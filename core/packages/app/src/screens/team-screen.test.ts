@@ -76,3 +76,36 @@ describe("buildLeaderBriefing", () => {
     expect(briefing).toContain("create_agent");
   });
 });
+
+describe("buildLeaderBriefing roster", () => {
+  it("lists enabled registered agents with their specs", () => {
+    const briefing = buildLeaderBriefing("Ship it", [
+      {
+        id: "a1",
+        name: "Backend reviewer",
+        role: "Reviews server code",
+        provider: "amaze",
+        model: "anthropic/claude-fable-5",
+        thinkingOptionId: "high",
+        systemPrompt: "Be strict.",
+        enabled: true,
+      },
+      {
+        id: "a2",
+        name: "Disabled one",
+        role: "",
+        provider: "amaze",
+        enabled: false,
+      },
+    ]);
+    expect(briefing).toContain("Backend reviewer — Reviews server code");
+    expect(briefing).toContain("provider=amaze, model=anthropic/claude-fable-5, thinking=high");
+    expect(briefing).toContain("system prompt: Be strict.");
+    expect(briefing).not.toContain("Disabled one");
+  });
+
+  it("omits the roster section when no agents are registered", () => {
+    const briefing = buildLeaderBriefing("Ship it", []);
+    expect(briefing).not.toContain("Registered team agents");
+  });
+});

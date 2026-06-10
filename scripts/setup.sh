@@ -24,6 +24,21 @@ echo "==> Installing rocky-orchestrate skill for agents (~/.agents/skills)"
 mkdir -p "$HOME/.agents/skills"
 ln -sfn "$ROOT/skills/rocky-orchestrate" "$HOME/.agents/skills/rocky-orchestrate"
 
+echo "==> Ensuring amaze exposes Rocky MCP tools by default (~/.amaze/agent/config.yml)"
+AMAZE_CFG="$HOME/.amaze/agent/config.yml"
+if [ -f "$AMAZE_CFG" ]; then
+  if ! grep -q "discoveryDefaultServers" "$AMAZE_CFG"; then
+    printf '\nmcp:\n  discoveryDefaultServers:\n    - rocky\n' >> "$AMAZE_CFG"
+    echo "    appended mcp.discoveryDefaultServers: [rocky]"
+  else
+    echo "    discoveryDefaultServers already configured — left untouched"
+  fi
+else
+  mkdir -p "$HOME/.amaze/agent"
+  printf 'mcp:\n  discoveryDefaultServers:\n    - rocky\n' > "$AMAZE_CFG"
+  echo "    created with mcp.discoveryDefaultServers: [rocky]"
+fi
+
 echo "==> Writing $ROCKY_HOME/config.json (kept if it already exists)"
 mkdir -p "$ROCKY_HOME"; chmod 700 "$ROCKY_HOME"
 if [ ! -f "$ROCKY_HOME/config.json" ]; then

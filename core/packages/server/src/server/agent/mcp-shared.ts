@@ -164,24 +164,33 @@ export function sanitizePermissionRequest(
   if (!permission) {
     return null;
   }
+  // Providers (e.g. amaze ACP) may emit `null` for optional fields; the MCP
+  // output schemas expect those fields to be absent instead, and a strict
+  // validator would otherwise fail the whole wait_for_agent/get_agent_status
+  // response. Drop null/undefined optional fields, including inside `detail`.
   const sanitized: AgentPermissionRequest = { ...permission };
-  if (sanitized.title === undefined) {
-    delete sanitized.title;
+  const optionalKeys = [
+    "title",
+    "description",
+    "input",
+    "detail",
+    "suggestions",
+    "actions",
+    "metadata",
+  ] as const;
+  for (const key of optionalKeys) {
+    if (sanitized[key] === undefined || sanitized[key] === null) {
+      delete sanitized[key];
+    }
   }
-  if (sanitized.description === undefined) {
-    delete sanitized.description;
-  }
-  if (sanitized.input === undefined) {
-    delete sanitized.input;
-  }
-  if (sanitized.suggestions === undefined) {
-    delete sanitized.suggestions;
-  }
-  if (sanitized.actions === undefined) {
-    delete sanitized.actions;
-  }
-  if (sanitized.metadata === undefined) {
-    delete sanitized.metadata;
+  if (sanitized.detail && typeof sanitized.detail === "object") {
+    const detail = { ...(sanitized.detail as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(detail)) {
+      if (value === null || value === undefined) {
+        delete detail[key];
+      }
+    }
+    sanitized.detail = detail as AgentPermissionRequest["detail"];
   }
   return sanitized;
 }

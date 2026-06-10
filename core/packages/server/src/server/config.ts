@@ -317,6 +317,16 @@ function resolveAppendSystemPrompt(persisted: ReturnType<typeof loadPersistedCon
   return persisted.daemon?.appendSystemPrompt ?? "";
 }
 
+function resolveTeamAgents(
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): import("@getrocky/protocol/messages").TeamAgent[] {
+  return (persisted.daemon?.teamAgents ?? []).map((agent) => ({
+    ...agent,
+    role: agent.role ?? "",
+    enabled: agent.enabled ?? true,
+  }));
+}
+
 function resolveStaticLoadConfigSettings(
   env: NodeJS.ProcessEnv,
   cli: CliConfigOverrides | undefined,
@@ -328,6 +338,7 @@ function resolveStaticLoadConfigSettings(
       cli?.mcpInjectIntoAgents ?? persisted.daemon?.mcp?.injectIntoAgents ?? false,
     autoArchiveAfterMerge: persisted.daemon?.autoArchiveAfterMerge ?? false,
     appendSystemPrompt: resolveAppendSystemPrompt(persisted),
+    teamAgents: resolveTeamAgents(persisted),
     hostnames: mergeHostnames([
       persisted.daemon?.hostnames,
       parseHostnamesEnv(env.ROCKY_HOSTNAMES ?? env.ROCKY_ALLOWED_HOSTS),
@@ -353,6 +364,7 @@ export function loadConfig(
     mcpInjectIntoAgents,
     autoArchiveAfterMerge,
     appendSystemPrompt,
+    teamAgents,
     hostnames,
     appBaseUrl,
   } = resolveStaticLoadConfigSettings(env, options?.cli, persisted);
@@ -386,6 +398,7 @@ export function loadConfig(
     mcpInjectIntoAgents,
     autoArchiveAfterMerge,
     appendSystemPrompt,
+    teamAgents,
     mcpDebug: env.MCP_DEBUG === "1",
     isDev: resolveRockyNodeEnv(env) === "development",
     agentStoragePath: path.join(rockyHome, "agents"),

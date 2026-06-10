@@ -210,6 +210,7 @@ function mergeMutableConfigIntoPersistedConfig(params: {
       },
       autoArchiveAfterMerge: mutable.autoArchiveAfterMerge,
       appendSystemPrompt: mutable.appendSystemPrompt,
+      teamAgents: mutable.teamAgents,
     },
     agents: nextAgents,
   } as PersistedConfig;

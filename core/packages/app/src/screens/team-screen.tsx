@@ -3,6 +3,8 @@ import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 import { StyleSheet, useUnistyles } from "react-native-unistyles";
 import { Bot, ChevronRight, Crown, Rocket, Settings2, Users } from "lucide-react-native";
+import type { TeamAgent } from "@getrocky/protocol/messages";
+import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { Button } from "@/components/ui/button";
 import { getProviderIcon } from "@/components/provider-icons";
@@ -124,10 +126,33 @@ function ProjectChip({
   );
 }
 
+function RosterRow({ preset }: { preset: TeamAgent }) {
+  const { theme } = useUnistyles();
+  const ProviderIcon = getProviderIcon(preset.provider);
+  const disabled = preset.enabled === false;
+  return (
+    <View style={styles.rosterRow} testID={`team-roster-${preset.id}`}>
+      <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+      <View style={styles.rosterInfo}>
+        <Text style={disabled ? styles.rosterNameDisabled : styles.rosterName} numberOfLines={1}>
+          {preset.name}
+        </Text>
+        <Text style={styles.agentMeta} numberOfLines={1}>
+          {[preset.role, preset.provider, preset.model, disabled ? "disabled" : null]
+            .filter(Boolean)
+            .join(" \u00b7 ")}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 export function TeamScreen({ serverId }: { serverId: string }) {
   const { theme } = useUnistyles();
   const projects = useHostProjects(serverId || null);
   const { agents } = useAllAgentsList({ serverId });
+  const { config } = useDaemonConfig(serverId);
+  const roster = useMemo(() => config?.teamAgents ?? [], [config?.teamAgents]);
   const [goal, setGoal] = useState("");
   const [selectedProjectKey, setSelectedProjectKey] = useState<string | null>(null);
 
@@ -157,7 +182,7 @@ export function TeamScreen({ serverId }: { serverId: string }) {
     const draftKey = `new-workspace:${serverId}:${sourceDirectory}`;
     useDraftStore.getState().saveDraftInput({
       draftKey,
-      draft: { text: buildLeaderBriefing(goal), attachments: [] },
+      draft: { text: buildLeaderBriefing(goal, roster), attachments: [] },
     });
     setGoal("");
     router.push(
@@ -166,7 +191,7 @@ export function TeamScreen({ serverId }: { serverId: string }) {
         projectId: selectedProject.projectKey,
       }),
     );
-  }, [goal, selectedProject, serverId]);
+  }, [goal, roster, selectedProject, serverId]);
 
   const handleOpenAgentSettings = useCallback(() => {
     router.push(buildSettingsHostSectionRoute(serverId, "agents"));
@@ -217,6 +242,26 @@ export function TeamScreen({ serverId }: { serverId: string }) {
           <View style={styles.launchRow}>
             <Button onPress={handleLaunch} disabled={!canLaunch} testID="team-launch">
               Launch Leader
+            </Button>
+          </View>
+        </View>
+
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Bot size={theme.iconSize.md} color={theme.colors.foreground} />
+            <Text style={styles.cardTitle}>Registered agents</Text>
+          </View>
+          {roster.length === 0 ? (
+            <Text style={styles.emptyText}>
+              No registered agents. Register reusable agent presets in Agent settings; the
+              Leader will staff missions with them.
+            </Text>
+          ) : (
+            roster.map((preset) => <RosterRow key={preset.id} preset={preset} />)
+          )}
+          <View style={styles.settingsLinks}>
+            <Button variant="secondary" size="sm" onPress={handleOpenAgentSettings}>
+              Manage agents
             </Button>
           </View>
         </View>
@@ -390,5 +435,25 @@ const styles = StyleSheet.create((theme) => ({
   settingsLinks: {
     flexDirection: "row",
     gap: theme.spacing[2],
+  },
+  rosterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[3],
+    paddingVertical: theme.spacing[2],
+  },
+  rosterInfo: {
+    flex: 1,
+    gap: 2,
+  },
+  rosterName: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  rosterNameDisabled: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
   },
 }));

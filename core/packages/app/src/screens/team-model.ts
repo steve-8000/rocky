@@ -1,4 +1,5 @@
 import { getParentAgentIdFromLabels } from "@getrocky/protocol/agent-labels";
+import type { TeamAgent } from "@getrocky/protocol/messages";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 
 export interface TeamGroup {
@@ -39,14 +40,38 @@ export function groupAgentsIntoTeams(agents: readonly AggregatedAgent[]): TeamGr
   return groups;
 }
 
-export function buildLeaderBriefing(goal: string): string {
+export function buildLeaderBriefing(goal: string, roster: readonly TeamAgent[] = []): string {
   const trimmedGoal = goal.trim();
+  const enabledRoster = roster.filter((agent) => agent.enabled !== false);
+  const rosterSection =
+    enabledRoster.length > 0
+      ? [
+          "",
+          "Registered team agents — prefer these presets when spawning Teammates",
+          "(pass their provider/model/thinking and include their system prompt in the briefing):",
+          ...enabledRoster.map((agent) => {
+            const spec = [
+              `provider=${agent.provider}`,
+              agent.model ? `model=${agent.model}` : null,
+              agent.thinkingOptionId ? `thinking=${agent.thinkingOptionId}` : null,
+            ]
+              .filter(Boolean)
+              .join(", ");
+            const role = agent.role ? ` — ${agent.role}` : "";
+            const prompt = agent.systemPrompt ? ` | system prompt: ${agent.systemPrompt}` : "";
+            return `- ${agent.name}${role} (${spec})${prompt}`;
+          }),
+        ]
+      : [];
   return [
     "You are the Leader of a Rocky agent team. Use the rocky-orchestrate skill protocol:",
     "decompose the goal into independent subtasks, spawn parallel Teammate agents with the",
-    "create_agent MCP tool (use worktrees for code changes), track a TEAM_BOARD.md at the",
-    "workspace root, monitor with wait_for_agent, integrate results, and report with",
-    "verification evidence.",
+    "Rocky daemon MCP tools (mcp__rocky_create_agent / mcp__rocky_wait_for_agent — activate",
+    "them via tool discovery if not yet active; NEVER use the built-in task tool for",
+    "Teammates: only daemon agents are visible on the Team board), use worktrees for code",
+    "changes, track a TEAM_BOARD.md at the workspace root, integrate results, and report",
+    "with verification evidence.",
+    ...rosterSection,
     "",
     `Goal: ${trimmedGoal}`,
   ].join("\n");

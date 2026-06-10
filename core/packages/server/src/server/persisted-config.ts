@@ -221,6 +221,22 @@ export const PersistedConfigSchema = z
           .optional(),
         autoArchiveAfterMerge: z.boolean().optional(),
         appendSystemPrompt: z.string().optional(),
+        teamAgents: z
+          .array(
+            z
+              .object({
+                id: z.string(),
+                name: z.string(),
+                role: z.string().optional(),
+                provider: z.string(),
+                model: z.string().optional(),
+                thinkingOptionId: z.string().optional(),
+                systemPrompt: z.string().optional(),
+                enabled: z.boolean().optional(),
+              })
+              .passthrough(),
+          )
+          .optional(),
         cors: z
           .object({
             allowedOrigins: z.array(z.string()).optional(),

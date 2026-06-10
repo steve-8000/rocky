@@ -17,7 +17,10 @@ daemon permission queue is each Teammate's own permission dialog.
 Prefer Rocky MCP tools when injected (`create_agent`, `wait_for_agent`,
 `send_agent_prompt`, `get_agent_status`, `get_agent_activity`, `list_agents`,
 `cancel_agent`, `kill_agent`, `archive_agent`, `list_pending_permissions`,
-`respond_to_permission`, `create_worktree`). Otherwise use the CLI:
+`respond_to_permission`, `create_worktree`) — under amaze they appear as
+`mcp__rocky_*`; activate them via tool discovery if not yet active. NEVER use a
+built-in `task`/subagent tool for Teammates: only daemon agents appear on the
+Team board and survive your session. Otherwise use the CLI:
 
 ```
 rocky agent run --provider <p> --cwd <dir> [--worktree] "<prompt>"

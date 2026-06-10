@@ -235,6 +235,7 @@ export interface RockyDaemonConfig {
   mcpInjectIntoAgents?: boolean;
   autoArchiveAfterMerge?: boolean;
   appendSystemPrompt?: string;
+  teamAgents?: import("@getrocky/protocol/messages").TeamAgent[];
   staticDir: string;
   // Rocky: optional built web client (SPA) served at the daemon root, so one
   // port carries UI + API + WS. Assets are public; API/WS stay behind auth.
@@ -313,6 +314,7 @@ export async function createRockyDaemon(
       },
       autoArchiveAfterMerge: config.autoArchiveAfterMerge ?? false,
       appendSystemPrompt: config.appendSystemPrompt ?? "",
+      teamAgents: config.teamAgents ?? [],
     },
     logger,
   );

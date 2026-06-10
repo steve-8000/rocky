@@ -350,14 +350,41 @@ function buildSerializableConfig(config: AgentSessionConfig): SerializableAgentC
 function sanitizePendingPermissions(
   pending: Map<string, AgentPermissionRequest>,
 ): AgentPermissionRequest[] {
-  return Array.from(pending.values()).map((request) =>
-    Object.assign({}, request, {
+  return Array.from(pending.values()).map((request) => {
+    const sanitized = Object.assign({}, request, {
       input: sanitizeMetadata(request.input),
       suggestions: sanitizeMetadataArray(request.suggestions),
       actions: request.actions?.map((action) => Object.assign({}, action)),
       metadata: sanitizeMetadata(request.metadata),
-    }),
-  );
+    });
+    // Optional fields must be absent — not null — to satisfy the protocol
+    // schemas (AgentPermissionRequestPayloadSchema and MCP output schemas).
+    // Providers like amaze ACP emit explicit nulls; strip them here, and
+    // inside `detail` too.
+    for (const key of [
+      "title",
+      "description",
+      "input",
+      "detail",
+      "suggestions",
+      "actions",
+      "metadata",
+    ] as const) {
+      if (sanitized[key] === null || sanitized[key] === undefined) {
+        delete sanitized[key];
+      }
+    }
+    if (sanitized.detail && typeof sanitized.detail === "object") {
+      const detail = { ...(sanitized.detail as Record<string, unknown>) };
+      for (const [key, value] of Object.entries(detail)) {
+        if (value === null || value === undefined) {
+          delete detail[key];
+        }
+      }
+      sanitized.detail = detail as AgentPermissionRequest["detail"];
+    }
+    return sanitized;
+  });
 }
 
 function sanitizePersistenceHandle(

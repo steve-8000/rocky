@@ -116,6 +116,23 @@ const MutableMetadataGenerationConfigSchema = z
   })
   .passthrough();
 
+// A registered team agent: a reusable named preset (role, provider, model,
+// system prompt) managed in Settings -> Agents and used by Team missions.
+export const TeamAgentSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    role: z.string().default(""),
+    provider: z.string().min(1),
+    model: z.string().optional(),
+    thinkingOptionId: z.string().optional(),
+    systemPrompt: z.string().optional(),
+    enabled: z.boolean().default(true),
+  })
+  .passthrough();
+
+export type TeamAgent = z.infer<typeof TeamAgentSchema>;
+
 export const MutableDaemonConfigSchema = z
   .object({
     mcp: z
@@ -127,6 +144,7 @@ export const MutableDaemonConfigSchema = z
     metadataGeneration: MutableMetadataGenerationConfigSchema.default({ providers: [] }),
     autoArchiveAfterMerge: z.boolean().default(false),
     appendSystemPrompt: z.string().default(""),
+    teamAgents: z.array(TeamAgentSchema).default([]),
   })
   .passthrough();
 
@@ -139,6 +157,7 @@ export const MutableDaemonConfigPatchSchema = z
     metadataGeneration: MutableMetadataGenerationConfigSchema.partial().optional(),
     autoArchiveAfterMerge: z.boolean().optional(),
     appendSystemPrompt: z.string().optional(),
+    teamAgents: z.array(TeamAgentSchema).optional(),
   })
   .partial()
   .passthrough();
