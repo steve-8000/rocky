@@ -16,6 +16,22 @@ Before exposing port 7767 anywhere, set a daemon password:
 npm run cli -- daemon set-password
 ```
 
+## Remote access (direct connection)
+
+Rocky serves the UI and API on one origin, so a reverse proxy is all you need
+for remote access. The production deployment:
+
+| Field | Value |
+| --- | --- |
+| URL | https://rocky.clab.one |
+| Host | `rocky.clab.one` |
+| Port | `443` (TLS on; Caddy → `127.0.0.1:7767`) |
+| Password | `~/.rocky/.admin-password` on the host (set via `npm run cli -- daemon set-password`) |
+
+Open the URL, choose **Direct connection** — host, port, and SSL are
+prefilled from the page origin; enter the daemon password to connect.
+For LAN use without a proxy, connect to `<host>:7767` with SSL off.
+
 ## Commands
 
 | Command | Effect |

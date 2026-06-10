@@ -6,26 +6,28 @@ interface RockyLogoProps {
   color?: string;
 }
 
-// Rocky mark — a faceted rock. Same geometry as the desktop app icon
-// (scripts/brand/make-icons.py); facets are rendered as opacity steps of a
-// single color so the mark works in any theme foreground/accent color.
+// Rocky mark — an asymmetric faceted peak. Same geometry as the desktop app
+// icon (scripts/brand/make-icons.py); facets are rendered as opacity steps of
+// a single color so the mark works in any theme foreground/accent color.
+// Silhouette: apex (44,10) → right shoulder (74,32) → right base (88,74)
+// → base (58,88) → base-left (14,80) → left shoulder (22,44) → apex.
 export function RockyLogo({ size = 64, color }: RockyLogoProps) {
   const { theme } = useUnistyles();
   const fill = color ?? theme.colors.foreground;
 
   const facets: Array<{ d: string; opacity: number }> = [
-    // top-right
-    { d: "M50 16 L78 34 L50 50 Z", opacity: 0.92 },
-    // top-left
-    { d: "M50 16 L22 34 L50 50 Z", opacity: 1 },
-    // left
-    { d: "M22 34 L18 66 L50 50 Z", opacity: 0.78 },
-    // right
-    { d: "M78 34 L82 66 L50 50 Z", opacity: 0.6 },
+    // apex, left face (highlight)
+    { d: "M44 10 L22 44 L48 54 Z", opacity: 1 },
+    // apex, right face
+    { d: "M44 10 L48 54 L74 32 Z", opacity: 0.85 },
+    // left flank
+    { d: "M22 44 L14 80 L48 54 Z", opacity: 0.9 },
     // bottom-left
-    { d: "M18 66 L50 84 L50 50 Z", opacity: 0.88 },
+    { d: "M48 54 L14 80 L58 88 Z", opacity: 0.72 },
+    // right flank
+    { d: "M74 32 L48 54 L88 74 Z", opacity: 0.62 },
     // bottom-right
-    { d: "M82 66 L50 84 L50 50 Z", opacity: 0.48 },
+    { d: "M48 54 L88 74 L58 88 Z", opacity: 0.48 },
   ];
 
   return (

@@ -17,6 +17,20 @@ import { Button } from "@/components/ui/button";
 const FLEX_ONE_STYLE = { flex: 1 } as const;
 const DIRECT_CONNECTION_HEADER: SheetHeader = { title: "Direct connection" };
 
+// When the app is served by a rockyd instance over the network (e.g.
+// https://rocky.clab.one), prefill the direct connection with the page
+// origin so remote users only need to enter the daemon password.
+function originConnectionDefaults(): { host: string; port: string; useTls: boolean } {
+  if (typeof window !== "undefined" && window.location?.protocol?.startsWith("http")) {
+    const { hostname, port, protocol } = window.location;
+    const useTls = protocol === "https:";
+    if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+      return { host: hostname, port: port || (useTls ? "443" : "80"), useTls };
+    }
+  }
+  return { host: "", port: "7767", useTls: false };
+}
+
 interface DirectConnectionDraft {
   host: string;
   port: string;
@@ -273,9 +287,10 @@ export function AddHostModal({ visible, onClose, onCancel, onSaved }: AddHostMod
 
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("7767");
-  const [useTls, setUseTls] = useState(false);
+  const originDefaults = useMemo(originConnectionDefaults, []);
+  const [host, setHost] = useState(originDefaults.host);
+  const [port, setPort] = useState(originDefaults.port);
+  const [useTls, setUseTls] = useState(originDefaults.useTls);
   const [password, setPassword] = useState("");
   const [isPasswordVisible, setIsPasswordVisible] = useState(false);
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
@@ -283,15 +298,15 @@ export function AddHostModal({ visible, onClose, onCancel, onSaved }: AddHostMod
   const [inputResetKey, bumpInputResetKey] = useReducer((key: number) => key + 1, 0);
 
   const clearInput = useCallback(() => {
-    setHost("");
-    setPort("7767");
-    setUseTls(false);
+    setHost(originDefaults.host);
+    setPort(originDefaults.port);
+    setUseTls(originDefaults.useTls);
     setPassword("");
     setIsPasswordVisible(false);
     setIsAdvancedOpen(false);
     setAdvancedUri("");
     bumpInputResetKey();
-  }, []);
+  }, [originDefaults]);
 
   const connectIcon = useMemo(
     () => <Link2 size={16} color={theme.colors.palette.white} />,

@@ -25,15 +25,16 @@ BASE = 1024
 BG_TOP = (43, 38, 32)
 BG_BOTTOM = (20, 17, 14)
 
-# Faceted rock — same geometry as RockyLogo (rocky-logo.tsx), copper palette.
+# Asymmetric faceted peak — same geometry as RockyLogo (rocky-logo.tsx),
+# copper palette graded by facet opacity (light from upper-left).
 ROCK_FACES = [
     # polygon (normalized coords), fill
-    ([(0.50, 0.16), (0.78, 0.34), (0.50, 0.50)], (222, 138, 66)),   # top-right
-    ([(0.50, 0.16), (0.22, 0.34), (0.50, 0.50)], (245, 166, 92)),   # top-left
-    ([(0.22, 0.34), (0.18, 0.66), (0.50, 0.50)], (196, 113, 44)),   # left
-    ([(0.78, 0.34), (0.82, 0.66), (0.50, 0.50)], (168, 92, 32)),    # right
-    ([(0.18, 0.66), (0.50, 0.84), (0.50, 0.50)], (230, 148, 72)),   # bottom-left
-    ([(0.82, 0.66), (0.50, 0.84), (0.50, 0.50)], (146, 76, 24)),    # bottom-right
+    ([(0.44, 0.10), (0.22, 0.44), (0.48, 0.54)], (247, 170, 96)),   # apex left (highlight)
+    ([(0.44, 0.10), (0.48, 0.54), (0.74, 0.32)], (226, 142, 66)),   # apex right
+    ([(0.22, 0.44), (0.14, 0.80), (0.48, 0.54)], (236, 156, 80)),   # left flank
+    ([(0.48, 0.54), (0.14, 0.80), (0.58, 0.88)], (204, 120, 48)),   # bottom-left
+    ([(0.74, 0.32), (0.48, 0.54), (0.88, 0.74)], (178, 98, 36)),    # right flank
+    ([(0.48, 0.54), (0.88, 0.74), (0.58, 0.88)], (150, 78, 26)),    # bottom-right
 ]
 
 STATUS_COLORS = {
@@ -46,7 +47,7 @@ def draw_rock(draw: ImageDraw.ImageDraw, size: int, mono: tuple[int, int, int] |
     for i, (points, fill) in enumerate(ROCK_FACES):
         if mono is not None:
             # opacity-stepped mono variant (matches RockyLogo facet opacities)
-            opacities = [235, 255, 199, 153, 224, 122]
+            opacities = [255, 217, 230, 184, 158, 122]
             fill = mono + (opacities[i],)
         draw.polygon([(x * size, y * size) for x, y in points], fill=fill)
 
