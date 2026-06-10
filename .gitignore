@@ -1,5 +1,14 @@
-# vendored paseo is a git worktree with its own index
-vendor/paseo
 node_modules/
+vendor/paseo/node_modules/
+vendor/paseo/packages/*/node_modules/
+vendor/paseo/packages/*/dist/
+vendor/paseo/packages/desktop/release/
+vendor/paseo/packages/app/.expo/
+vendor/amaze/node_modules/
+vendor/amaze/packages/*/node_modules/
+vendor/amaze/packages/coding-agent/dist/
+vendor/aionui/node_modules/
+vendor/aionui/packages/*/node_modules/
+vendor/aionui/packages/web-host/dist/
 *.log
 .DS_Store

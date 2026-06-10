@@ -1,0 +1,43 @@
+{
+	"manifest_version": 3,
+	"name": "Amaze Browser Bridge",
+	"version": "3.0.0",
+	"description": "Connects logged-in Chrome tabs to Amaze through a local MCP bridge.",
+	"permissions": [
+		"tabs",
+		"offscreen"
+	],
+	"host_permissions": [
+		"<all_urls>"
+	],
+	"background": {
+		"service_worker": "background.js",
+		"type": "module"
+	},
+	"content_scripts": [
+		{
+			"matches": [
+				"<all_urls>"
+			],
+			"js": [
+				"content.js"
+			],
+			"run_at": "document_idle",
+			"all_frames": false
+		}
+	],
+	"web_accessible_resources": [
+		{
+			"resources": [
+				"offscreen.html",
+				"offscreen.js"
+			],
+			"matches": [
+				"<all_urls>"
+			]
+		}
+	],
+	"action": {
+		"default_title": "Amaze Browser Bridge"
+	}
+}

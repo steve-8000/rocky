@@ -1,0 +1,84 @@
+modelRoles:
+  default: openai-codex/gpt-5.5
+  Builder: openai-codex/gpt-5.5
+  Resercher: openai-codex/gpt-5.3-codex-spark
+  SRE: openai-codex/gpt-5.5
+hideThinkingBlock: true
+localLlm:
+  enabled: true
+  required: false
+  modelRole: Resercher
+  structuredOutput: true
+  disableThinking: true
+  useForLogSummarizer: true
+  useForContextCompressor: false
+prompt:
+  mainContextMode: compact
+  cache:
+    orchestratorRetention: default
+    subagentRetention: short
+    subagentPrefixReuse: true
+compaction:
+  enabled: true
+  mode: map-reduce
+  strategy: context-full
+  thresholdPercent: 70
+  idleEnabled: true
+  remoteEnabled: false
+  mapReduceSectionTokenBudget: 4000
+  mapReduceMaxSections: 12
+  continuousDemotion:
+    enabled: true
+theme:
+  dark: erid
+mission:
+  # Disabled: auto-approve + auto-continuation were firing on an ambiently-promoted,
+  # misclassified mission (a pasted bash error became the objective), causing a
+  # runaway continuation loop. Re-enable only after continuation is restricted to
+  # explicitly-created missions.
+  autoApprove: false
+  continuation:
+    enabled: false
+task:
+  disabledAgents: []
+tools:
+  # bash/eval/recipe are used in almost every task; keep them always-active instead
+  # of hidden behind search_tool_bm25 discovery (which also does not persist built-in
+  # activations across turns, so they kept disappearing).
+  essentialOverride: [read, find, search, edit, write, task, todo_write, todo_read, bash, eval, recipe]
+agencyBrain:
+  enabled: true
+  mcpServer: gbrain
+  agencySourceId: "__all__"
+skills:
+  enableCodexUser: false
+  enableClaudeUser: false
+  includeSkills:
+    - clarify
+    - ideate
+    - spec
+    - api
+    - ui
+    - context
+    - source
+    - debug
+    - test
+    - review
+    - simplify
+    - security
+    - perf
+    - docs
+    - quickstart
+    - threat-model
+    - vuln-scan
+    - triage
+    - patch
+    - customize
+    - browser-control
+    - skillui
+    - build-ios-apps:*
+    - baguette-ios-runtime
+    - system-prompts
+    - sui-validater
+    - destructive-mission
+    - fp-validated

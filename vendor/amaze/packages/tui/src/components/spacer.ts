@@ -1,0 +1,24 @@
+import type { Component } from "../tui";
+
+/**
+ * Spacer component that renders empty lines
+ */
+export class Spacer implements Component {
+	#lines: number;
+
+	constructor(lines: number = 1) {
+		this.#lines = lines;
+	}
+
+	setLines(lines: number): void {
+		this.#lines = lines;
+	}
+
+	invalidate(): void {
+		// No cached state to invalidate currently
+	}
+
+	render(_width: number): string[] {
+		return new Array<string>(this.#lines).fill("");
+	}
+}

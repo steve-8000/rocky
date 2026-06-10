@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7-labs
+###############################################################################
+# rocky — GitHub triage+fix bot orchestrator.
+#
+# Extends `amaze-base` (from /Dockerfile, default target amaze/amaze:dev) and adds
+# the rocky Python package. The pi toolchain (python + bun + rustup launcher +
+# pi-natives + amaze_rpc wheel + /usr/local/bin/amaze shim) all comes from
+# AMAZE_BASE; this file only layers what's rocky-specific.
+#
+# Build (from amaze root):
+#     bun run amaze:image                              # build amaze/amaze:dev first
+#     docker build -f Dockerfile.rocky -t rocky:dev .
+#
+# Compose (recommended):
+#     docker compose --project-directory python/rocky build
+###############################################################################
+
+ARG AMAZE_BASE=amaze/amaze:dev
+
+############################
+# runtime — amaze-base + rocky src + pip install
+############################
+FROM ${AMAZE_BASE} AS runtime
+
+# rocky runs against the host pi checkout mounted at /work/amaze read-only.
+ENV AMAZE_ROOT=/work/amaze
+
+WORKDIR /app
+
+# rocky itself.
+COPY python/rocky/pyproject.toml ./
+COPY python/rocky/src/ ./src/
+
+RUN pip install --no-cache-dir \
+        "fastapi>=0.112" "uvicorn[standard]>=0.30" "httpx>=0.27" \
+        "pydantic>=2.6" "pydantic-settings>=2.2" "python-dotenv>=1.0" \
+        "click>=8.1" \
+    && pip install --no-cache-dir --no-deps .
+
+# Host agent config is mounted read-only under /srv/agent-home-stage with
+# host-controlled permissions. The entrypoint copies it into root-owned
+# world-readable files under /srv/agent-home; the agent subprocess runs with
+# HOME=/srv/agent-home, so ~/.amaze and ~/.agent resolve there without exposing
+# mutable host mounts.
+RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.amaze/agent \
+    && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.amaze/agent \
+    && printf '[install]\nbackend = "copyfile"\n' > /srv/agent-home/.bunfig.toml
+
+COPY python/rocky/entrypoint.sh /usr/local/bin/rocky-entrypoint
+RUN chmod +x /usr/local/bin/rocky-entrypoint
+
+VOLUME ["/data"]
+EXPOSE 8080
+EXPOSE 8081
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/rocky-entrypoint"]
+CMD ["python", "-m", "rocky", "serve"]

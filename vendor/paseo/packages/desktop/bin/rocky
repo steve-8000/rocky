@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_PATH=$0
+case "$SCRIPT_PATH" in
+  /*) ;;
+  *) SCRIPT_PATH="$(pwd)/$SCRIPT_PATH" ;;
+esac
+
+# Follow symlinks so `/usr/local/bin/paseo` resolves back into the app bundle.
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+  LINK_TARGET=$(readlink "$SCRIPT_PATH")
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *) SCRIPT_PATH="${SCRIPT_DIR}/${LINK_TARGET}" ;;
+  esac
+done
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+RESOURCES_DIR=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
+
+# macOS: MacOS/Rocky is a sibling of Resources/
+# Linux: the executable sits next to resources/. Prefer Rocky.bin when present
+# because Paseo is a GUI wrapper that adds Chromium flags not accepted by
+# ELECTRON_RUN_AS_NODE.
+if [ -x "${RESOURCES_DIR}/../MacOS/Rocky" ]; then
+  APP_EXECUTABLE="${RESOURCES_DIR}/../MacOS/Rocky"
+elif [ -x "${RESOURCES_DIR}/../Rocky.bin" ]; then
+  APP_EXECUTABLE="${RESOURCES_DIR}/../Rocky.bin"
+elif [ -x "${RESOURCES_DIR}/../Rocky" ]; then
+  APP_EXECUTABLE="${RESOURCES_DIR}/../Rocky"
+else
+  echo "Bundled Rocky executable not found relative to ${RESOURCES_DIR}" >&2
+  exit 1
+fi
+
+RUNNER_PATH="${RESOURCES_DIR}/app.asar.unpacked/dist/daemon/node-entrypoint-runner.js"
+CLI_ENTRYPOINT="${RESOURCES_DIR}/app.asar/node_modules/@getpaseo/cli/dist/index.js"
+
+PASEO_HOME="${PASEO_HOME:-$HOME/.rocky}"
+export PASEO_HOME
+exec env ELECTRON_RUN_AS_NODE=1 PASEO_NODE_ENV=production "${APP_EXECUTABLE}" --disable-warning=DEP0040 "${RUNNER_PATH}" node-script "${CLI_ENTRYPOINT}" "$@"

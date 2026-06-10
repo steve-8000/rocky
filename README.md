@@ -1,63 +1,60 @@
 # Rocky
 
-amaze (agent runtime) + Paseo (session daemon / workspaces / models / attachments) + AionUi-style orchestrator mode, packaged as one server with a remote WebUI and a macOS desktop app.
+amaze (agent runtime) + Paseo (session daemon) + AionUi (Team Mode orchestrator & Cowork UI) integrated into **one self-contained project**: a single server process, two remote WebUIs, and a macOS desktop app.
 
-See [DESIGN.md](DESIGN.md) for architecture and decisions.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the integration design and [DESIGN.md](DESIGN.md) for the decision record.
 
 ## Quickstart
 
-```bash
-npm run setup            # checks amaze, installs vendored deps, writes ~/.rocky/config.json
-npm run daemon:start     # Rocky daemon on 0.0.0.0:7767 (home: ~/.rocky)
-npm run daemon:status
-```
-
-Set a password before exposing port 7767 beyond localhost:
+Prerequisites: Node ≥ 23 (native TS), Bun ≥ 1.3, network access to the npm registry only.
 
 ```bash
-cd vendor/paseo && npm run cli -- daemon set-password
+npm run setup     # installs all vendored deps, builds paseo dist + web-host, writes ~/.rocky/config.json
+npm start         # rockyd: Paseo daemon :7767 + Rocky WebUI :7780 + AionUi WebUI :25808 — one process
 ```
 
-## Remote WebUI
+`npm start` prints all endpoints plus the AionUi initial admin credentials on first run.
+
+Set a daemon password before exposing 7767 beyond localhost:
 
 ```bash
-npm run build:webui      # Expo web export → vendor/paseo/packages/app/dist
-npm run serve:webui      # serves it on 0.0.0.0:7780
+npm run cli -- daemon set-password
 ```
 
-Open `http://<host>:7780`, add a host with endpoint `<host>:7767` and the daemon password. All agent traffic goes browser → daemon WebSocket directly; the static server only ships the SPA. If the daemon and WebUI live on different origins, add the WebUI origin to `daemon.cors.allowedOrigins` and the host to `daemon.hostnames` in `~/.rocky/config.json` (the template covers localhost:7780).
+## What runs where
 
-## Desktop app (DMG)
+| Service | Port | Notes |
+| --- | --- | --- |
+| Paseo daemon | 7767 | WS protocol; agents, workspaces, worktrees, models, attachments, MCP |
+| Rocky WebUI | 7780 | Expo SPA — add host `<host>:7767` + daemon password in the UI |
+| AionUi WebUI | 25808 | Cowork + Team Mode UI; login with printed admin credentials |
+| aioncore | localhost-only | AionUi Rust backend, managed child of rockyd |
 
-```bash
-npm run build:dmg
-# → vendor/paseo/packages/desktop/release/Rocky-<version>-arm64.dmg
-```
+Environment knobs: `ROCKY_HOME` (default `~/.rocky`), `ROCKY_WEBUI_PORT`, `ROCKY_AIONUI_PORT`, `ROCKY_ALLOW_REMOTE=0` for localhost-only.
 
-The app is ad-hoc signed (no notarization — no Developer ID on this machine). On another Mac you must clear quarantine once: `xattr -dr com.apple.quarantine /Applications/Rocky.app`. The bundle manages its own daemon (`~/.rocky`, app id `one.clab.rocky`) and ships a `rocky` CLI shim (Settings → Integrations installs it to `~/.local/bin/rocky`).
+## amaze
 
-## amaze provider
+Vendored at `vendor/amaze`, run from source via Bun — never from PATH:
 
-`~/.rocky/config.json` registers amaze as an ACP provider:
-
-```json
-"agents": { "providers": { "amaze": { "extends": "acp", "label": "Amaze", "command": ["amaze", "acp"] } } }
-```
-
-Rocky uses whatever `amaze` is on PATH — upgrade amaze independently.
-
-```bash
-cd vendor/paseo && npm run cli -- agent run --provider amaze --cwd <repo> "task..."
-```
+- **In Paseo:** registered as ACP provider in `~/.rocky/config.json`. Test: `npm run cli -- agent run --provider amaze --cwd <repo> "task"`.
+- **In AionUi:** auto-registered as custom ACP agent on every rockyd boot — appears in Cowork agent list and as a Team Mode backend.
 
 ## Orchestrator mode
 
-`skills/rocky-orchestrate/SKILL.md` (also bundled into the app) runs AionUi Team-Mode-style Leader/Teammate orchestration on daemon primitives: parallel `create_agent` Teammates (worktree-isolated by default), a chat-room mailbox, a `TEAM_BOARD.md` task board, per-agent permission queues, and silent-agent escalation. Invoke `/rocky-orchestrate <goal>` from any agent with Paseo MCP tools injected (`daemon.mcp.injectIntoAgents` is on in the template config).
+Two paths over the same daemon substrate:
 
-## Upstream sync
+- **AionUi Team Mode** (UI): create a team in the AionUi WebUI; Leader delegates to parallel Teammates with task board, mailbox, and per-agent permissions. Add the daemon's MCP server in AionUi MCP settings (bridge: `vendor/paseo/packages/server/dist/scripts/mcp-stdio-socket-bridge-cli.mjs`) to let the Leader drive daemon-managed agents in worktrees.
+- **`/rocky-orchestrate`** (headless skill, `skills/rocky-orchestrate/`, also bundled in the desktop app): same Leader/Teammate protocol on daemon MCP tools.
 
-`vendor/paseo` is a git worktree of `~/roy/paseo` on branch `rocky` (branding + defaults as commits). To pull upstream:
+## Rocky WebUI build & desktop app
 
 ```bash
-cd vendor/paseo && git fetch origin && git merge origin/main
+npm run build:webui   # Expo web export → vendor/paseo/packages/app/dist (needed once before npm start)
+npm run build:dmg     # → vendor/paseo/packages/desktop/release/Rocky-<version>-arm64.dmg
 ```
+
+The DMG is ad-hoc signed (no Developer ID on this machine): on another Mac run `xattr -dr com.apple.quarantine /Applications/Rocky.app` once. The app manages its own daemon (`~/.rocky`, id `one.clab.rocky`) and ships a `rocky` CLI shim.
+
+## Self-containment
+
+`vendor/{amaze,paseo,aionui}` are full source trees committed here. Committed binaries (unavoidable): aioncore (closed-source Rust backend) and the amaze darwin-arm64 native addon (rebuildable with Rust nightly via `bun run build:native` in vendor/amaze). AionUi's built renderer is committed so its WebUI needs no electron-vite build.

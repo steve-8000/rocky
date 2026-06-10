@@ -1,0 +1,40 @@
+{
+	"type": "module",
+	"name": "@amaze/browser-control-extension",
+	"version": "2.2.1",
+	"description": "Chrome extension and MCP bridge for controlling logged-in browser tabs",
+	"author": "Can Boluk",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/amaze.git",
+		"directory": "packages/browser-control-extension"
+	},
+	"keywords": [
+		"browser",
+		"chrome",
+		"mcp",
+		"extension",
+		"agent"
+	],
+	"bin": {
+		"amaze-browser-bridge": "src/mcp-server.ts"
+	},
+	"scripts": {
+		"check": "biome check . && bun run check:types",
+		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"lint": "biome lint .",
+		"fix": "biome check --write --unsafe .",
+		"fmt": "biome format --write ."
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	},
+	"files": [
+		"src",
+		"chrome"
+	]
+}

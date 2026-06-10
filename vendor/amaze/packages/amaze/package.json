@@ -1,0 +1,36 @@
+{
+	"type": "module",
+	"name": "amaze",
+	"version": "2.2.1",
+	"description": "Amaze CLI npx entry package",
+	"author": "Can Boluk",
+	"contributors": [
+		"Mario Zechner"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/amaze.git",
+		"directory": "packages/amaze"
+	},
+	"keywords": [
+		"amaze",
+		"coding-agent",
+		"ai",
+		"llm",
+		"cli",
+		"tui",
+		"agent"
+	],
+	"bin": {
+		"amaze": "bin/amaze"
+	},
+	"scripts": {
+		"build": "bun scripts/sync-binary.ts",
+		"prepack": "bun run build"
+	},
+	"files": [
+		"bin",
+		"README.md"
+	]
+}

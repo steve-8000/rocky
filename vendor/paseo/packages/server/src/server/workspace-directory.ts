@@ -1,0 +1,511 @@
+import { homedir } from "node:os";
+import { sep } from "node:path";
+import type pino from "pino";
+import type {
+  AgentSnapshotPayload,
+  SessionInboundMessage,
+  SessionOutboundMessage,
+  WorkspaceDescriptorPayload,
+} from "./messages.js";
+import {
+  deriveAgentStateBucket,
+  getWorkspaceStateBucketPriority,
+  type WorkspaceStateBucket,
+} from "@getpaseo/protocol/agent-state-bucket";
+import { getParentAgentIdFromLabels, isDelegatedAgent } from "@getpaseo/protocol/agent-labels";
+import { SortablePager } from "./pagination/sortable-pager.js";
+import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "./workspace-registry.js";
+import { normalizeWorkspaceId } from "./workspace-registry-model.js";
+
+const FETCH_WORKSPACES_SORT_KEYS = [
+  "status_priority",
+  "activity_at",
+  "name",
+  "project_id",
+] as const;
+
+/**
+ * Per-workspace bucket history. Drives the priority-unmasking semantic for
+ * `statusEnteredAt`: when the winning bucket changes from a higher-priority
+ * mask to a lower-priority bucket, the new entry time is the unmask time
+ * (i.e., the moment the higher-priority bucket cleared), not when the
+ * underlying agent originally entered the lower-priority bucket. Cleared when
+ * the workspace has never had contributing agents.
+ */
+interface WorkspaceBucketHistoryEntry {
+  bucket: WorkspaceStateBucket;
+  enteredAt: string;
+}
+
+type FetchWorkspacesRequestMessage = Extract<
+  SessionInboundMessage,
+  { type: "fetch_workspaces_request" }
+>;
+type FetchWorkspacesRequestFilter = NonNullable<FetchWorkspacesRequestMessage["filter"]>;
+type FetchWorkspacesRequestSort = NonNullable<FetchWorkspacesRequestMessage["sort"]>[number];
+type FetchWorkspacesResponsePayload = Extract<
+  SessionOutboundMessage,
+  { type: "fetch_workspaces_response" }
+>["payload"];
+type FetchWorkspacesResponseEntry = FetchWorkspacesResponsePayload["entries"][number];
+type FetchWorkspacesResponsePageInfo = FetchWorkspacesResponsePayload["pageInfo"];
+
+export type WorkspaceUpdatesFilter = FetchWorkspacesRequestFilter;
+
+export interface WorkspaceDirectoryDeps {
+  logger: pino.Logger;
+  projectRegistry: {
+    list(): Promise<PersistedProjectRecord[]>;
+  };
+  workspaceRegistry: {
+    list(): Promise<PersistedWorkspaceRecord[]>;
+  };
+  listAgentPayloads(): Promise<AgentSnapshotPayload[]>;
+  isProviderVisibleToClient(provider: string): boolean;
+  buildWorkspaceDescriptor(input: {
+    workspace: PersistedWorkspaceRecord;
+    projectRecord?: PersistedProjectRecord | null;
+    includeGitData: boolean;
+  }): Promise<WorkspaceDescriptorPayload>;
+}
+
+export function summarizeFetchWorkspacesEntries(entries: Iterable<FetchWorkspacesResponseEntry>): {
+  count: number;
+  projectIds: string[];
+  statusCounts: Record<string, number>;
+  workspaces: Array<{
+    id: string;
+    projectId: string;
+    projectDisplayName: string;
+    name: string;
+    status: FetchWorkspacesResponseEntry["status"];
+    workspaceKind: FetchWorkspacesResponseEntry["workspaceKind"];
+    activityAt: string | null;
+  }>;
+} {
+  const workspaces = Array.from(entries, (entry) => ({
+    id: entry.id,
+    projectId: entry.projectId,
+    projectDisplayName: entry.projectDisplayName,
+    name: entry.name,
+    status: entry.status,
+    workspaceKind: entry.workspaceKind,
+    activityAt: entry.activityAt,
+  }));
+  const statusCounts = new Map<string, number>();
+  for (const workspace of workspaces) {
+    statusCounts.set(workspace.status, (statusCounts.get(workspace.status) ?? 0) + 1);
+  }
+
+  return {
+    count: workspaces.length,
+    projectIds: [...new Set(workspaces.map((workspace) => workspace.projectId))],
+    statusCounts: Object.fromEntries(statusCounts),
+    workspaces,
+  };
+}
+
+export class WorkspaceDirectory {
+  private readonly archivingByWorkspaceId = new Map<string, string>();
+  /**
+   * Per-workspace last-seen winning bucket + entered-at. Persists across
+   * `buildDescriptorMap` calls inside the daemon process; reset on cold start.
+   * Server-internal; never crosses the wire.
+   */
+  private readonly bucketHistoryByWorkspaceId = new Map<string, WorkspaceBucketHistoryEntry>();
+
+  private readonly pager = new SortablePager<
+    WorkspaceDescriptorPayload,
+    FetchWorkspacesRequestSort["key"]
+  >({
+    validKeys: FETCH_WORKSPACES_SORT_KEYS,
+    defaultSort: [{ key: "activity_at", direction: "desc" }],
+    label: "fetch_workspaces",
+    getId: (workspace) => workspace.id,
+    getSortValue: (workspace, key) => {
+      switch (key) {
+        case "status_priority":
+          return getWorkspaceStateBucketPriority(workspace.status);
+        case "activity_at":
+          return workspace.activityAt ? Date.parse(workspace.activityAt) : null;
+        case "name":
+          return workspace.name.toLocaleLowerCase();
+        case "project_id":
+          return workspace.projectId.toLocaleLowerCase();
+        default:
+          throw new Error("unreachable");
+      }
+    },
+  });
+
+  constructor(private readonly deps: WorkspaceDirectoryDeps) {}
+
+  markArchiving(workspaceIds: Iterable<string>, archivingAt: string): void {
+    for (const workspaceId of workspaceIds) {
+      this.archivingByWorkspaceId.set(workspaceId, archivingAt);
+    }
+  }
+
+  clearArchiving(workspaceIds: Iterable<string>): void {
+    for (const workspaceId of workspaceIds) {
+      this.archivingByWorkspaceId.delete(workspaceId);
+    }
+  }
+
+  async buildDescriptorMap(options: {
+    includeGitData: boolean;
+    workspaceIds?: Iterable<string>;
+  }): Promise<Map<string, WorkspaceDescriptorPayload>> {
+    const [agents, persistedWorkspaces, persistedProjects] = await Promise.all([
+      this.deps.listAgentPayloads(),
+      this.deps.workspaceRegistry.list(),
+      this.deps.projectRegistry.list(),
+    ]);
+
+    const activeProjects = new Map(
+      persistedProjects
+        .filter((project) => !project.archivedAt)
+        .map((project) => [project.projectId, project] as const),
+    );
+    const archivedProjectIds = new Set(
+      persistedProjects.filter((project) => project.archivedAt).map((project) => project.projectId),
+    );
+    const activeRecords = persistedWorkspaces.filter(
+      (workspace) => !workspace.archivedAt && !archivedProjectIds.has(workspace.projectId),
+    );
+    const descriptorsByWorkspaceId = new Map<string, WorkspaceDescriptorPayload>();
+    const workspaceIds = options.workspaceIds ? new Set(options.workspaceIds) : null;
+    const workspaceIdsByDirectory = new Map(
+      activeRecords.map(
+        (workspace) => [normalizeWorkspaceId(workspace.cwd), workspace.workspaceId] as const,
+      ),
+    );
+
+    const includedWorkspaces = activeRecords.filter(
+      (workspace) => !workspaceIds || workspaceIds.has(workspace.workspaceId),
+    );
+    const workspaceDescriptors = await Promise.all(
+      includedWorkspaces.map((workspace) =>
+        this.deps.buildWorkspaceDescriptor({
+          workspace,
+          projectRecord: activeProjects.get(workspace.projectId) ?? null,
+          includeGitData: options.includeGitData,
+        }),
+      ),
+    );
+    for (let i = 0; i < includedWorkspaces.length; i += 1) {
+      const workspaceId = includedWorkspaces[i].workspaceId;
+      descriptorsByWorkspaceId.set(workspaceId, {
+        ...workspaceDescriptors[i],
+        archivingAt: this.archivingByWorkspaceId.get(workspaceId) ?? null,
+      });
+    }
+
+    const activeAgents = agents.filter(
+      (agent) => !agent.archivedAt && this.deps.isProviderVisibleToClient(agent.provider),
+    );
+    const activeAgentsById = new Map(activeAgents.map((agent) => [agent.id, agent] as const));
+
+    for (const agent of activeAgents) {
+      let workspaceAgent = agent;
+      let bucket: WorkspaceDescriptorPayload["status"];
+      if (isDelegatedAgent(agent)) {
+        if (agent.status !== "running") {
+          continue;
+        }
+        const parentAgent = resolveDelegationRootAgent(agent, activeAgentsById);
+        if (!parentAgent) {
+          continue;
+        }
+        workspaceAgent = parentAgent;
+        bucket = "running";
+      } else {
+        bucket = deriveAgentStateBucket({
+          status: agent.status,
+          pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
+          requiresAttention: agent.requiresAttention,
+          attentionReason: agent.attentionReason ?? null,
+        });
+      }
+
+      const workspaceId = workspaceIdsByDirectory.get(normalizeWorkspaceId(workspaceAgent.cwd));
+      if (workspaceId === undefined) {
+        continue;
+      }
+      const existing = descriptorsByWorkspaceId.get(workspaceId);
+      if (!existing) {
+        continue;
+      }
+
+      if (
+        getWorkspaceStateBucketPriority(bucket) < getWorkspaceStateBucketPriority(existing.status)
+      ) {
+        existing.status = bucket;
+      }
+    }
+
+    // Resolve the workspace-level `statusEnteredAt` (see aggregate semantics
+    // on `resolveStatusEnteredAt`).
+    const nowIso = new Date().toISOString();
+    for (const [workspaceId, descriptor] of descriptorsByWorkspaceId) {
+      const contributingAgents = agents.filter(
+        (agent) =>
+          !agent.archivedAt &&
+          this.deps.isProviderVisibleToClient(agent.provider) &&
+          workspaceIdsByDirectory.get(normalizeWorkspaceId(agent.cwd)) === workspaceId,
+      );
+      const result = this.resolveStatusEnteredAt({
+        workspaceId,
+        winningBucket: descriptor.status,
+        contributingAgents,
+        previous: this.bucketHistoryByWorkspaceId.get(workspaceId) ?? null,
+        nowIso,
+      });
+      descriptor.statusEnteredAt = result.statusEnteredAt;
+      if (result.recordUpdate) {
+        this.bucketHistoryByWorkspaceId.set(workspaceId, result.recordUpdate);
+      } else if (result.recordDelete) {
+        this.bucketHistoryByWorkspaceId.delete(workspaceId);
+      }
+    }
+
+    return descriptorsByWorkspaceId;
+  }
+
+  // Aggregate the workspace-level `statusEnteredAt` from its contributing
+  // agents. Aggregate semantics:
+  //   - winning bucket = highest-priority across contributing agents;
+  //   - entry time = best-effort timestamp from agents in the winning bucket;
+  //   - priority unmasking: when the winning bucket transitions (e.g. a
+  //     higher-priority bucket cleared), the new entry time is "now";
+  //   - same-bucket emits reuse the previous entered-at;
+  //   - empty workspaces that never had contributing agents get
+  //     `statusEnteredAt: null`.
+  //   - when archived agents leave a previously active workspace empty, keep
+  //     the previous done timestamp or stamp the transition to done now.
+  private resolveStatusEnteredAt(params: {
+    workspaceId: string;
+    winningBucket: WorkspaceStateBucket;
+    contributingAgents: AgentSnapshotPayload[];
+    previous: WorkspaceBucketHistoryEntry | null;
+    nowIso: string;
+  }): {
+    statusEnteredAt: string | null;
+    recordUpdate?: WorkspaceBucketHistoryEntry;
+    recordDelete?: true;
+  } {
+    const { winningBucket, contributingAgents, previous, nowIso } = params;
+
+    if (contributingAgents.length === 0) {
+      if (!previous) {
+        return { statusEnteredAt: null };
+      }
+
+      const enteredAt = previous.bucket === "done" ? previous.enteredAt : nowIso;
+      return {
+        statusEnteredAt: enteredAt,
+        recordUpdate: { bucket: "done", enteredAt },
+      };
+    }
+
+    if (!previous) {
+      const newestInWinningBucket = this.findNewestAgentTimestampInBucket(
+        contributingAgents,
+        winningBucket,
+      );
+      const enteredAt = newestInWinningBucket ?? nowIso;
+      return {
+        statusEnteredAt: enteredAt,
+        recordUpdate: { bucket: winningBucket, enteredAt },
+      };
+    }
+
+    if (previous.bucket !== winningBucket) {
+      return {
+        statusEnteredAt: nowIso,
+        recordUpdate: { bucket: winningBucket, enteredAt: nowIso },
+      };
+    }
+
+    return {
+      statusEnteredAt: previous.enteredAt,
+      recordUpdate: previous,
+    };
+  }
+
+  // Best-effort newest timestamp across contributing agents whose derived
+  // bucket matches `winningBucket`. Uses available agent fields:
+  //   - `attentionTimestamp` when attention is set (covers attention/failed)
+  //   - `updatedAt` as a general fallback for any bucket
+  // Returns `null` if no matching agent has a parseable timestamp.
+  private findNewestAgentTimestampInBucket(
+    contributingAgents: AgentSnapshotPayload[],
+    winningBucket: WorkspaceStateBucket,
+  ): string | null {
+    const candidates = contributingAgents
+      .filter((agent) => {
+        const derived = deriveAgentStateBucket({
+          status: agent.status,
+          pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
+          requiresAttention: agent.requiresAttention,
+          attentionReason: agent.attentionReason ?? null,
+        });
+        return derived === winningBucket;
+      })
+      .map((agent) => {
+        // Prefer attentionTimestamp when the agent has attention set — this is
+        // the most accurate "entered current status" signal.
+        if (agent.attentionTimestamp) {
+          return agent.attentionTimestamp;
+        }
+        // Fall back to updatedAt as a general proxy for recent activity.
+        return agent.updatedAt;
+      })
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .sort();
+    return candidates.at(-1) ?? null;
+  }
+
+  resolveRegisteredWorkspaceIdForCwd(cwd: string, workspaces: PersistedWorkspaceRecord[]): string {
+    const normalizedCwd = normalizeWorkspaceId(cwd);
+    const exact = workspaces.find((workspace) => workspace.cwd === normalizedCwd);
+    if (exact) {
+      return exact.workspaceId;
+    }
+
+    const userHome = homedir();
+    let bestMatch: PersistedWorkspaceRecord | null = null;
+    for (const workspace of workspaces) {
+      if (workspace.cwd === userHome) continue;
+      if (workspace.archivedAt) continue;
+      const prefix = workspace.cwd.endsWith(sep) ? workspace.cwd : `${workspace.cwd}${sep}`;
+      if (!normalizedCwd.startsWith(prefix)) {
+        continue;
+      }
+      if (!bestMatch || workspace.cwd.length > bestMatch.cwd.length) {
+        bestMatch = workspace;
+      }
+    }
+
+    return bestMatch?.workspaceId ?? normalizedCwd;
+  }
+
+  async listDescriptors(): Promise<WorkspaceDescriptorPayload[]> {
+    return Array.from(
+      (
+        await this.buildDescriptorMap({
+          includeGitData: true,
+        })
+      ).values(),
+    );
+  }
+
+  matchesFilter(input: {
+    workspace: WorkspaceDescriptorPayload;
+    filter: FetchWorkspacesRequestFilter | undefined;
+  }): boolean {
+    const { workspace, filter } = input;
+    if (!filter) {
+      return true;
+    }
+
+    if (filter.projectId && filter.projectId.trim().length > 0) {
+      if (workspace.projectId !== filter.projectId.trim()) {
+        return false;
+      }
+    }
+
+    if (filter.idPrefix && filter.idPrefix.trim().length > 0) {
+      if (!workspace.id.startsWith(filter.idPrefix.trim())) {
+        return false;
+      }
+    }
+
+    if (filter.query && filter.query.trim().length > 0) {
+      const query = filter.query.trim().toLocaleLowerCase();
+      const haystacks = [workspace.name, workspace.projectId, workspace.id];
+      if (!haystacks.some((value) => value.toLocaleLowerCase().includes(query))) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  async listFetchEntries(request: FetchWorkspacesRequestMessage): Promise<{
+    entries: FetchWorkspacesResponseEntry[];
+    pageInfo: FetchWorkspacesResponsePageInfo;
+  }> {
+    const filter = request.filter;
+    const sort = this.pager.normalizeSort(request.sort);
+    let entries = await this.listDescriptors();
+    const listedCount = entries.length;
+    entries = entries.filter((workspace) => this.matchesFilter({ workspace, filter }));
+    const filteredCount = entries.length;
+    entries.sort((left, right) => this.pager.compare(left, right, sort));
+
+    const cursorToken = request.page?.cursor;
+    if (cursorToken) {
+      const cursor = this.pager.decode(cursorToken, sort);
+      entries = entries.filter(
+        (workspace) => this.pager.compareWithCursor(workspace, cursor, sort) > 0,
+      );
+    }
+
+    const limit = request.page?.limit ?? 200;
+    const pagedEntries = entries.slice(0, limit);
+    const hasMore = entries.length > limit;
+    const nextCursor =
+      hasMore && pagedEntries.length > 0
+        ? this.pager.encode(pagedEntries[pagedEntries.length - 1], sort)
+        : null;
+
+    this.deps.logger.debug(
+      {
+        requestId: request.requestId,
+        filter: request.filter ?? null,
+        sort,
+        page: request.page ?? null,
+        listedCount,
+        filteredCount,
+        returnedCount: pagedEntries.length,
+        hasMore,
+        nextCursor,
+      },
+      "fetch_workspaces_entries_listed",
+    );
+
+    return {
+      entries: pagedEntries,
+      pageInfo: {
+        nextCursor,
+        prevCursor: request.page?.cursor ?? null,
+        hasMore,
+      },
+    };
+  }
+}
+
+function resolveDelegationRootAgent(
+  agent: AgentSnapshotPayload,
+  activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>,
+): AgentSnapshotPayload | null {
+  const seen = new Set<string>([agent.id]);
+  let current = agent;
+
+  while (true) {
+    const parentAgentId = getParentAgentIdFromLabels(current.labels);
+    if (!parentAgentId) {
+      return current;
+    }
+    if (seen.has(parentAgentId)) {
+      return null;
+    }
+    const parent = activeAgentsById.get(parentAgentId);
+    if (!parent) {
+      return null;
+    }
+    seen.add(parentAgentId);
+    current = parent;
+  }
+}

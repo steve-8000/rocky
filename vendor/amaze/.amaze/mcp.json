@@ -1,0 +1,16 @@
+{
+	"$schema": "https://raw.githubusercontent.com/can1357/amaze/main/packages/coding-agent/src/config/mcp-schema.json",
+	"mcpServers": {
+		"amaze-browser-bridge": {
+			"type": "stdio",
+			"command": "bun",
+			"args": [
+				"packages/browser-control-extension/src/mcp-server.ts"
+			],
+			"env": {
+				"AMAZE_BROWSER_BRIDGE_HOST": "127.0.0.1",
+				"AMAZE_BROWSER_BRIDGE_PORT": "17362"
+			}
+		}
+	}
+}

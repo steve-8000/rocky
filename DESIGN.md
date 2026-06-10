@@ -5,7 +5,7 @@ Rocky is a single server + remote WebUI + desktop app that integrates three syst
 | Layer | Source | What Rocky takes |
 | --- | --- | --- |
 | Agent runtime | **amaze** (`~/roy/amaze/amaze`) | The full amaze CLI, unchanged. Exposed to Rocky over ACP (`amaze acp`). |
-| Server core | **Paseo** (vendored worktree at `vendor/paseo`, branch `rocky`) | Session daemon, workspace/worktree registry, model/provider catalog, file attachments, terminals, schedules, MCP server, relay, web client. |
+| Server core | **Paseo** (vendored at `vendor/paseo`) | Session daemon, workspace/worktree registry, model/provider catalog, file attachments, terminals, schedules, MCP server, relay, web client. |
 | Orchestration | **AionUi** (Team Mode concept) | Leader/Teammate orchestrator mode, re-implemented as a Rocky skill on top of the Paseo MCP/CLI surface instead of AionUi's Electron-internal Team MCP server. |
 
 ## Why this shape
@@ -58,31 +58,10 @@ A rewrite of Paseo's daemon (agent lifecycle, timeline sync, E2E relay, binary t
 4. Leader monitors with `wait_for_agent` / `get_agent_activity`, reassigns or kills silent agents (AionUi's auto-escalate-failed), aggregates results, updates the board, reports.
 5. Permissions stay per-agent (daemon permission queue = AionUi's per-agent permission dialogs).
 
-## Repository layout
+## Key decisions (current — see ARCHITECTURE.md for the authoritative layout)
 
-```
-rocky/
-├── DESIGN.md                 ← this file
-├── README.md                 ← quickstart + operations
-├── package.json              ← root scripts (setup/dev/build/dmg/webui)
-├── config/
-│   └── rocky.config.json     ← template for ~/.rocky/config.json
-├── skills/
-│   └── rocky-orchestrate/    ← Leader/Teammate orchestrator skill
-├── scripts/
-│   ├── setup.sh              ← install deps, link amaze, write ~/.rocky config
-│   ├── build-webui.sh        ← Expo web export → webui/dist
-│   ├── build-dmg.sh          ← Rocky-branded Electron DMG
-│   ├── brand/make-icons.py   ← generates Rocky icon set (icns/ico/png)
-│   └── serve-webui.mjs       ← static server for remote WebUI + daemon proxy note
-└── vendor/
-    └── paseo/                ← git worktree of ~/roy/paseo @ branch `rocky`
-```
-
-## Key decisions
-
-- **Vendor via git worktree, not fork-copy.** `vendor/paseo` is a worktree of the existing `~/roy/paseo` clone on a dedicated `rocky` branch. Rocky-specific changes (branding: productName/appId/icons/executable name; defaults: port 7767, `ROCKY_HOME`) are commits on that branch; upstream sync is `git merge main`.
-- **Port 7767, home `~/.rocky`.** Avoids colliding with a normal Paseo install on 6767/`~/.paseo` on the same machine. `PASEO_HOME=~/.rocky` keeps daemon internals untouched.
-- **amaze stays external.** Rocky never bundles amaze; it invokes whatever `amaze` is on PATH (`~/.bun/bin/amaze`). Upgrading amaze is independent of Rocky.
-- **WebUI = Expo web export served separately (port 7780) talking to the daemon WS.** The daemon's express only serves `/public`; the web client is a static SPA that takes the daemon endpoint as a connection target — same model as app.paseo.sh. For LAN/remote use, run `scripts/serve-webui.mjs` (or any static host / reverse proxy) and point it at `ws://host:7767` with the daemon password.
-- **DMG unsigned for now.** No Developer ID identity on this machine (`security find-identity` → 0). The build produces a valid DMG with `notarize: false`; signing/notarization is a config flip when credentials exist.
+- **Self-contained vendoring.** `vendor/{amaze,paseo,aionui}` are full source trees committed to this repository (originally a git worktree of `~/roy/paseo`; detached when self-containment became a requirement). Upstream sync is a re-export + replay of Rocky commits.
+- **One server process.** Paseo daemon and AionUi web-host run inside a single Node runtime (`server/rockyd.ts`). aioncore (AionUi's closed-source Rust backend) is the only managed child process; amaze stays a separate CLI for per-session process isolation.
+- **Port 7767, home `~/.rocky`.** Avoids colliding with stock Paseo (6767/`~/.paseo`). All Rocky state, including AionUi's, lives under `~/.rocky`.
+- **amaze is vendored, not PATH-resolved.** Both the daemon ACP provider and the AionUi custom agent point at `vendor/amaze/packages/coding-agent/src/cli.ts` via Bun.
+- **DMG ad-hoc signed for now.** No Developer ID identity on this machine. Signing/notarization is a config flip in `vendor/paseo/packages/desktop/electron-builder.yml` when credentials exist.

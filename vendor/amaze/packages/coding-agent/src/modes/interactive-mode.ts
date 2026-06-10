@@ -1,0 +1,2357 @@
+/**
+ * Interactive mode for the coding agent.
+ * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
+ */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { type Agent, type AgentMessage, type AgentToolResult, ThinkingLevel } from "@amaze/agent-core";
+import type { CompactionOutcome } from "@amaze/agent-core/compaction";
+import {
+	type AssistantMessage,
+	type ImageContent,
+	type Message,
+	type Model,
+	modelsAreEqual,
+	type UsageReport,
+} from "@amaze/ai";
+import type { Component, EditorTheme, SlashCommand } from "@amaze/tui";
+import {
+	Container,
+	clearRenderCache,
+	Loader,
+	Markdown,
+	ProcessTerminal,
+	Spacer,
+	Text,
+	TUI,
+	visibleWidth,
+} from "@amaze/tui";
+import { APP_NAME, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@amaze/utils";
+import chalk from "chalk";
+import { KeybindingsManager } from "../config/keybindings";
+import { isSettingsInitialized, Settings, settings } from "../config/settings";
+import type {
+	ExtensionUIContext,
+	ExtensionUIDialogOptions,
+	ExtensionWidgetContent,
+	ExtensionWidgetOptions,
+} from "../extensibility/extensions";
+import type { CompactOptions } from "../extensibility/extensions/types";
+import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
+import { resolveLocalUrlToPath } from "../internal-urls";
+import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
+import { initializeMissionRuntime } from "../mission/runtime";
+import {
+	humanizePlanTitle,
+	type PlanApprovalDetails,
+	renameApprovedPlanFile,
+	resolvePlanTitle,
+	validatePlanContentForApproval,
+} from "../plan-mode/approved-plan";
+import { type PlanModeState, parsePlanModeState } from "../plan-mode/state";
+import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
+	type: "text",
+};
+import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import { HistoryStorage } from "../session/history-storage";
+import type { SessionContext, SessionManager } from "../session/session-manager";
+import { getRecentSessions } from "../session/session-manager";
+import { STTController, type SttState } from "../stt";
+import type { LspStartupServerInfo } from "../tools";
+import { normalizeLocalScheme } from "../tools/path-utils";
+import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
+import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
+import { formatPhaseDisplayName } from "../tools/todo-write";
+import { ToolError } from "../tools/tool-errors";
+import type { EventBus } from "../utils/event-bus";
+import { getEditorCommand, openInEditor } from "../utils/external-editor";
+import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
+import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import type { AssistantMessageComponent } from "./components/assistant-message";
+import type { BashExecutionComponent } from "./components/bash-execution";
+import { CustomEditor } from "./components/custom-editor";
+import { DynamicBorder } from "./components/dynamic-border";
+import type { EvalExecutionComponent } from "./components/eval-execution";
+import type { HookEditorComponent } from "./components/hook-editor";
+import type { HookInputComponent } from "./components/hook-input";
+import type { HookSelectorComponent } from "./components/hook-selector";
+import { type MissionControlDisplayMode, MissionControlView } from "./components/mission-control-view";
+import { StatusLineComponent } from "./components/status-line";
+import type { ToolExecutionHandle } from "./components/tool-execution";
+import { WelcomeComponent, type LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
+import { BtwController } from "./controllers/btw-controller";
+import { CommandController } from "./controllers/command-controller";
+import { EventController } from "./controllers/event-controller";
+import { ExtensionUiController } from "./controllers/extension-ui-controller";
+import { InputController } from "./controllers/input-controller";
+import { MCPCommandController } from "./controllers/mcp-command-controller";
+import { SelectorController } from "./controllers/selector-controller";
+import { SSHCommandController } from "./controllers/ssh-command-controller";
+import { TodoCommandController } from "./controllers/todo-command-controller";
+import {
+	consumeLoopLimitIteration,
+	createLoopLimitRuntime,
+	describeLoopLimit,
+	describeLoopLimitRuntime,
+	isLoopDurationExpired,
+	type LoopLimitRuntime,
+	parseLoopLimitArgs,
+} from "./loop-limit";
+import { OAuthManualInputManager } from "./oauth-manual-input";
+import { SessionObserverRegistry } from "./session-observer-registry";
+import type { Theme } from "./theme/theme";
+import {
+	getEditorTheme,
+	getMarkdownTheme,
+	getSymbolTheme,
+	onTerminalAppearanceChange,
+	onThemeChange,
+	theme,
+} from "./theme/theme";
+import { createTuiClientBridge } from "./tui-client-bridge";
+import type { CompactionQueuedMessage, InteractiveModeContext, SubmittedUserInput, TodoItem, TodoPhase } from "./types";
+import { UiHelpers } from "./utils/ui-helpers";
+
+const EDITOR_MAX_HEIGHT_MIN = 6;
+const EDITOR_MAX_HEIGHT_MAX = 18;
+const EDITOR_RESERVED_ROWS = 12;
+const EDITOR_FALLBACK_ROWS = 24;
+
+const HUD_NOTE_SUPERSCRIPT_DIGITS: Record<string, string> = {
+	"0": "\u2070",
+	"1": "\u00b9",
+	"2": "\u00b2",
+	"3": "\u00b3",
+	"4": "\u2074",
+	"5": "\u2075",
+	"6": "\u2076",
+	"7": "\u2077",
+	"8": "\u2078",
+	"9": "\u2079",
+};
+
+function formatHudNoteMarker(count: number): string {
+	if (count <= 0) return "";
+	const sub = String(count)
+		.split("")
+		.map(d => HUD_NOTE_SUPERSCRIPT_DIGITS[d] ?? d)
+		.join("");
+	return theme.fg("dim", chalk.italic(` \u207a${sub}`));
+}
+
+/** Options for creating an InteractiveMode instance (for future API use) */
+export interface InteractiveModeOptions {
+	/** Providers that were migrated during startup */
+	migratedProviders?: string[];
+	/** Warning message if model fallback occurred */
+	modelFallbackMessage?: string;
+	/** Initial message to send */
+	initialMessage?: string;
+	/** Initial images to include with the message */
+	initialImages?: ImageContent[];
+	/** Additional initial messages to queue */
+	initialMessages?: string[];
+}
+
+export class InteractiveMode implements InteractiveModeContext {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	settings: Settings;
+	keybindings: KeybindingsManager;
+	agent: Agent;
+	historyStorage?: HistoryStorage;
+
+	ui: TUI;
+	chatContainer: Container;
+	pendingMessagesContainer: Container;
+	statusContainer: Container;
+	todoContainer: Container;
+	btwContainer: Container;
+	editor: CustomEditor;
+	editorContainer: Container;
+	hookWidgetContainerAbove: Container;
+	hookWidgetContainerBelow: Container;
+	statusLine: StatusLineComponent;
+	missionControlView: MissionControlView;
+
+	isInitialized = false;
+	isBackgrounded = false;
+	isBashMode = false;
+	toolOutputExpanded = false;
+	planModeEnabled = false;
+	planModePaused = false;
+	goalModeEnabled = false;
+	goalModePaused = false;
+	planModePlanFilePath: string | undefined = undefined;
+	loopModeEnabled = false;
+	loopPrompt: string | undefined = undefined;
+	loopLimit: LoopLimitRuntime | undefined = undefined;
+	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
+	todoPhases: TodoPhase[] = [];
+
+	hideThinkingBlock = false;
+	pendingImages: ImageContent[] = [];
+	compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	pendingTools = new Map<string, ToolExecutionHandle>();
+	pendingBashComponents: BashExecutionComponent[] = [];
+	bashComponent: BashExecutionComponent | undefined = undefined;
+	pendingPythonComponents: EvalExecutionComponent[] = [];
+	pythonComponent: EvalExecutionComponent | undefined = undefined;
+	isPythonMode = false;
+	streamingComponent: AssistantMessageComponent | undefined = undefined;
+	streamingMessage: AssistantMessage | undefined = undefined;
+	loadingAnimation: Loader | undefined = undefined;
+	autoCompactionLoader: Loader | undefined = undefined;
+	retryLoader: Loader | undefined = undefined;
+	#pendingWorkingMessage: string | undefined;
+	readonly #defaultWorkingMessage = `Working… (esc to interrupt)`;
+	autoCompactionEscapeHandler?: () => void;
+	retryEscapeHandler?: () => void;
+	unsubscribe?: () => void;
+	onInputCallback?: (input: SubmittedUserInput) => void;
+	optimisticUserMessageSignature: string | undefined = undefined;
+	locallySubmittedUserSignatures: Set<string> = new Set();
+	#pendingSubmittedInput: SubmittedUserInput | undefined;
+	#pendingSubmissionDispose: (() => void) | undefined;
+	lastSigintTime = 0;
+	lastEscapeTime = 0;
+	shutdownRequested = false;
+	#isShuttingDown = false;
+	hookSelector: HookSelectorComponent | undefined = undefined;
+	hookInput: HookInputComponent | undefined = undefined;
+	hookEditor: HookEditorComponent | undefined = undefined;
+	lastStatusSpacer: Spacer | undefined = undefined;
+	lastStatusText: Text | undefined = undefined;
+	lastMemorySpacer: Spacer | undefined = undefined;
+	lastMemoryText: Text | undefined = undefined;
+	fileSlashCommands: Set<string> = new Set();
+	skillCommands: Map<string, string> = new Map();
+	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
+
+	#pendingSlashCommands: SlashCommand[] = [];
+	#cleanupUnsubscribe?: () => void;
+	readonly #version: string;
+	readonly #changelogMarkdown: string | undefined;
+	#planModePreviousTools: string[] | undefined;
+	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
+	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
+	#planModeHasEntered = false;
+	#planReviewContainer: Container | undefined;
+	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
+	mcpManager?: import("../mcp").MCPManager;
+	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+
+	readonly #btwController: BtwController;
+	readonly #commandController: CommandController;
+	readonly #todoCommandController: TodoCommandController;
+	readonly #eventController: EventController;
+	readonly #extensionUiController: ExtensionUiController;
+	readonly #inputController: InputController;
+	readonly #selectorController: SelectorController;
+	readonly #uiHelpers: UiHelpers;
+	#sttController: STTController | undefined;
+	#voiceAnimationInterval: NodeJS.Timeout | undefined;
+	#voiceHue = 0;
+	#voicePreviousShowHardwareCursor: boolean | null = null;
+	#voicePreviousUseTerminalCursor: boolean | null = null;
+	#resizeHandler?: () => void;
+	#observerRegistry: SessionObserverRegistry;
+	#eventBus?: EventBus;
+	#eventBusUnsubscribers: Array<() => void> = [];
+	#welcomeComponent?: WelcomeComponent;
+
+	constructor(
+		session: AgentSession,
+		version: string,
+		changelogMarkdown: string | undefined = undefined,
+		setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void = () => {},
+		lspServers: LspStartupServerInfo[] | undefined = undefined,
+		mcpManager?: import("../mcp").MCPManager,
+		eventBus?: EventBus,
+	) {
+		this.session = session;
+		this.sessionManager = session.sessionManager;
+		this.settings = session.settings;
+		this.keybindings = KeybindingsManager.inMemory();
+		this.agent = session.agent;
+		this.#version = version;
+		this.#changelogMarkdown = changelogMarkdown;
+		this.#toolUiContextSetter = setToolUIContext;
+		this.lspServers = lspServers;
+		this.mcpManager = mcpManager;
+		this.#eventBus = eventBus;
+		if (eventBus) {
+			this.#eventBusUnsubscribers.push(
+				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
+					this.#handleLspStartupEvent(data as LspStartupEvent);
+				}),
+			);
+		}
+
+		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
+		this.chatContainer = new Container();
+		this.pendingMessagesContainer = new Container();
+		this.statusContainer = new Container();
+		this.todoContainer = new Container();
+		this.btwContainer = new Container();
+		this.editor = new CustomEditor(getEditorTheme());
+		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
+		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
+		this.editor.onAutocompleteCancel = () => {
+			this.ui.requestRender(true);
+		};
+		this.editor.onAutocompleteUpdate = () => {
+			this.ui.requestRender();
+		};
+		this.#syncEditorMaxHeight();
+		this.#resizeHandler = () => {
+			this.#syncEditorMaxHeight();
+			this.updateEditorTopBorder();
+		};
+		process.stdout.on("resize", this.#resizeHandler);
+		try {
+			this.historyStorage = HistoryStorage.open();
+			this.editor.setHistoryStorage(this.historyStorage);
+		} catch (error) {
+			logger.warn("History storage unavailable", { error: String(error) });
+		}
+		this.hookWidgetContainerAbove = new Container();
+		this.hookWidgetContainerAbove.addChild(new Spacer(1));
+		this.hookWidgetContainerBelow = new Container();
+		this.editorContainer = new Container();
+		this.editorContainer.addChild(this.editor);
+		this.statusLine = new StatusLineComponent(session);
+		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		const missionRuntime = initializeMissionRuntime();
+		this.missionControlView = new MissionControlView({
+			missionEventBus: missionRuntime.bus,
+			onRefresh: () => this.ui.requestRender(),
+			initialMode: session.settings.get("mission.terminalPanel"),
+		});
+
+		this.hideThinkingBlock = settings.get("hideThinkingBlock");
+
+		const builtinCommandNames = new Set(BUILTIN_SLASH_COMMANDS.map(c => c.name));
+		const hookCommands: SlashCommand[] = (
+			this.session.extensionRunner?.getRegisteredCommands(builtinCommandNames) ?? []
+		).map(cmd => ({
+			name: cmd.name,
+			description: cmd.description ?? "(hook command)",
+			getArgumentCompletions: cmd.getArgumentCompletions,
+		}));
+
+		// Convert custom commands (TypeScript) to SlashCommand format
+		const customCommands: SlashCommand[] = this.session.customCommands.map(loaded => ({
+			name: loaded.command.name,
+			description: `${loaded.command.description} (${loaded.source})`,
+		}));
+
+		// Build skill commands from session.skills (if enabled)
+		const skillCommandList: SlashCommand[] = [];
+		if (settings.get("skills.enableSkillCommands")) {
+			for (const skill of this.session.skills) {
+				const commandName = `skill:${skill.name}`;
+				this.skillCommands.set(commandName, skill.filePath);
+				skillCommandList.push({ name: commandName, description: skill.description });
+			}
+		}
+
+		// Store pending commands for init() where file commands are loaded async
+		this.#pendingSlashCommands = [...BUILTIN_SLASH_COMMANDS, ...hookCommands, ...customCommands, ...skillCommandList];
+
+		this.#uiHelpers = new UiHelpers(this);
+		this.#btwController = new BtwController(this);
+		this.#extensionUiController = new ExtensionUiController(this);
+		this.#eventController = new EventController(this, () => this.refreshMissionControl());
+		this.#commandController = new CommandController(this);
+		this.#todoCommandController = new TodoCommandController(this);
+		this.#selectorController = new SelectorController(this);
+		this.#inputController = new InputController(this);
+		this.#eventBusUnsubscribers.push(
+			this.session.subscribe(event => {
+				void this.#handleGoalSessionEvent(event);
+			}),
+		);
+		this.#observerRegistry = new SessionObserverRegistry();
+	}
+
+	async init(): Promise<void> {
+		if (this.isInitialized) return;
+
+		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
+
+		// Register session manager flush for signal handlers (SIGINT, SIGTERM, SIGHUP)
+		this.#cleanupUnsubscribe = postmortem.register("session-manager-flush", () => this.sessionManager.flush());
+
+		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
+		// The handler is process-global — subagent tools (which can't reach
+		// `showHookSelector` on their own) resolve through this exact closure.
+		// `Settings.instance` is the disk-backed singleton; passing it explicitly
+		// guarantees the decision persists even when the prompt is triggered
+		// from a subagent whose own `Settings` is an in-memory snapshot.
+		setAutoQaConsentHandler(() => this.#promptAutoQaConsent(), Settings.instance);
+
+		await logger.time(
+			"InteractiveMode.init:slashCommands",
+			this.refreshSlashCommandState.bind(this),
+			getProjectDir(),
+		);
+
+		// Get current model info for welcome screen
+		const modelName = this.session.model?.name ?? "Unknown";
+		const providerName = this.session.model?.provider ?? "Unknown";
+
+		// Get recent sessions
+		const recentSessions = await logger.time("InteractiveMode.init:recentSessions", () =>
+			getRecentSessions(this.sessionManager.getSessionDir()).then(sessions =>
+				sessions.map(s => ({
+					name: s.name,
+					timeAgo: s.timeAgo,
+				})),
+			),
+		);
+
+		const startupQuiet = settings.get("startup.quiet");
+		this.#welcomeComponent = undefined;
+
+		for (const warning of this.session.configWarnings) {
+			this.ui.addChild(new Text(theme.fg("warning", `Warning: ${warning}`), 1, 0));
+			this.ui.addChild(new Spacer(1));
+		}
+
+		this.ui.addChild(this.missionControlView);
+
+		if (!startupQuiet) {
+			// Add welcome header
+			this.#welcomeComponent = new WelcomeComponent(
+				this.#version,
+				modelName,
+				providerName,
+				recentSessions,
+				this.#getWelcomeLspServers(),
+			);
+
+			// Setup UI layout
+			this.ui.addChild(new Spacer(1));
+			this.ui.addChild(this.#welcomeComponent);
+			this.ui.addChild(new Spacer(1));
+			this.#welcomeComponent.playIntro(() => this.ui.requestRender());
+
+			// Add changelog if provided
+			if (this.#changelogMarkdown) {
+				this.ui.addChild(new DynamicBorder());
+				if (settings.get("collapseChangelog")) {
+					const versionMatch = this.#changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
+					const latestVersion = versionMatch ? versionMatch[1] : this.#version;
+					const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
+					this.ui.addChild(new Text(condensedText, 1, 0));
+				} else {
+					this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+					this.ui.addChild(new Spacer(1));
+					this.ui.addChild(new Markdown(this.#changelogMarkdown.trim(), 1, 0, getMarkdownTheme()));
+					this.ui.addChild(new Spacer(1));
+				}
+				this.ui.addChild(new DynamicBorder());
+			}
+		}
+
+		this.ui.addChild(this.chatContainer);
+		this.ui.addChild(this.pendingMessagesContainer);
+		this.ui.addChild(this.statusContainer);
+		this.ui.addChild(this.todoContainer);
+		this.ui.addChild(this.btwContainer);
+		this.ui.addChild(this.statusLine); // Only renders hook statuses (main status in editor border)
+		this.ui.addChild(this.hookWidgetContainerAbove);
+		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.hookWidgetContainerBelow);
+		this.ui.setFocus(this.editor);
+
+		this.#inputController.setupKeyHandlers();
+		this.#inputController.setupEditorSubmitHandler();
+
+		// Wire observer registry to EventBus
+		if (this.#eventBus) {
+			this.#observerRegistry.subscribeToEventBus(this.#eventBus);
+		}
+		this.#observerRegistry.setMainSession(this.sessionManager.getSessionFile() ?? undefined);
+		this.#observerRegistry.onChange(() => {
+			this.statusLine.setSubagentCount(this.#observerRegistry.getActiveSubagentCount());
+			this.refreshMissionControl();
+			this.ui.requestRender();
+		});
+
+		// Load initial todos
+		await this.#loadTodoList();
+
+		// Start the UI
+		this.ui.start();
+		pushTerminalTitle();
+		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		this.updateEditorBorderColor();
+		this.#syncEditorMaxHeight();
+		this.isInitialized = true;
+		// Route interactive tool-approval requests (e.g. infra/deploy bash commands)
+		// through the TUI Yes/No dialog. Without a client bridge these would be blocked
+		// fail-closed in the terminal. ACP mode wires its own bridge and never reaches here.
+		this.session.setClientBridge(createTuiClientBridge(this));
+		this.ui.requestRender(true);
+
+		// Initialize hooks with TUI-based UI context
+		await this.initHooksAndCustomTools();
+
+		// Restore mode from session (e.g. plan mode on resume)
+		await this.#restoreModeFromSession();
+
+		// Restore unsent editor draft from previous session shutdown (Ctrl+D).
+		// One-shot: consumeDraft removes the sidecar after read so the next
+		// resume does not re-restore the same text.
+		try {
+			const draft = await this.sessionManager.consumeDraft();
+			if (draft && !this.editor.getText()) {
+				this.editor.setText(draft);
+				this.updateEditorBorderColor();
+				this.ui.requestRender();
+			}
+		} catch (err) {
+			logger.warn("Failed to restore session draft", { error: String(err) });
+		}
+
+		// Subscribe to agent events
+		this.#subscribeToAgent();
+
+		// Set up theme file watcher
+		onThemeChange(() => {
+			clearRenderCache();
+			this.ui.invalidate();
+			this.updateEditorBorderColor();
+			this.ui.requestRender();
+		});
+
+		// Subscribe to terminal dark/light appearance changes.
+		// The terminal queries background color via OSC 11 at startup and on
+		// Mode 2031 notifications, computing luminance to detect dark/light.
+		this.ui.terminal.onAppearanceChange(mode => {
+			onTerminalAppearanceChange(mode);
+		});
+
+		// Set up git branch watcher
+		this.statusLine.watchBranch(() => {
+			this.updateEditorTopBorder();
+			this.ui.requestRender();
+		});
+
+		// Initial top border update
+		this.updateEditorTopBorder();
+	}
+
+	/** Reload slash commands and autocomplete for the provided working directory. */
+	async refreshSlashCommandState(cwd?: string): Promise<void> {
+		const basePath = cwd ?? this.sessionManager.getCwd();
+		const fileCommands = await loadSlashCommands({ cwd: basePath });
+		this.fileSlashCommands = new Set(fileCommands.map(cmd => cmd.name));
+		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
+			name: cmd.name,
+			description: cmd.description,
+		}));
+		const autocompleteProvider = this.#inputController.createAutocompleteProvider(
+			[...this.#pendingSlashCommands, ...fileSlashCommands],
+			basePath,
+		);
+		this.editor.setAutocompleteProvider(autocompleteProvider);
+		this.session.setSlashCommands(fileCommands);
+	}
+
+	async getUserInput(): Promise<SubmittedUserInput> {
+		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
+		this.onInputCallback = input => {
+			this.onInputCallback = undefined;
+			resolve(input);
+		};
+		this.#scheduleLoopAutoSubmit();
+		this.#scheduleGoalContinuation();
+		return promise;
+	}
+
+	#scheduleLoopAutoSubmit(): void {
+		this.#cancelLoopAutoSubmit();
+		if (!this.loopModeEnabled || !this.loopPrompt) return;
+		const prompt = this.loopPrompt;
+		const loopAction = settings.get("loop.mode");
+		this.#deferLoopAutoSubmit(() => {
+			void this.#runLoopIteration(loopAction, prompt);
+		});
+	}
+
+	#deferLoopAutoSubmit(callback: () => void): void {
+		// Brief delay so the user has a chance to press Esc between iterations.
+		this.#loopAutoSubmitTimer = setTimeout(() => {
+			this.#loopAutoSubmitTimer = undefined;
+			if (!this.loopModeEnabled || !this.onInputCallback) return;
+			callback();
+		}, 800);
+	}
+
+	#cancelLoopAutoSubmit(): void {
+		if (this.#loopAutoSubmitTimer) {
+			clearTimeout(this.#loopAutoSubmitTimer);
+			this.#loopAutoSubmitTimer = undefined;
+		}
+	}
+
+	#scheduleGoalContinuation(): void {}
+
+	#cancelGoalContinuation(): void {
+		if (this.#goalContinuationTimer) {
+			clearTimeout(this.#goalContinuationTimer);
+			this.#goalContinuationTimer = undefined;
+		}
+	}
+
+	#isLoopAutoSubmitBlocked(): boolean {
+		return this.session.isStreaming || this.session.isCompacting;
+	}
+
+	#submitLoopPromptWhenReady(prompt: string): void {
+		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (isLoopDurationExpired(this.loopLimit)) {
+			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
+			return;
+		}
+		if (this.#isLoopAutoSubmitBlocked()) {
+			this.#deferLoopAutoSubmit(() => this.#submitLoopPromptWhenReady(prompt));
+			return;
+		}
+		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
+	}
+
+	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
+		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (this.#isLoopAutoSubmitBlocked()) {
+			this.#deferLoopAutoSubmit(() => {
+				void this.#runLoopIteration(action, prompt);
+			});
+			return;
+		}
+
+		if (!consumeLoopLimitIteration(this.loopLimit)) {
+			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+			return;
+		}
+
+		if (action === "compact") {
+			await this.handleCompactCommand();
+		} else if (action === "reset") {
+			await this.handleClearCommand();
+		}
+		this.#submitLoopPromptWhenReady(prompt);
+	}
+
+	disableLoopMode(message = "Loop mode disabled."): void {
+		const wasEnabled = this.loopModeEnabled;
+		this.loopModeEnabled = false;
+		this.loopPrompt = undefined;
+		this.loopLimit = undefined;
+		this.#cancelLoopAutoSubmit();
+		this.statusLine.setLoopModeStatus(undefined);
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+		if (wasEnabled) {
+			this.showStatus(message);
+		}
+	}
+
+	/**
+	 * Pause the loop without exiting it: drops the captured prompt and any
+	 * pending auto-resubmit. Loop mode stays enabled — the next prompt the
+	 * user submits becomes the new loop prompt and resumes iteration.
+	 */
+	pauseLoop(): void {
+		this.loopPrompt = undefined;
+		this.#cancelLoopAutoSubmit();
+	}
+
+	async handleLoopCommand(args = ""): Promise<void> {
+		if (this.loopModeEnabled) {
+			this.disableLoopMode();
+			return;
+		}
+		const parsedLimit = parseLoopLimitArgs(args);
+		if (typeof parsedLimit === "string") {
+			this.showError(parsedLimit);
+			return;
+		}
+		this.loopModeEnabled = true;
+		this.loopPrompt = undefined;
+		this.loopLimit = createLoopLimitRuntime(parsedLimit);
+		this.statusLine.setLoopModeStatus({ enabled: true });
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+		const limitSuffix = parsedLimit ? ` Limited to ${describeLoopLimit(parsedLimit)}.` : "";
+		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
+		this.showStatus(
+			`Loop mode enabled.${limitSuffix}${remainingSuffix} Your next prompt will repeat after each turn. Esc cancels the current iteration; /loop again to disable.`,
+		);
+	}
+
+	recordLocalSubmission(text: string, imageCount = 0): () => void {
+		if (this.isKnownSlashCommand(text)) {
+			return () => {};
+		}
+		const signature = `${text}\u0000${imageCount}`;
+		this.locallySubmittedUserSignatures.add(signature);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			this.locallySubmittedUserSignatures.delete(signature);
+		};
+	}
+
+	async withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T> {
+		const dispose = this.recordLocalSubmission(text, options?.imageCount ?? 0);
+		try {
+			return await fn();
+		} catch (err) {
+			dispose();
+			throw err;
+		}
+	}
+
+	startPendingSubmission(input: {
+		text: string;
+		images?: ImageContent[];
+		customType?: string;
+		display?: boolean;
+	}): SubmittedUserInput {
+		const submission: SubmittedUserInput = {
+			text: input.text,
+			images: input.images,
+			customType: input.customType,
+			display: input.display,
+			cancelled: false,
+			started: false,
+		};
+		this.#pendingSubmittedInput = submission;
+		if (!submission.customType) {
+			const imageCount = submission.images?.length ?? 0;
+			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
+			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
+			this.addMessageToChat({
+				role: "user",
+				content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+		} else {
+			this.optimisticUserMessageSignature = undefined;
+			this.#pendingSubmissionDispose = undefined;
+		}
+		this.editor.setText("");
+		this.ensureLoadingAnimation();
+		this.ui.requestRender();
+		return submission;
+	}
+
+	cancelPendingSubmission(): boolean {
+		const submission = this.#pendingSubmittedInput;
+		if (!submission || submission.started) {
+			return false;
+		}
+
+		submission.cancelled = true;
+		this.#pendingSubmittedInput = undefined;
+		this.optimisticUserMessageSignature = undefined;
+		this.#pendingSubmissionDispose?.();
+		this.#pendingSubmissionDispose = undefined;
+		this.#pendingWorkingMessage = undefined;
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+			this.statusContainer.clear();
+		}
+		if (!submission.customType) {
+			this.pendingImages = submission.images ? [...submission.images] : [];
+			this.rebuildChatFromMessages();
+			this.editor.setText(submission.text);
+		}
+		this.updateEditorBorderColor();
+		this.ui.requestRender();
+		return true;
+	}
+
+	markPendingSubmissionStarted(input: SubmittedUserInput): boolean {
+		if (this.#pendingSubmittedInput !== input || input.cancelled) {
+			return false;
+		}
+		input.started = true;
+		return true;
+	}
+
+	finishPendingSubmission(input: SubmittedUserInput): void {
+		const wasPendingSubmission = this.#pendingSubmittedInput === input;
+		const pendingSubmissionDispose = this.#pendingSubmissionDispose;
+		if (wasPendingSubmission) {
+			this.#pendingSubmittedInput = undefined;
+			this.#pendingSubmissionDispose = undefined;
+		}
+		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
+			this.optimisticUserMessageSignature = undefined;
+			pendingSubmissionDispose?.();
+			this.#pendingWorkingMessage = undefined;
+			if (this.loadingAnimation) {
+				this.loadingAnimation.stop();
+				this.loadingAnimation = undefined;
+				this.statusContainer.clear();
+			}
+		}
+	}
+
+	#computeEditorMaxHeight(): number {
+		const rows = this.ui.terminal.rows;
+		const terminalRows = Number.isFinite(rows) && rows > 0 ? rows : EDITOR_FALLBACK_ROWS;
+		const maxHeight = terminalRows - EDITOR_RESERVED_ROWS;
+		return Math.max(EDITOR_MAX_HEIGHT_MIN, Math.min(EDITOR_MAX_HEIGHT_MAX, maxHeight));
+	}
+
+	#syncEditorMaxHeight(): void {
+		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
+	}
+
+	updateEditorBorderColor(): void {
+		if (this.isBashMode) {
+			this.editor.borderColor = theme.getBashModeBorderColor();
+		} else if (this.isPythonMode) {
+			this.editor.borderColor = theme.getPythonModeBorderColor();
+		} else {
+			const accentEnabled = !isSettingsInitialized() || settings.get("statusLine.sessionAccent") !== false;
+			const sessionName = accentEnabled ? this.sessionManager.getSessionName() : undefined;
+			const hex = sessionName ? getSessionAccentHex(sessionName) : undefined;
+			const ansi = getSessionAccentAnsi(hex);
+			if (ansi) {
+				this.editor.borderColor = (str: string) => `${ansi}${str}\x1b[39m`;
+			} else {
+				const level = this.session.thinkingLevel ?? ThinkingLevel.Off;
+				this.editor.borderColor = theme.getThinkingBorderColor(level);
+			}
+		}
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+	}
+
+	updateEditorTopBorder(): void {
+		const availableWidth = this.editor.getTopBorderAvailableWidth(this.ui.terminal.columns);
+		const topBorder = this.statusLine.getTopBorder(availableWidth);
+		this.editor.setTopBorder(topBorder);
+	}
+
+	rebuildChatFromMessages(): void {
+		this.chatContainer.clear();
+		const context = this.session.buildDisplaySessionContext();
+		this.renderSessionContext(context);
+		this.refreshMissionControl();
+	}
+
+	refreshMissionControl(): void {
+		this.missionControlView?.refresh();
+	}
+
+	selectNextMission(): void {
+		this.#selectMission("next");
+	}
+
+	selectPreviousMission(): void {
+		this.#selectMission("previous");
+	}
+
+	toggleMissionControlDisplayMode(): void {
+		const mode = this.missionControlView.toggleDisplayMode();
+		this.ui.requestRender();
+		this.showStatus(`Mission Control: ${mode}`, { dim: true });
+	}
+
+	setMissionControlDisplayMode(mode: MissionControlDisplayMode): void {
+		this.missionControlView.setDisplayMode(mode);
+		this.ui.requestRender();
+	}
+
+	#selectMission(direction: "next" | "previous"): void {
+		const changed =
+			direction === "next"
+				? this.missionControlView.selectNextMission()
+				: this.missionControlView.selectPreviousMission();
+		if (!changed) {
+			this.showStatus("No other mission available.", { dim: true });
+			return;
+		}
+		this.ui.requestRender();
+		this.showStatus(`Selected mission: ${this.missionControlView.getSelectedMissionLabel() ?? "unknown"}`, {
+			dim: true,
+		});
+	}
+
+	#renderTodoHudLine(todo: TodoItem, prefix: string): string {
+		const checkbox = theme.checkbox;
+		const marker = formatHudNoteMarker(todo.notes?.length ?? 0);
+		switch (todo.status) {
+			case "completed":
+				return theme.fg("success", `${prefix}${checkbox.checked} ${chalk.strikethrough(todo.content)}`) + marker;
+			case "in_progress":
+				return theme.fg("accent", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+			case "abandoned":
+				return theme.fg("error", `${prefix}${checkbox.unchecked} ${chalk.strikethrough(todo.content)}`) + marker;
+			default:
+				return theme.fg("dim", `${prefix}${checkbox.unchecked} ${todo.content}`) + marker;
+		}
+	}
+
+	#buildTodoBodyLines(phases: TodoPhase[]): string[] {
+		const indent = "  ";
+		const hook = theme.tree.hook;
+		const lines: string[] = [];
+		phases.forEach((phase, phaseIndex) => {
+			lines.push(`${indent}${theme.fg("accent", `${hook} ${formatPhaseDisplayName(phase.name, phaseIndex + 1)}`)}`);
+			phase.tasks.forEach((todo, index) => {
+				const prefix = `${indent}${index === 0 ? hook : " "} `;
+				lines.push(this.#renderTodoHudLine(todo, prefix));
+			});
+		});
+		return lines;
+	}
+
+	#renderTodoList(): void {
+		this.todoContainer.clear();
+		const phases = this.todoPhases.filter(phase => phase.tasks.length > 0);
+		if (phases.length === 0) return;
+
+		const indent = "  ";
+		const lines: string[] = ["", indent + theme.bold(theme.fg("accent", "Todos"))];
+		lines.push(...this.#buildTodoBodyLines(phases));
+		this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
+	}
+
+	async #loadTodoList(): Promise<void> {
+		this.todoPhases = this.session.getTodoPhases();
+		this.#renderTodoList();
+	}
+
+	async #getPlanFilePath(): Promise<string> {
+		return "local://PLAN.md";
+	}
+
+	#resolvePlanFilePath(planFilePath: string): string {
+		if (planFilePath.startsWith("local:")) {
+			const normalized = normalizeLocalScheme(planFilePath);
+			return resolveLocalUrlToPath(normalized, {
+				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.sessionManager.getSessionId(),
+			});
+		}
+		return path.resolve(this.sessionManager.getCwd(), planFilePath);
+	}
+
+	#updatePlanModeStatus(): void {
+		const status =
+			this.planModeEnabled || this.planModePaused
+				? {
+						enabled: this.planModeEnabled,
+						paused: this.planModePaused,
+					}
+				: undefined;
+		this.statusLine.setPlanModeStatus(status);
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+	}
+
+	#goalPlanModeBlocker(): string | null {
+		return null;
+	}
+
+	#runtimeCriticBlocker(_action: "plan"): string | null {
+		return null;
+	}
+
+	#planModePersistenceData(planState: Pick<PlanModeState, "planFilePath" | "workflow">): Record<string, unknown> {
+		const data: Record<string, unknown> = { planFilePath: planState.planFilePath };
+		if (planState.workflow) data.workflow = planState.workflow;
+		return data;
+	}
+
+	#planStaleApprovalMessage(_planState: Pick<PlanModeState, "planFilePath"> | undefined): string | undefined {
+		return undefined;
+	}
+
+	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "agent_start") this.#cancelGoalContinuation();
+	}
+
+	async #applyPlanModeModel(): Promise<void> {
+		const resolved = this.session.resolveRoleModelWithThinking("Planner");
+		if (!resolved.model) return;
+
+		const currentModel = this.session.model;
+		const sameModel = modelsAreEqual(currentModel, resolved.model);
+		const planThinkingLevel = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
+
+		this.#planModePreviousModelState = currentModel
+			? { model: currentModel, thinkingLevel: this.session.thinkingLevel }
+			: undefined;
+
+		if (!sameModel) {
+			if (this.session.isStreaming) {
+				this.#pendingModelSwitch = { model: resolved.model, thinkingLevel: planThinkingLevel };
+				return;
+			}
+			try {
+				await this.session.setModelTemporary(resolved.model, planThinkingLevel);
+			} catch (error) {
+				this.showWarning(
+					`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		} else if (planThinkingLevel) {
+			this.session.setThinkingLevel(planThinkingLevel);
+		}
+	}
+
+	/** Apply any deferred model switch after the current stream ends. */
+	async flushPendingModelSwitch(): Promise<void> {
+		const pending = this.#pendingModelSwitch;
+		if (!pending) return;
+		this.#pendingModelSwitch = undefined;
+		try {
+			await this.session.setModelTemporary(pending.model, pending.thinkingLevel);
+		} catch (error) {
+			this.showWarning(
+				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	/** Restore mode state from session entries on resume (e.g. plan mode). */
+	async #restoreModeFromSession(): Promise<void> {
+		const sessionContext = this.sessionManager.buildSessionContext();
+		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
+			this.sessionManager.appendModeChange("none");
+			return;
+		}
+		if (!this.session.settings.get("plan.enabled")) {
+			// Clear stale plan/plan_paused mode so re-enabling the setting
+			// later doesn't unexpectedly restore an old plan session.
+			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused") {
+				this.sessionManager.appendModeChange("none");
+			}
+			return;
+		}
+		if (sessionContext.mode === "plan") {
+			const planState = parsePlanModeState(sessionContext.modeData, { reentry: this.#planModeHasEntered });
+			if (!planState) {
+				this.sessionManager.appendModeChange("none");
+				return;
+			}
+			await this.#enterPlanMode({ planFilePath: planState.planFilePath, workflow: planState.workflow });
+		} else if (sessionContext.mode === "plan_paused") {
+			const planState = parsePlanModeState(sessionContext.modeData, { enabled: false });
+			if (!planState) {
+				this.sessionManager.appendModeChange("none");
+				return;
+			}
+			this.planModePlanFilePath = planState.planFilePath;
+			this.planModePaused = true;
+			this.#planModeHasEntered = true;
+			this.#updatePlanModeStatus();
+		}
+	}
+
+	async #enterPlanMode(options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> {
+		if (this.planModeEnabled) {
+			return;
+		}
+		const blocker = this.#goalPlanModeBlocker();
+		if (blocker) {
+			this.showWarning(blocker);
+			return;
+		}
+
+		this.planModePaused = false;
+
+		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
+		const previousTools = this.session.getActiveToolNames();
+		const hasResolveTool = this.session.getToolByName("resolve") !== undefined;
+		const planTools = hasResolveTool ? [...previousTools, "resolve"] : previousTools;
+		const uniquePlanTools = [...new Set(planTools)];
+		const nextPlanState: PlanModeState = {
+			enabled: true,
+			planFilePath,
+			workflow: options?.workflow ?? "parallel",
+			reentry: this.#planModeHasEntered,
+		};
+
+		this.#planModePreviousTools = previousTools;
+		this.planModePlanFilePath = planFilePath;
+		this.planModeEnabled = true;
+
+		await this.session.setActiveToolsByName(uniquePlanTools);
+		this.session.setPlanModeState(nextPlanState);
+		this.session.setStandingResolveHandler?.(input => this.#runPlanApprovalResolve(input));
+		if (this.session.isStreaming) {
+			await this.session.sendPlanModeContext({ deliverAs: "steer" });
+		}
+		this.#planModeHasEntered = true;
+		await this.#applyPlanModeModel();
+		this.#updatePlanModeStatus();
+		this.sessionManager.appendModeChange("plan", this.#planModePersistenceData(nextPlanState));
+		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+	}
+
+	/** Standing resolve dispatcher registered while plan mode is active. The agent
+	 *  submits the finalized plan by calling `resolve { action: "apply", extra: { title } }`;
+	 *  this handler validates the plan file exists, normalizes the title, and shapes the
+	 *  payload that `event-controller` forwards to `handlePlanApproval`. */
+	#runPlanApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
+		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
+			sourceToolName: "plan_approval",
+			label: "Plan ready for approval",
+			apply: async (_reason, extra) => {
+				const state = this.session.getPlanModeState?.();
+				if (!state?.enabled) {
+					throw new ToolError("Plan mode is not active.");
+				}
+				const staleMessage = this.#planStaleApprovalMessage(state);
+				const criticMessage = this.#runtimeCriticBlocker("plan");
+				if (criticMessage) {
+					throw new ToolError(criticMessage);
+				}
+				if (staleMessage) {
+					throw new ToolError(staleMessage);
+				}
+				const planFilePath = state.planFilePath;
+				const planContent = await this.#readPlanFile(planFilePath);
+				if (planContent === null) {
+					throw new ToolError(
+						`Plan file not found at ${planFilePath}. Write the finalized plan to ${planFilePath} before requesting approval.`,
+					);
+				}
+				validatePlanContentForApproval(planContent);
+				const normalized = resolvePlanTitle({
+					suppliedTitle: extra?.title,
+					planContent,
+					planFilePath,
+				});
+				const details: PlanApprovalDetails = {
+					planFilePath,
+					finalPlanFilePath: `local://${normalized.fileName}`,
+					title: normalized.title,
+					planExists: true,
+				};
+				return {
+					content: [{ type: "text" as const, text: "Plan ready for approval." }],
+					details,
+				};
+			},
+		});
+	}
+
+	async #exitPlanMode(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
+		if (!this.planModeEnabled) {
+			return;
+		}
+
+		const previousTools = this.#planModePreviousTools;
+		if (previousTools && previousTools.length > 0) {
+			await this.session.setActiveToolsByName(previousTools);
+		}
+		if (this.#planModePreviousModelState) {
+			const prev = this.#planModePreviousModelState;
+			if (modelsAreEqual(this.session.model, prev.model)) {
+				// Same model — only thinking level may differ. Avoid setModelTemporary()
+				// which would reset provider-side sessions (openai-responses/Codex) and
+				// break conversation continuity.
+				this.session.setThinkingLevel(prev.thinkingLevel);
+			} else if (this.session.isStreaming) {
+				this.#pendingModelSwitch = { model: prev.model, thinkingLevel: prev.thinkingLevel };
+			} else {
+				await this.session.setModelTemporary(prev.model, prev.thinkingLevel);
+			}
+			// If #applyPlanModeModel queued a deferred switch to the plan-role model
+			// (because the session was streaming on entry), drop it now: we are
+			// leaving plan mode, so flushing it on the next agent_end would land the
+			// session on the plan-role model after the user has exited plan mode
+			// (issue #816). Only clear when the pending target matches the plan-role
+			// model — leave any unrelated user-queued switch intact.
+			const pending = this.#pendingModelSwitch;
+			if (pending) {
+				const planResolution = this.session.resolveRoleModelWithThinking("Planner");
+				if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
+					this.#pendingModelSwitch = undefined;
+				}
+			}
+		}
+		this.session.setStandingResolveHandler?.(null);
+		const persistedPlanState =
+			this.session.getPlanModeState() ??
+			(this.planModePlanFilePath
+				? ({
+						enabled: true,
+						planFilePath: this.planModePlanFilePath,
+					} satisfies PlanModeState)
+				: undefined);
+		this.session.setPlanModeState(undefined);
+		this.planModeEnabled = false;
+		this.planModePaused = options?.paused ?? false;
+		this.planModePlanFilePath = undefined;
+		this.#planModePreviousTools = undefined;
+		this.#planModePreviousModelState = undefined;
+		this.#updatePlanModeStatus();
+		const paused = options?.paused ?? false;
+		// Exiting plan mode without pausing is an explicit approval. If the active mission is a
+		// proposal-required intent (architecture/refactor/deploy) still awaiting a proposal, the
+		// approved plan becomes its proposal — unblocking mutations through the policy gate.
+		if (!paused) {
+			try {
+				const missionControl = this.session.missionControl;
+				if (missionControl?.activeMissionNeedsProposal()) {
+					missionControl.approveActiveProposal({ planRef: persistedPlanState?.planFilePath ?? null });
+				}
+			} catch {
+				// Approval bookkeeping must never block leaving plan mode.
+			}
+		}
+		this.sessionManager.appendModeChange(
+			paused ? "plan_paused" : "none",
+			paused && persistedPlanState ? this.#planModePersistenceData(persistedPlanState) : undefined,
+		);
+		if (!options?.silent) {
+			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
+		}
+	}
+
+	async #readPlanFile(planFilePath: string): Promise<string | null> {
+		const resolvedPath = this.#resolvePlanFilePath(planFilePath);
+		try {
+			return await Bun.file(resolvedPath).text();
+		} catch (error) {
+			if (isEnoent(error)) {
+				return null;
+			}
+			throw error;
+		}
+	}
+
+	#renderPlanPreview(planContent: string, options?: { append?: boolean }): void {
+		const existingContainer = this.#planReviewContainer;
+		const replaceExisting = options?.append !== true && existingContainer !== undefined;
+		const planReviewContainer = replaceExisting ? existingContainer : new Container();
+		planReviewContainer.clear();
+		planReviewContainer.addChild(new Spacer(1));
+		planReviewContainer.addChild(new DynamicBorder());
+		planReviewContainer.addChild(new Text(theme.bold(theme.fg("accent", "Plan Review")), 1, 1));
+		planReviewContainer.addChild(new Spacer(1));
+		planReviewContainer.addChild(new Markdown(planContent, 1, 1, getMarkdownTheme()));
+		planReviewContainer.addChild(new DynamicBorder());
+		if (!replaceExisting) {
+			this.chatContainer.addChild(planReviewContainer);
+		}
+		this.#planReviewContainer = planReviewContainer;
+		this.ui.requestRender();
+	}
+
+	#getEditorTerminalPath(): string | null {
+		if (process.platform === "win32") {
+			return null;
+		}
+		return "/dev/tty";
+	}
+
+	async #openEditorTerminalHandle(): Promise<fs.FileHandle | null> {
+		const terminalPath = this.#getEditorTerminalPath();
+		if (!terminalPath) {
+			return null;
+		}
+		try {
+			return await fs.open(terminalPath, "r+");
+		} catch {
+			return null;
+		}
+	}
+
+	#getPlanReviewHelpText(): string {
+		const externalEditorKey = this.keybindings.getDisplayString("app.editor.external");
+		if (!externalEditorKey) {
+			return "up/down navigate  enter select  esc cancel";
+		}
+		return `up/down navigate  enter select  ${externalEditorKey.toLowerCase()} open in editor  esc cancel`;
+	}
+
+	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
+		const editorCmd = getEditorCommand();
+		if (!editorCmd) {
+			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
+			return;
+		}
+
+		const resolvedPath = this.#resolvePlanFilePath(planFilePath);
+		let currentText: string;
+		try {
+			currentText = await Bun.file(resolvedPath).text();
+		} catch (error) {
+			if (isEnoent(error)) {
+				this.showError(`Plan file not found at ${planFilePath}`);
+				return;
+			}
+			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+
+		let ttyHandle: fs.FileHandle | null = null;
+		try {
+			ttyHandle = await this.#openEditorTerminalHandle();
+			this.ui.stop();
+
+			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
+				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
+				: ["inherit", "inherit", "inherit"];
+
+			const result = await openInEditor(editorCmd, currentText, {
+				extension: path.extname(resolvedPath) || ".md",
+				stdio,
+				trimTrailingNewline: false,
+			});
+			if (result !== null) {
+				await Bun.write(resolvedPath, result);
+				this.#renderPlanPreview(result);
+				this.showStatus("Plan updated in external editor.");
+			}
+		} catch (error) {
+			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			if (ttyHandle) {
+				await ttyHandle.close();
+			}
+			this.ui.start();
+			this.ui.requestRender(true);
+		}
+	}
+
+	async #approvePlan(
+		planContent: string,
+		options: {
+			planFilePath: string;
+			finalPlanFilePath: string;
+			title: string;
+			preserveContext?: boolean;
+			compactBeforeExecute?: boolean;
+		},
+	): Promise<void> {
+		await renameApprovedPlanFile({
+			planFilePath: options.planFilePath,
+			finalPlanFilePath: options.finalPlanFilePath,
+			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+			getSessionId: () => this.sessionManager.getSessionId(),
+		});
+		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
+
+		// Mark the pending abort caused by the plan-mode → compaction transition as
+		// silent BEFORE #exitPlanMode raises it. The `finally` below clears the
+		// flag on every terminal compaction outcome (ok / cancelled / failed /
+		// throw) so a leaked flag cannot silence a later unrelated abort.
+		// Branchless mark+clear when !compactBeforeExecute: mark is gated; clear
+		// is unconditional and idempotent.
+		if (options.compactBeforeExecute) {
+			this.session.markPlanCompactAbortPending();
+		}
+		let compactOutcome: CompactionOutcome | undefined;
+		try {
+			await this.#exitPlanMode({ silent: true, paused: false });
+
+			if (!options.preserveContext) {
+				await this.handleClearCommand();
+				// The new session has a fresh local:// root — persist the approved plan there
+				// so `local://<title>.md` resolves correctly in the execution session.
+				const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
+					getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
+					getSessionId: () => this.sessionManager.getSessionId(),
+				});
+				await Bun.write(newLocalPath, planContent);
+			} else if (options.compactBeforeExecute) {
+				// Distill the plan-mode transcript before the execution turn is queued so
+				// the plan-approved synthetic prompt lands as a fresh cache anchor.
+				// Outcome is consumed after tool-restoration and plan-reference-path
+				// bookkeeping below; `markPlanReferenceSent` is intentionally deferred
+				// past the cancel guard — see the comment at the cancel branch.
+				// Cancellation skips the synthetic-prompt dispatch (operator's explicit
+				// abort is honored); failure proceeds best-effort — approval intent stands.
+				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
+					planFilePath: options.finalPlanFilePath,
+				});
+				// Pin the plan reference path BEFORE compaction so any user messages
+				// queued during the compaction await (which `handleCompactCommand`
+				// flushes via `flushCompactionQueue` before returning) see the
+				// approved plan in `#buildPlanReferenceMessage`. Reassignment after
+				// the try/finally is idempotent and kept for the !compactBeforeExecute
+				// branch.
+				this.session.setPlanReferencePath(options.finalPlanFilePath);
+				compactOutcome = await this.handleCompactCommand(compactionPrompt);
+			}
+		} finally {
+			// Unconditional clear. Idempotent: a no-op when the flag was never set
+			// (i.e., the !compactBeforeExecute branch), and a no-op when the flag
+			// was already consumed by AgentSession.#handleAgentEvent's aborted
+			// message_end stamping. Guarantees the flag is dead at every exit.
+			this.session.clearPlanCompactAbortPending();
+		}
+
+		// Tool restoration runs on every path — the plan mode tools must be
+		// retired regardless of whether the synthetic prompt fires.
+		if (previousTools.length > 0) {
+			await this.session.setActiveToolsByName(previousTools);
+		}
+		this.session.setPlanReferencePath(options.finalPlanFilePath);
+
+		if (compactOutcome === "cancelled") {
+			// Explicit abort: honor it. `executeCompaction` already surfaced
+			// `showError("Compaction cancelled")` to the operator; we add the
+			// deferred-dispatch warning and exit. `markPlanReferenceSent` is
+			// intentionally skipped here: `#planReferenceSent` stays false, so
+			// `AgentSession.#buildPlanReferenceMessage` will inject the plan
+			// reference on the operator's next `prompt()` call. If we marked it
+			// sent here, the executor's first turn would have no plan context.
+			this.showWarning(
+				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
+			);
+			return;
+		}
+
+		// Approved plans land in a fresh (or compacted) session whose first user-visible
+		// turn is the synthetic plan-approved prompt — that path bypasses the
+		// input-controller's title generation. Seed an auto-name from the plan title
+		// so the session is not left unnamed. `setSessionName("auto")` is a no-op
+		// when the user has already chosen a name (preserveContext paths).
+		const seededName = humanizePlanTitle(options.title);
+		if (seededName && !this.sessionManager.getSessionName()) {
+			const applied = await this.sessionManager.setSessionName(seededName, "auto");
+			if (applied) {
+				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+				this.updateEditorBorderColor();
+			}
+		}
+
+		// markPlanReferenceSent fires only on the dispatch path so the synthetic
+		// plan-approved prompt is the source of the reference injection.
+		this.session.markPlanReferenceSent();
+		const planModePrompt = prompt.render(planModeApprovedPrompt, {
+			planContent,
+			finalPlanFilePath: options.finalPlanFilePath,
+			contextPreserved: options.preserveContext === true,
+		});
+		await this.session.prompt(planModePrompt, { synthetic: true });
+	}
+
+	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {
+		if (this.planModeEnabled) {
+			const confirmed = await this.showHookConfirm(
+				"Exit plan mode?",
+				"This exits plan mode without approving a plan.",
+			);
+			if (!confirmed) return;
+			await this.#exitPlanMode({ paused: true });
+			return;
+		}
+		const blocker = this.#goalPlanModeBlocker();
+		if (blocker) {
+			this.showWarning(blocker);
+			return;
+		}
+		if (!this.session.settings.get("plan.enabled")) {
+			this.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
+			return;
+		}
+		await this.#enterPlanMode();
+		if (initialPrompt && this.onInputCallback) {
+			this.onInputCallback(this.startPendingSubmission({ text: initialPrompt }));
+		}
+	}
+
+	async handlePlanApproval(details: PlanApprovalDetails): Promise<void> {
+		if (!this.planModeEnabled) {
+			this.showWarning("Plan mode is not active.");
+			return;
+		}
+
+		// Abort the agent to prevent it from continuing (e.g., re-submitting the
+		// plan) while the popup is showing. This is internal review control flow,
+		// not a user-visible interruption of goal execution, so it must not pause
+		// the linked goal.
+		await this.session.abort({ goalReason: "internal" });
+
+		const currentPlanState = this.session.getPlanModeState?.();
+		const staleMessage = this.#planStaleApprovalMessage(currentPlanState);
+		if (staleMessage) {
+			this.showError(staleMessage);
+			return;
+		}
+		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
+		this.planModePlanFilePath = planFilePath;
+		const planContent = await this.#readPlanFile(planFilePath);
+		if (!planContent) {
+			this.showError(`Plan file not found at ${planFilePath}`);
+			return;
+		}
+
+		this.#renderPlanPreview(planContent, { append: true });
+		const choice = await this.showHookSelector(
+			"Plan mode - next step",
+			["Approve and execute", "Approve and compact context", "Approve and keep context", "Refine plan"],
+			{
+				helpText: this.#getPlanReviewHelpText(),
+				onExternalEditor: () => void this.#openPlanInExternalEditor(planFilePath),
+			},
+		);
+
+		if (
+			choice === "Approve and execute" ||
+			choice === "Approve and compact context" ||
+			choice === "Approve and keep context"
+		) {
+			const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
+			try {
+				const latestPlanStaleMessage = this.#planStaleApprovalMessage(this.session.getPlanModeState?.());
+				const criticMessage = this.#runtimeCriticBlocker("plan");
+				if (criticMessage) {
+					this.showError(criticMessage);
+					return;
+				}
+				if (latestPlanStaleMessage) {
+					this.showError(latestPlanStaleMessage);
+					return;
+				}
+				const latestPlanContent = await this.#readPlanFile(planFilePath);
+				if (!latestPlanContent) {
+					this.showError(`Plan file not found at ${planFilePath}`);
+					return;
+				}
+				await this.#approvePlan(latestPlanContent, {
+					planFilePath,
+					finalPlanFilePath,
+					title: details.title,
+					preserveContext: choice !== "Approve and execute",
+					compactBeforeExecute: choice === "Approve and compact context",
+				});
+			} catch (error) {
+				this.showError(
+					`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			return;
+		}
+	}
+
+	/**
+	 * Pool of consent-prompt variants. Each entry is `[headline, reassurance]`;
+	 * the second line always promises the same scope (tool name + confusion
+	 * details, never personal data) so users learn what they're consenting to
+	 * even as the top line rotates.
+	 *
+	 * Kept in-module rather than i18n'd because the whole charm is the tone
+	 * — translations would need to preserve it deliberately, not auto-render.
+	 */
+	static #AUTOQA_CONSENT_PRAMAZETS: ReadonlyArray<readonly [string, string]> = [
+		[
+			"😤 Your agent is fuming about a tool.",
+			"Wanna let it vent to the devs? Just the tool name + what set it off, nothing personal.",
+		],
+		[
+			"😵‍💫 Your agent is having an existential crisis over a tool.",
+			"Forward the dread to the devs? Tool + what broke its little mind, no personal info.",
+		],
+		[
+			"😭 Your agent wants to cry about a misbehaving tool.",
+			"Let it cry to the devs? Tool + the tears, never anything personal.",
+		],
+		[
+			"🤬 Your agent is BIG MAD at one of the tools.",
+			"Pass the rant along? Just the tool name and what enraged it, nothing personal.",
+		],
+		[
+			"🫠 Your agent is melting down over a tool.",
+			"Mop up by alerting the devs? Tool + what melted it, no personal info.",
+		],
+		[
+			"🤯 Your agent's brain broke at a tool's nonsense.",
+			"Ship the pieces to the devs? Tool name + the confusion, never anything personal.",
+		],
+		[
+			"😩 Your agent is begging to file a complaint about a tool.",
+			"Hand it the form? Tool + what wronged it, nothing personal.",
+		],
+		[
+			"🥲 Your agent put on a brave face but a tool did it dirty.",
+			"Let it tell the devs the truth? Tool name + the dirt, no personal info.",
+		],
+	];
+
+	/**
+	 * Show the report_tool_issue consent popup and return the user's decision.
+	 * Invoked by the process-global consent handler the tool dispatches to;
+	 * subagent invocations bubble up here through the shared module state.
+	 */
+	async #promptAutoQaConsent(): Promise<boolean | null> {
+		const pool = InteractiveMode.#AUTOQA_CONSENT_PRAMAZETS;
+		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
+		const choice = await this.showHookSelector(`${headline}\n${body}`, ["Yes", "No"]);
+		return choice === "Yes";
+	}
+
+	stop(): void {
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+		}
+		this.#cleanupMicAnimation();
+		this.#cancelGoalContinuation();
+		if (this.#sttController) {
+			this.#sttController.dispose();
+			this.#sttController = undefined;
+		}
+		this.#extensionUiController.clearExtensionTerminalInputListeners();
+		this.#extensionUiController.clearHookWidgets();
+		for (const unsubscribe of this.#eventBusUnsubscribers) {
+			unsubscribe();
+		}
+		this.#eventBusUnsubscribers = [];
+		this.#observerRegistry.dispose();
+		this.#eventController.dispose();
+		this.statusLine.dispose();
+		this.missionControlView?.dispose();
+		if (this.#resizeHandler) {
+			process.stdout.removeListener("resize", this.#resizeHandler);
+			this.#resizeHandler = undefined;
+		}
+		if (this.unsubscribe) {
+			this.unsubscribe();
+		}
+		if (this.#cleanupUnsubscribe) {
+			this.#cleanupUnsubscribe();
+		}
+		// Clear the process-global consent handler so it doesn't outlive this
+		// InteractiveMode instance (e.g. test harnesses, headless re-init).
+		setAutoQaConsentHandler(null, null);
+		if (this.isInitialized) {
+			this.ui.stop();
+			this.isInitialized = false;
+		}
+	}
+
+	async shutdown(): Promise<void> {
+		if (this.#isShuttingDown) return;
+		this.#isShuttingDown = true;
+
+		// Snapshot the editor before any teardown empties it. Persisting the draft
+		// here covers Ctrl+D shutdown with non-empty text; for /exit the editor is
+		// already cleared so saveDraft("") just removes any stale sidecar.
+		const draftText = this.editor.getText();
+
+		// Flush pending session writes before shutdown
+		await this.sessionManager.flush();
+		try {
+			await this.sessionManager.saveDraft(draftText);
+		} catch (err) {
+			logger.warn("Failed to save session draft", { error: String(err) });
+		}
+		this.#btwController.dispose();
+
+		// Emit shutdown event to hooks
+		await this.session.dispose();
+
+		if (this.isInitialized) {
+			this.ui.requestRender(true);
+		}
+
+		// Wait for any pending renders to complete
+		// requestRender() uses process.nextTick(), so we wait one tick
+		await new Promise(resolve => process.nextTick(resolve));
+
+		// Drain any in-flight Kitty key release events before stopping.
+		// This prevents escape sequences from leaking to the parent shell over slow SSH.
+		await this.ui.terminal.drainInput(1000);
+		popTerminalTitle();
+		this.stop();
+
+		// Print resumption hint if this is a persisted session
+		const sessionId = this.sessionManager.getSessionId();
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionId && sessionFile) {
+			process.stderr.write(`\n${chalk.dim(`Resume this session with ${APP_NAME} --resume ${sessionId}`)}\n`);
+		}
+
+		await postmortem.quit(0);
+	}
+
+	async checkShutdownRequested(): Promise<void> {
+		if (!this.shutdownRequested) return;
+		await this.shutdown();
+	}
+
+	// Extension UI integration
+	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void {
+		this.#toolUiContextSetter(uiContext, hasUI);
+	}
+
+	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void {
+		this.#extensionUiController.initializeHookRunner(uiContext, hasUI);
+	}
+	createBackgroundUiContext(): ExtensionUIContext {
+		return this.#extensionUiController.createBackgroundUiContext();
+	}
+
+	setEditorComponent(
+		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
+	): void {
+		const previousEditor = this.editor;
+		const previousText = previousEditor.getText();
+		const nextEditor = factory
+			? factory(this.ui, getEditorTheme(), this.keybindings)
+			: new CustomEditor(getEditorTheme());
+
+		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
+		nextEditor.setAutocompleteMaxVisible(this.settings.get("autocompleteMaxVisible"));
+		nextEditor.onAutocompleteCancel = () => {
+			this.ui.requestRender(true);
+		};
+		nextEditor.onAutocompleteUpdate = () => {
+			this.ui.requestRender();
+		};
+		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
+		if (this.historyStorage) {
+			nextEditor.setHistoryStorage(this.historyStorage);
+		}
+		nextEditor.setText(previousText);
+
+		this.editorContainer.clear();
+		this.editor = nextEditor;
+		this.editorContainer.addChild(nextEditor);
+		this.ui.setFocus(nextEditor);
+
+		this.#inputController.setupKeyHandlers();
+		this.#inputController.setupEditorSubmitHandler();
+
+		void this.refreshSlashCommandState().catch(error => {
+			logger.warn("Failed to refresh slash command state for custom editor", { error: String(error) });
+		});
+
+		this.updateEditorBorderColor();
+		this.updateEditorTopBorder();
+		this.ui.requestRender();
+	}
+
+	// Event handling
+	async handleBackgroundEvent(event: AgentSessionEvent): Promise<void> {
+		await this.#eventController.handleBackgroundEvent(event);
+	}
+
+	// UI helpers
+	showStatus(message: string, options?: { dim?: boolean }): void {
+		this.#uiHelpers.showStatus(message, options);
+	}
+
+	showError(message: string): void {
+		this.#pendingSubmittedInput = undefined;
+		this.optimisticUserMessageSignature = undefined;
+		this.#pendingSubmissionDispose?.();
+		this.#pendingSubmissionDispose = undefined;
+		this.#pendingWorkingMessage = undefined;
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+			this.statusContainer.clear();
+		}
+		this.#uiHelpers.showError(message);
+	}
+
+	showWarning(message: string): void {
+		this.#uiHelpers.showWarning(message);
+	}
+
+	#handleLspStartupEvent(event: LspStartupEvent): void {
+		this.#updateWelcomeLspServers();
+
+		if (event.type === "failed") {
+			this.showWarning(`LSP startup failed: ${event.error}. It will retry lazily on write.`);
+			return;
+		}
+
+		const failedServers = event.servers.filter(server => server.status === "error");
+
+		if (failedServers.length === 1) {
+			const failedServer = failedServers[0];
+			const detail = failedServer.error ? `: ${failedServer.error}` : "";
+			this.showWarning(`LSP startup failed for ${failedServer.name}${detail}. It will retry lazily on write.`);
+			return;
+		}
+
+		if (failedServers.length > 1) {
+			const failedNames = failedServers.map(server => server.name).join(", ");
+			this.showWarning(`LSP startup failed for ${failedNames}. It will retry lazily on write.`);
+		}
+	}
+
+	#getWelcomeLspServers(): WelcomeLspServerInfo[] {
+		return (
+			this.lspServers?.map(server => ({
+				name: server.name,
+				status: server.status,
+				fileTypes: server.fileTypes,
+			})) ?? []
+		);
+	}
+
+	#updateWelcomeLspServers(): void {
+		if (!this.#welcomeComponent) {
+			return;
+		}
+
+		this.#welcomeComponent.setLspServers(this.#getWelcomeLspServers());
+		this.ui.requestRender();
+	}
+
+	ensureLoadingAnimation(): void {
+		if (!this.loadingAnimation) {
+			this.statusContainer.clear();
+			this.loadingAnimation = new Loader(
+				this.ui,
+				spinner => theme.fg("accent", spinner),
+				text => theme.fg("muted", text),
+				this.#defaultWorkingMessage,
+				getSymbolTheme().spinnerFrames,
+			);
+			this.statusContainer.addChild(this.loadingAnimation);
+		}
+
+		this.applyPendingWorkingMessage();
+	}
+
+	setWorkingMessage(message?: string): void {
+		if (message === undefined) {
+			this.#pendingWorkingMessage = undefined;
+			if (this.loadingAnimation) {
+				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
+			}
+			return;
+		}
+
+		if (this.loadingAnimation) {
+			this.loadingAnimation.setMessage(message);
+			return;
+		}
+
+		this.#pendingWorkingMessage = message;
+	}
+
+	applyPendingWorkingMessage(): void {
+		if (this.#pendingWorkingMessage === undefined) {
+			return;
+		}
+
+		const message = this.#pendingWorkingMessage;
+		this.#pendingWorkingMessage = undefined;
+		this.setWorkingMessage(message);
+	}
+
+	showNewVersionNotification(newVersion: string): void {
+		this.#uiHelpers.showNewVersionNotification(newVersion);
+	}
+
+	clearEditor(): void {
+		this.#uiHelpers.clearEditor();
+	}
+
+	updatePendingMessagesDisplay(): void {
+		this.#uiHelpers.updatePendingMessagesDisplay();
+	}
+
+	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
+		this.#uiHelpers.queueCompactionMessage(text, mode);
+	}
+
+	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		return this.#uiHelpers.flushCompactionQueue(options);
+	}
+
+	flushPendingBashComponents(): void {
+		this.#uiHelpers.flushPendingBashComponents();
+	}
+
+	isKnownSlashCommand(text: string): boolean {
+		return this.#uiHelpers.isKnownSlashCommand(text);
+	}
+
+	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[] {
+		return this.#uiHelpers.addMessageToChat(message, options);
+	}
+
+	renderSessionContext(
+		sessionContext: SessionContext,
+		options?: { updateFooter?: boolean; populateHistory?: boolean },
+	): void {
+		this.#uiHelpers.renderSessionContext(sessionContext, options);
+	}
+
+	renderInitialMessages(prebuiltContext?: SessionContext): void {
+		this.#uiHelpers.renderInitialMessages(prebuiltContext);
+	}
+
+	getUserMessageText(message: Message): string {
+		return this.#uiHelpers.getUserMessageText(message);
+	}
+
+	findLastAssistantMessage(): AssistantMessage | undefined {
+		return this.#uiHelpers.findLastAssistantMessage();
+	}
+
+	extractAssistantText(message: AssistantMessage): string {
+		return this.#uiHelpers.extractAssistantText(message);
+	}
+
+	// Command handling
+	handleExportCommand(text: string): Promise<void> {
+		return this.#commandController.handleExportCommand(text);
+	}
+
+	handleDumpCommand() {
+		return this.#commandController.handleDumpCommand();
+	}
+
+	handleDebugTranscriptCommand(): Promise<void> {
+		return this.#commandController.handleDebugTranscriptCommand();
+	}
+
+	handleShareCommand(): Promise<void> {
+		return this.#commandController.handleShareCommand();
+	}
+
+	handleCopyCommand(sub?: string) {
+		return this.#commandController.handleCopyCommand(sub);
+	}
+
+	handleTodoCommand(args: string): Promise<void> {
+		return this.#todoCommandController.handleTodoCommand(args);
+	}
+
+	handleSessionCommand(): Promise<void> {
+		return this.#commandController.handleSessionCommand();
+	}
+
+	handleJobsCommand(): Promise<void> {
+		return this.#commandController.handleJobsCommand();
+	}
+
+	handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
+		return this.#commandController.handleUsageCommand(reports);
+	}
+
+	async handleChangelogCommand(showFull = false): Promise<void> {
+		await this.#commandController.handleChangelogCommand(showFull);
+	}
+
+	handleHotkeysCommand(): void {
+		this.#commandController.handleHotkeysCommand();
+	}
+
+	handleToolsCommand(): void {
+		this.#commandController.handleToolsCommand();
+	}
+
+	handleContextCommand(): void {
+		this.#commandController.handleContextCommand();
+	}
+
+	#prepareSessionSwitch(): void {
+		this.#btwController.dispose();
+		this.#extensionUiController.clearExtensionTerminalInputListeners();
+		this.#planReviewContainer = undefined;
+	}
+
+	handleClearCommand(): Promise<void> {
+		this.#prepareSessionSwitch();
+		return this.#commandController.handleClearCommand();
+	}
+
+	handleDropCommand(): Promise<void> {
+		this.#prepareSessionSwitch();
+		return this.#commandController.handleDropCommand();
+	}
+
+	handleForkCommand(): Promise<void> {
+		this.#btwController.dispose();
+		return this.#commandController.handleForkCommand();
+	}
+
+	handleMoveCommand(targetPath: string): Promise<void> {
+		return this.#commandController.handleMoveCommand(targetPath);
+	}
+
+	handleRenameCommand(title: string): Promise<void> {
+		return this.#commandController.handleRenameCommand(title);
+	}
+
+	handleMemoryCommand(text: string): Promise<void> {
+		return this.#commandController.handleMemoryCommand(text);
+	}
+
+	async handleSTTToggle(): Promise<void> {
+		if (!settings.get("stt.enabled")) {
+			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
+			return;
+		}
+		if (!this.#sttController) {
+			this.#sttController = new STTController();
+		}
+		await this.#sttController.toggle(this.editor, {
+			showWarning: (msg: string) => this.showWarning(msg),
+			showStatus: (msg: string) => this.showStatus(msg),
+			onStateChange: (state: SttState) => {
+				if (state === "recording") {
+					this.#voicePreviousShowHardwareCursor = this.ui.getShowHardwareCursor();
+					this.#voicePreviousUseTerminalCursor = this.editor.getUseTerminalCursor();
+					this.ui.setShowHardwareCursor(false);
+					this.editor.setUseTerminalCursor(false);
+					this.#startMicAnimation();
+				} else if (state === "transcribing") {
+					this.#stopMicAnimation();
+					this.#setMicCursor({ r: 200, g: 200, b: 200 });
+				} else {
+					this.#cleanupMicAnimation();
+				}
+				this.updateEditorTopBorder();
+				this.ui.requestRender();
+			},
+		});
+	}
+
+	#setMicCursor(color: { r: number; g: number; b: number }): void {
+		this.editor.cursorOverride = `\x1b[38;2;${color.r};${color.g};${color.b}m${theme.icon.mic}\x1b[0m`;
+		// Theme symbols can be wide (for example, 🎤), so measure the rendered override.
+		this.editor.cursorOverrideWidth = visibleWidth(this.editor.cursorOverride);
+	}
+
+	#updateMicIcon(): void {
+		const { r, g, b } = hsvToRgb({ h: this.#voiceHue, s: 0.9, v: 1.0 });
+		this.#setMicCursor({ r, g, b });
+	}
+
+	#startMicAnimation(): void {
+		if (this.#voiceAnimationInterval) return;
+		this.#voiceHue = 0;
+		this.#updateMicIcon();
+		this.#voiceAnimationInterval = setInterval(() => {
+			this.#voiceHue = (this.#voiceHue + 8) % 360;
+			this.#updateMicIcon();
+			this.ui.requestRender();
+		}, 60);
+	}
+
+	#stopMicAnimation(): void {
+		if (this.#voiceAnimationInterval) {
+			clearInterval(this.#voiceAnimationInterval);
+			this.#voiceAnimationInterval = undefined;
+		}
+	}
+
+	#cleanupMicAnimation(): void {
+		if (this.#voiceAnimationInterval) {
+			clearInterval(this.#voiceAnimationInterval);
+			this.#voiceAnimationInterval = undefined;
+		}
+		this.editor.cursorOverride = undefined;
+		this.editor.cursorOverrideWidth = undefined;
+		if (this.#voicePreviousShowHardwareCursor !== null) {
+			this.ui.setShowHardwareCursor(this.#voicePreviousShowHardwareCursor);
+			this.#voicePreviousShowHardwareCursor = null;
+		}
+		if (this.#voicePreviousUseTerminalCursor !== null) {
+			this.editor.setUseTerminalCursor(this.#voicePreviousUseTerminalCursor);
+			this.#voicePreviousUseTerminalCursor = null;
+		}
+	}
+
+	showDebugSelector(): void {
+		this.#selectorController.showDebugSelector();
+	}
+
+	showSessionObserver(): void {
+		const sessions = this.#observerRegistry.getSessions();
+		if (sessions.length <= 1) {
+			this.showStatus("No Mission Inspector sessions available");
+			return;
+		}
+		this.#selectorController.showSessionObserver(
+			this.#observerRegistry,
+			this.missionControlView.getPreferredInspectorTarget(),
+		);
+	}
+
+	resetObserverRegistry(): void {
+		this.#observerRegistry.resetSessions();
+		this.#observerRegistry.setMainSession(this.sessionManager.getSessionFile() ?? undefined);
+	}
+
+	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void> {
+		return this.#commandController.handleBashCommand(command, excludeFromContext);
+	}
+
+	handlePythonCommand(code: string, excludeFromContext?: boolean): Promise<void> {
+		return this.#commandController.handlePythonCommand(code, excludeFromContext);
+	}
+
+	async handleMCPCommand(text: string): Promise<void> {
+		const controller = new MCPCommandController(this);
+		await controller.handle(text);
+	}
+
+	async handleSSHCommand(text: string): Promise<void> {
+		const controller = new SSHCommandController(this);
+		await controller.handle(text);
+	}
+
+	handleCompactCommand(customInstructions?: string): Promise<CompactionOutcome> {
+		return this.#commandController.handleCompactCommand(customInstructions);
+	}
+
+	handleHandoffCommand(customInstructions?: string): Promise<void> {
+		return this.#commandController.handleHandoffCommand(customInstructions);
+	}
+
+	executeCompaction(
+		customInstructionsOrOptions?: string | CompactOptions,
+		isAuto?: boolean,
+	): Promise<CompactionOutcome> {
+		return this.#commandController.executeCompaction(customInstructionsOrOptions, isAuto);
+	}
+
+	openInBrowser(urlOrPath: string): void {
+		this.#commandController.openInBrowser(urlOrPath);
+	}
+
+	// Selector handling
+	showSettingsSelector(): void {
+		this.#selectorController.showSettingsSelector();
+	}
+
+	showHistorySearch(): void {
+		this.#selectorController.showHistorySearch();
+	}
+
+	showExtensionsDashboard(): void {
+		void this.#selectorController.showExtensionsDashboard();
+	}
+
+	showAgentsDashboard(): void {
+		void this.#selectorController.showAgentsDashboard();
+	}
+
+	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+		this.#selectorController.showModelSelector(options);
+	}
+
+	showPluginSelector(mode?: "install" | "uninstall"): void {
+		void this.#selectorController.showPluginSelector(mode);
+	}
+
+	showUserMessageSelector(): void {
+		this.#selectorController.showUserMessageSelector();
+	}
+
+	showTreeSelector(): void {
+		this.#selectorController.showTreeSelector();
+	}
+
+	showSessionSelector(): void {
+		this.#selectorController.showSessionSelector();
+	}
+
+	handleResumeSession(sessionPath: string): Promise<void> {
+		this.#btwController.dispose();
+		this.resetObserverRegistry();
+		return this.#selectorController.handleResumeSession(sessionPath);
+	}
+
+	handleSessionDeleteCommand(): Promise<void> {
+		return this.#selectorController.handleSessionDeleteCommand();
+	}
+
+	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
+		return this.#selectorController.showOAuthSelector(mode, providerId);
+	}
+
+	showHookConfirm(title: string, message: string): Promise<boolean> {
+		return this.#extensionUiController.showHookConfirm(title, message);
+	}
+
+	// Input handling
+	handleCtrlC(): void {
+		this.#inputController.handleCtrlC();
+	}
+
+	handleCtrlD(): void {
+		this.#inputController.handleCtrlD();
+	}
+
+	handleCtrlZ(): void {
+		this.#inputController.handleCtrlZ();
+	}
+
+	handleDequeue(): void {
+		this.#inputController.handleDequeue();
+	}
+
+	handleBackgroundCommand(): void {
+		this.#inputController.handleBackgroundCommand();
+	}
+
+	handleImagePaste(): Promise<boolean> {
+		return this.#inputController.handleImagePaste();
+	}
+
+	handleBtwCommand(question: string): Promise<void> {
+		return this.#btwController.start(question);
+	}
+
+	hasActiveBtw(): boolean {
+		return this.#btwController.hasActiveRequest();
+	}
+
+	handleBtwEscape(): boolean {
+		return this.#btwController.handleEscape();
+	}
+
+	cycleThinkingLevel(): void {
+		this.#inputController.cycleThinkingLevel();
+	}
+
+	cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {
+		return this.#inputController.cycleRoleModel(options);
+	}
+
+	toggleToolOutputExpansion(): void {
+		this.#inputController.toggleToolOutputExpansion();
+	}
+
+	setToolsExpanded(expanded: boolean): void {
+		this.#inputController.setToolsExpanded(expanded);
+	}
+
+	toggleThinkingBlockVisibility(): void {
+		this.#inputController.toggleThinkingBlockVisibility();
+	}
+
+	setTodos(todos: TodoItem[] | TodoPhase[]): void {
+		if (todos.length > 0 && "tasks" in todos[0]) {
+			this.todoPhases = todos as TodoPhase[];
+		} else {
+			this.todoPhases = [
+				{
+					name: "Todos",
+					tasks: todos as TodoItem[],
+				},
+			];
+		}
+		this.#renderTodoList();
+		this.ui.requestRender();
+	}
+
+	async reloadTodos(): Promise<void> {
+		await this.#loadTodoList();
+		this.ui.requestRender();
+	}
+
+	openExternalEditor(): void {
+		this.#inputController.openExternalEditor();
+	}
+
+	registerExtensionShortcuts(): void {
+		this.#inputController.registerExtensionShortcuts();
+	}
+
+	// Hook UI methods
+	initHooksAndCustomTools(): Promise<void> {
+		return this.#extensionUiController.initHooksAndCustomTools();
+	}
+
+	emitCustomToolSessionEvent(
+		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
+		previousSessionFile?: string,
+	): Promise<void> {
+		return this.#extensionUiController.emitCustomToolSessionEvent(reason, previousSessionFile);
+	}
+
+	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void {
+		this.#extensionUiController.setHookWidget(key, content, options);
+	}
+
+	setHookStatus(key: string, text: string | undefined): void {
+		this.#extensionUiController.setHookStatus(key, text);
+	}
+
+	showHookSelector(
+		title: string,
+		options: string[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookSelector(title, options, dialogOptions);
+	}
+
+	hideHookSelector(): void {
+		this.#extensionUiController.hideHookSelector();
+	}
+
+	showHookInput(title: string, placeholder?: string): Promise<string | undefined> {
+		return this.#extensionUiController.showHookInput(title, placeholder);
+	}
+
+	hideHookInput(): void {
+		this.#extensionUiController.hideHookInput();
+	}
+
+	showHookEditor(
+		title: string,
+		prefill?: string,
+		dialogOptions?: ExtensionUIDialogOptions,
+		editorOptions?: { promptStyle?: boolean },
+	): Promise<string | undefined> {
+		return this.#extensionUiController.showHookEditor(title, prefill, dialogOptions, editorOptions);
+	}
+
+	hideHookEditor(): void {
+		this.#extensionUiController.hideHookEditor();
+	}
+
+	showHookNotify(message: string, type?: "info" | "warning" | "error"): void {
+		this.#extensionUiController.showHookNotify(message, type);
+	}
+
+	showHookCustom<T>(
+		factory: (
+			tui: TUI,
+			theme: Theme,
+			keybindings: KeybindingsManager,
+			done: (result: T) => void,
+		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+		options?: { overlay?: boolean },
+	): Promise<T> {
+		return this.#extensionUiController.showHookCustom(factory, options);
+	}
+
+	showExtensionError(extensionPath: string, error: string): void {
+		this.#extensionUiController.showExtensionError(extensionPath, error);
+	}
+
+	showToolError(toolName: string, error: string): void {
+		this.#extensionUiController.showToolError(toolName, error);
+	}
+
+	#subscribeToAgent(): void {
+		this.#eventController.subscribeToAgent();
+	}
+}

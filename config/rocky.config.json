@@ -23,7 +23,8 @@
         "extends": "acp",
         "label": "Amaze",
         "command": [
-          "amaze",
+          "bun",
+          "__ROCKY_ROOT__/vendor/amaze/packages/coding-agent/src/cli.ts",
           "acp"
         ]
       }
