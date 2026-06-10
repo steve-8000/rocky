@@ -10,7 +10,8 @@
     "cli": "npm --prefix vendor/paseo run cli --silent --",
     "build:webui": "npm --prefix vendor/paseo/packages/app run build:web",
     "build:dmg": "npm --prefix vendor/paseo/packages/desktop run build",
-    "icons": "python3 scripts/brand/make-icons.py vendor/paseo/packages/desktop/assets"
+    "icons": "python3 scripts/brand/make-icons.py vendor/paseo/packages/desktop/assets",
+    "smoke": "sh scripts/smoke.sh"
   },
   "dependencies": {
     "serve-handler": "6.1.6"
