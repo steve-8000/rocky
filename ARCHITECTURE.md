@@ -1,120 +1,89 @@
 # Rocky — Three-System Integrated Architecture
 
-Rocky integrates **amaze**, **Paseo**, and **AionUi** into one self-contained
-project. Everything needed to build and run lives inside this repository — no
-sibling checkouts, no PATH-installed agent binaries. Paseo and AionUi run as
-**one unified server process (`rockyd`)**; amaze stays a separate CLI runtime
-that the server spawns per agent session.
+Rocky integrates **amaze**, **Paseo**, and **AionUi's orchestrator concept**
+into one self-contained project: **one server process, one port, one UI**.
 
 ```
-┌──────────────────────────────── Clients ────────────────────────────────┐
-│  Rocky.app (DMG)      Rocky WebUI            AionUi Cowork WebUI        │
-│  Electron desktop     (Expo SPA :7780)       (SPA + /api proxy :25808)  │
-└──────┬──────────────────────┬─────────────────────────┬─────────────────┘
-       │ Paseo WS protocol    │ static                  │ HTTP/WS
-┌──────┴──────────────────────┴─────────────────────────┴─────────────────┐
-│                     rockyd — ONE Node process (server/rockyd.ts)        │
-│                                                                          │
-│  ┌─────────────────────────────┐   ┌──────────────────────────────────┐ │
-│  │ Paseo daemon (in-process)   │   │ AionUi web-host (in-process)     │ │
-│  │ vendor/paseo library call   │   │ vendor/aionui/packages/web-host  │ │
-│  │ ws/http 0.0.0.0:7767        │   │ SPA + reverse proxy :25808       │ │
-│  │ home ~/.rocky               │   │                                  │ │
-│  ├─────────────────────────────┤   │  ┌────────────────────────────┐  │ │
-│  │ agent lifecycle, timeline   │   │  │ aioncore (Rust, managed    │  │ │
-│  │ workspaces / worktrees      │◄──┼──┤ child process — closed-    │  │ │
-│  │ models / providers          │MCP│  │ source prebuilt binary)    │  │ │
-│  │ file attachments, terminals │   │  │ Team Mode: Leader/Teammate │  │ │
-│  │ schedules, permissions      │   │  │ task board, async mailbox  │  │ │
-│  │ MCP server, E2E relay       │   │  └────────────────────────────┘  │ │
-│  └──────────┬──────────────────┘   └───────────────┬──────────────────┘ │
-│             │ + Rocky WebUI static server :7780    │                    │
-└─────────────┼───────────────────────────────────────┼────────────────────┘
-              │ ACP (stdio, per agent session)        │ ACP (stdio)
-       ┌──────▼────────────────────────────────────────▼──────┐
-       │              amaze (vendor/amaze, separate CLI)      │
-       │   `bun vendor/amaze/packages/coding-agent/src/cli.ts │
-       │    acp` — scout-and-orchestrate runtime, Mission     │
-       │   Control, bounded subagents, plan mode              │
-       └──────────────────────────────────────────────────────┘
+┌────────────────────────── Clients ──────────────────────────┐
+│   Browser (remote WebUI)        Rocky.app (Electron DMG)    │
+│   http://host:7767              managed daemon + same SPA   │
+└───────────────┬─────────────────────────┬───────────────────┘
+                │  ONE origin: UI + API + WS  (:7767)
+┌───────────────┴─────────────────────────┴───────────────────┐
+│            rockyd — ONE Node process (server/rockyd.ts)     │
+│                                                              │
+│  Paseo daemon core (in-process library, vendor/paseo)        │
+│   • agent lifecycle + append-only timeline                   │
+│   • workspaces / git worktrees                               │
+│   • model & provider catalog                                 │
+│   • file attachments, terminals, schedules                   │
+│   • permissions, MCP server, E2E relay                       │
+│   • Rocky WebUI (Expo SPA) served at the daemon root         │
+│                                                              │
+│  Orchestrator mode (AionUi Team Mode, re-implemented native) │
+│   • rocky-orchestrate skill on daemon MCP tools              │
+│   • Leader/Teammate, TEAM_BOARD.md, chat-room mailbox,       │
+│     worktree isolation, per-agent permission queue           │
+└──────────────────────────┬───────────────────────────────────┘
+                           │ ACP (stdio, per agent session)
+              ┌────────────▼────────────┐
+              │  amaze (vendor/amaze)   │   separate CLI by design:
+              │  scout-and-orchestrate  │   each agent session gets its
+              │  runtime, Mission       │   own process, cwd, lifetime
+              │  Control, plan mode     │
+              └─────────────────────────┘
 ```
-
-## Why one process — and the one exception
-
-`rockyd` (`server/rockyd.ts`) hosts everything Node-side in a single runtime:
-
-- **Paseo daemon** is consumed as a library (`createPaseoDaemon` from the built
-  `@getpaseo/server` dist) instead of being supervised as a subprocess.
-- **AionUi web-host** (`startWebHost`) runs in the same process: static SPA,
-  reverse proxy, auth seeding.
-- **Rocky WebUI** is a static file server for the Expo web export.
-
-One startup command, one log stream, one lifecycle (SIGINT/SIGTERM stops all
-layers in order).
-
-The one exception is **aioncore**, AionUi's Rust backend. Its source is not in
-the AionUi repository — only a prebuilt binary ships. It cannot be linked into
-a Node process, so web-host manages it as a child with health checks and crash
-restart. amaze likewise stays a separate CLI by design (per-session isolation:
-each agent gets its own process, cwd, and lifetime).
 
 ## What each system contributes
 
-| Layer | Source | Contribution |
+| System | Source | Contribution |
 | --- | --- | --- |
-| Agent runtime | `vendor/amaze` (full source + prebuilt darwin-arm64 native addon) | The amaze CLI, unchanged. ACP over stdio: default/plan modes, model selection, content-block file attachments. |
-| Control plane | `vendor/paseo` (full source, Rocky branding commits) | Session daemon: agent lifecycle + append-only timeline, workspace/worktree registry, model/provider catalog, file attachments, terminals, schedules, permissions, MCP server, E2E relay, Expo web client, Electron DMG. |
-| Orchestrator + Cowork UI | `vendor/aionui` (full source + bundled aioncore binary + built renderer) | Team Mode orchestration (Leader/Teammates, shared task board, async mailbox, per-agent permission dialogs), Cowork WebUI, 21 assistants, skills, MCP unified management. |
+| **amaze** | `vendor/amaze` (full source + prebuilt darwin-arm64 native addon) | The agent runtime, unchanged. ACP over stdio: default/plan modes, model selection, content-block file attachments. Primary provider; Claude Code/Codex/etc. work alongside it. |
+| **Paseo** | `vendor/paseo` (full source + Rocky branding/integration commits) | Everything server-side: session daemon, timeline sync, workspace/worktree registry, model catalog, attachments, terminals, schedules, permissions, MCP server, E2E relay — plus the Expo SPA that is now Rocky's one UI, and the Electron DMG. |
+| **AionUi** | concept, re-implemented (no vendored code) | Team Mode orchestration semantics: Leader decomposes and delegates to parallel Teammates with a shared task board, async mailbox, per-agent permissions, and silent-agent escalation. Rocky implements this natively as the `rocky-orchestrate` skill over daemon MCP tools — no Electron app, no closed-source aioncore backend. |
 
-## Integration contracts
+### Why AionUi is a concept, not a vendor tree
 
-Configuration-level only; each vendored tree stays mergeable with upstream.
+AionUi's Team Mode is welded to its Electron main process and a closed-source
+Rust backend (aioncore). Vendoring it meant a second UI, a second port, a
+second state store, and an unbuildable binary dependency. Every Team Mode
+primitive maps 1:1 onto daemon primitives Rocky already has:
 
-- **C1 — amaze ⇄ Paseo:** `~/.rocky/config.json` registers vendored amaze as an
-  ACP provider (`command: ["bun", "<root>/vendor/amaze/.../cli.ts", "acp"]`).
-  `setup.sh` substitutes the absolute path.
-- **C2 — amaze ⇄ AionUi:** `rockyd` registers vendored amaze as a custom ACP
-  agent against aioncore's HTTP API on every boot (idempotent create/update).
-- **C3 — AionUi ⇄ Paseo:** the daemon's MCP server (agents/terminals/worktrees/
-  schedules/permissions) can be added once in AionUi's MCP unified management
-  via the bundled stdio bridge
-  (`vendor/paseo/packages/server/dist/scripts/mcp-stdio-socket-bridge-cli.mjs`)
-  and syncs to all AionUi agents — an AionUi Team Mode Leader can then drive
-  daemon-managed agents in Paseo worktrees.
+| AionUi Team Mode | Rocky native |
+| --- | --- |
+| Leader agent | Any daemon agent loading `/rocky-orchestrate` |
+| Teammate agents (parallel) | `create_agent` × N, worktree-isolated by default |
+| Shared task board | `TEAM_BOARD.md` in the workspace (visible in the UI file tree) |
+| Async mailbox | Daemon chat room (`chat create/post/wait`) |
+| Per-agent permission dialogs | Daemon permission queue (`list_pending_permissions` / UI) |
+| Silent-agent auto-escalation | Leader protocol step 5 (nudge → kill → reassign) |
 
-## Two orchestration paths, one substrate
+The earlier two-UI integration (vendored AionUi + aioncore child process) was
+built, verified, and then deliberately removed in favor of this design —
+recorded in git history (`bd6bea7` → this commit).
 
-| | AionUi Team Mode (UI) | `rocky-orchestrate` skill (headless) |
+## Single-origin serving
+
+One ~20-line patch in `vendor/paseo/.../bootstrap.ts` adds `webUiDir` to the
+daemon config: the built Expo SPA is served at the daemon root with SPA
+fallback, while `/api`, `/ws`, `/public`, `/mcp`, `/download` keep their
+existing handlers and auth. The browser talks to the same origin for UI, REST,
+and WebSocket — no CORS hop, no second server, no extra port.
+
+## Ports & state
+
+| Surface | Where | State |
 | --- | --- | --- |
-| Leader | AionUi Leader agent (any backend incl. amaze) | Any daemon agent with MCP tools |
-| Teammates | AionUi ACP sessions and/or daemon agents via C3 | Daemon agents (worktree-isolated) |
-| Task board | AionUi team board UI | `TEAM_BOARD.md` in workspace |
-| Mailbox | AionUi async mailbox | Daemon chat room |
-| Permissions | Per-agent dialogs + badges | Daemon permission queue |
+| UI + API + WS | `:7767` (one port) | `~/.rocky` |
+| amaze sessions | stdio children of rockyd | per-workspace |
 
-## Ports & homes
-
-| Service | Port | State |
-| --- | --- | --- |
-| Paseo daemon (in rockyd) | 7767 | `~/.rocky` |
-| Rocky WebUI (in rockyd) | 7780 | — static |
-| AionUi WebUI (in rockyd) | 25808 | `~/.rocky/aionui` |
-| aioncore (child of rockyd) | ephemeral, localhost | `~/.rocky/aionui` |
-
-All state lives under one home (`~/.rocky`). Nothing collides with stock
-Paseo (6767/`~/.paseo`) or stock AionUi (`~/.aionui`) on the same machine.
+No collision with stock Paseo (6767/`~/.paseo`) on the same machine.
 
 ## Self-containment policy
 
-- `vendor/{amaze,paseo,aionui}` are full tracked source trees (AionUi README
-  media stripped; `node_modules`/build outputs rebuilt locally by `setup.sh`).
-- Committed binaries, unavoidable by provenance:
-  `vendor/aionui/resources/bundled-aioncore/darwin-arm64/aioncore` (closed
-  source) and `vendor/amaze/packages/natives/native/amaze_natives.darwin-arm64.node`
-  (skips a Rust nightly toolchain requirement; rebuildable via
-  `bun run build:native` inside vendor/amaze).
-- `vendor/aionui/out/renderer` (built SPA) is committed so AionUi's WebUI works
-  without an electron-vite build.
+- `vendor/amaze` and `vendor/paseo` are full tracked source trees.
+- One committed binary: `vendor/amaze/packages/natives/native/amaze_natives.darwin-arm64.node`
+  (skips the Rust nightly toolchain; rebuildable via `bun run build:native`).
 - The only network access setup needs is the npm/bun package registry.
 
 ## Repository layout
@@ -124,16 +93,16 @@ rocky/
 ├── ARCHITECTURE.md            ← this file
 ├── DESIGN.md                  ← decision record
 ├── README.md                  ← operations
-├── package.json               ← npm run setup / start / cli / build:*
-├── server/rockyd.ts           ← THE unified server entry
+├── package.json               ← npm run setup / start / smoke / cli / build:*
+├── server/rockyd.ts           ← THE server entry (one process, one port)
 ├── config/rocky.config.json   ← ~/.rocky/config.json template
-├── skills/rocky-orchestrate/  ← headless Leader/Teammate skill
+├── skills/rocky-orchestrate/  ← orchestrator mode (Leader/Teammate protocol)
 ├── scripts/
-│   ├── setup.sh               ← all-vendor install + web-host compile + config
+│   ├── setup.sh               ← vendor installs + build + skill link + config
 │   ├── rockyd.sh              ← launcher (node, native TS)
+│   ├── smoke.sh               ← regression contract (npm run smoke)
 │   └── brand/make-icons.py    ← Rocky icon set generator
 └── vendor/
     ├── amaze/                 ← agent runtime (separate CLI)
-    ├── paseo/                 ← control plane (in rockyd)
-    └── aionui/                ← orchestrator + Cowork UI (in rockyd)
+    └── paseo/                 ← server core + UI + DMG (Rocky-branded)
 ```

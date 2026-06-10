@@ -7,8 +7,5 @@ vendor/paseo/packages/app/.expo/
 vendor/amaze/node_modules/
 vendor/amaze/packages/*/node_modules/
 vendor/amaze/packages/coding-agent/dist/
-vendor/aionui/node_modules/
-vendor/aionui/packages/*/node_modules/
-vendor/aionui/packages/web-host/dist/
 *.log
 .DS_Store

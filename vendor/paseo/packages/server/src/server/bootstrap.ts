@@ -236,6 +236,9 @@ export interface PaseoDaemonConfig {
   autoArchiveAfterMerge?: boolean;
   appendSystemPrompt?: string;
   staticDir: string;
+  // Rocky: optional built web client (SPA) served at the daemon root, so one
+  // port carries UI + API + WS. Assets are public; API/WS stay behind auth.
+  webUiDir?: string;
   mcpDebug: boolean;
   isDev?: boolean;
   agentClients: Partial<Record<AgentProvider, AgentClient>>;
@@ -413,6 +416,25 @@ export async function createPaseoDaemon(
     }
     next();
   });
+
+  // Rocky single-port UI: serve the SPA before bearer auth (assets are not
+  // secrets; WS/API keep their own auth). API-ish prefixes fall through.
+  if (config.webUiDir) {
+    const webUiDir = config.webUiDir;
+    const spaIndex = path.join(webUiDir, "index.html");
+    const reservedPrefixes = ["/api", "/public", "/mcp", "/ws", "/download"];
+    app.use(express.static(webUiDir, { index: "index.html", fallthrough: true }));
+    app.get(/.*/, (req, res, next) => {
+      if (req.method !== "GET" && req.method !== "HEAD") return next();
+      if (reservedPrefixes.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
+        return next();
+      }
+      if (req.path.includes("..")) return next();
+      res.sendFile(spaIndex, (err) => {
+        if (err) next();
+      });
+    });
+  }
 
   app.use(
     createRequireBearerMiddleware(config.auth, (context) => {
