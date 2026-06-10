@@ -819,7 +819,7 @@ export class AgentManager {
             mcpServers: {
               paseo: {
                 type: "http" as const,
-                url: `${this.mcpBaseUrl}?callerAgentId=${resolvedAgentId}`,
+                url: `${this.mcpBaseUrl}${this.mcpBaseUrl.includes("?") ? "&" : "?"}callerAgentId=${resolvedAgentId}`,
               },
               ...config.mcpServers,
             },

@@ -318,6 +318,8 @@ export async function createPaseoDaemon(
   );
 
   const serverId = getOrCreateServerId(config.paseoHome, { logger });
+  // Rocky: boot-scoped secret for daemon→self MCP calls from injected agents.
+  const internalMcpToken = randomUUID();
   const daemonKeyPair = await loadOrCreateDaemonKeyPair(config.paseoHome, logger);
   let relayTransport: RelayTransportController | null = null;
 
@@ -437,9 +439,13 @@ export async function createPaseoDaemon(
   }
 
   app.use(
-    createRequireBearerMiddleware(config.auth, (context) => {
-      logger.warn(context, "Rejected HTTP request with invalid daemon password");
-    }),
+    createRequireBearerMiddleware(
+      config.auth,
+      (context) => {
+        logger.warn(context, "Rejected HTTP request with invalid daemon password");
+      },
+      { internalMcpToken },
+    ),
   );
 
   // Serve static files from public directory
@@ -938,7 +944,12 @@ export async function createPaseoDaemon(
           mainStarted = true;
           const logAndResolve = async () => {
             boundListenTarget = resolveBoundListenTarget(listenTarget, httpServer);
-            const mcpBaseUrl = mcpEnabled ? createAgentMcpBaseUrl(boundListenTarget) : null;
+            let mcpBaseUrl = mcpEnabled ? createAgentMcpBaseUrl(boundListenTarget) : null;
+            if (mcpBaseUrl && config.auth?.password) {
+              // Rocky: password-protected daemons hand injected agents a
+              // boot-scoped token so the self-call to /mcp/agents passes auth.
+              mcpBaseUrl = `${mcpBaseUrl}?paseoToken=${internalMcpToken}`;
+            }
             agentMcpBaseUrl = config.mcpInjectIntoAgents === false ? null : mcpBaseUrl;
             agentManager.setMcpBaseUrl(agentMcpBaseUrl);
             daemonConfigStore.onFieldChange("mcp.injectIntoAgents", (value) => {

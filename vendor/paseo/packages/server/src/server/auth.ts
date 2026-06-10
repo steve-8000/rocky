@@ -1,5 +1,15 @@
+import { timingSafeEqual } from "node:crypto";
 import { compare, compareSync, hashSync } from "bcryptjs";
 import type { RequestHandler } from "express";
+
+function timingSafeTokenEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) {
+    return false;
+  }
+  return timingSafeEqual(left, right);
+}
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
 
@@ -89,10 +99,25 @@ export function extractWsBearerToken(protocol: string | null): string | null {
 export function createRequireBearerMiddleware(
   auth: DaemonAuthConfig | undefined,
   onReject?: (context: BearerAuthRejectContext) => void,
+  options?: { internalMcpToken?: string },
 ): RequestHandler {
   const password = auth?.password;
   return (req, res, next) => {
     if (!password || shouldBypassBearerAuth(req.method, req.path)) {
+      next();
+      return;
+    }
+
+    // Rocky: agent-injected Paseo MCP clients authenticate with a boot-scoped
+    // internal token carried in the URL (?paseoToken=). Only honored under
+    // /mcp/ — every other route still requires the daemon password.
+    const internalToken = options?.internalMcpToken;
+    if (
+      internalToken &&
+      (req.path === "/mcp/agents" || req.path.startsWith("/mcp/")) &&
+      typeof req.query.paseoToken === "string" &&
+      timingSafeTokenEqual(req.query.paseoToken, internalToken)
+    ) {
       next();
       return;
     }
