@@ -254,6 +254,10 @@ import {
 } from "./worktree-session.js";
 import { toWorktreeWireError } from "./worktree-errors.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
+import {
+  assertMacOSFullDiskAccess,
+  formatMacOSFullDiskAccessError,
+} from "./macos-full-disk-access.js";
 
 const WORKSPACE_GIT_WATCH_REMOVED_STATE_KEY = "__removed__";
 
@@ -3033,6 +3037,7 @@ export class Session {
     let createdWorktreeForCleanup: CreateRockyWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      await assertMacOSFullDiskAccess(config.cwd);
       const trimmedPrompt = initialPrompt?.trim();
       const { explicitTitle, provisionalTitle } = resolveCreateAgentTitles({
         configTitle: config.title,
@@ -3117,7 +3122,7 @@ export class Session {
         createdWorktree: createdWorktreeForCleanup,
         createdAgentId,
       });
-      const wireError = toWorktreeWireError(error);
+      const wireError = toWorktreeWireError(formatMacOSFullDiskAccessError(config.cwd, error));
       this.sessionLogger.error({ err: error }, "Failed to create agent");
       if (requestId) {
         this.emit({
@@ -7055,6 +7060,7 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "open_project_request" }>,
   ): Promise<void> {
     try {
+      await assertMacOSFullDiskAccess(request.cwd);
       const workspace = await this.findOrCreateWorkspaceForDirectory(request.cwd);
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
       const descriptor = await this.describeWorkspaceRecord(workspace);
@@ -7080,7 +7086,7 @@ export class Session {
           );
         });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to open project";
+      const message = getErrorMessage(formatMacOSFullDiskAccessError(request.cwd, error));
       this.sessionLogger.error({ err: error, cwd: request.cwd }, "Failed to open project");
       this.emit({
         type: "open_project_response",
@@ -7234,6 +7240,21 @@ export class Session {
   private async handleCreateRockyWorktreeRequest(
     request: Extract<SessionInboundMessage, { type: "create_rocky_worktree_request" }>,
   ): Promise<void> {
+    try {
+      await assertMacOSFullDiskAccess(request.cwd);
+    } catch (error) {
+      this.emit({
+        type: "create_rocky_worktree_response",
+        payload: {
+          workspace: null,
+          error: getErrorMessage(formatMacOSFullDiskAccessError(request.cwd, error)),
+          setupTerminalId: null,
+          requestId: request.requestId,
+        },
+      });
+      return;
+    }
+
     return handleCreateWorktreeRequest(
       {
         rockyHome: this.rockyHome,
