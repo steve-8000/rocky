@@ -1,0 +1,17 @@
+{
+  "name": "rocky",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rocky: amaze + Paseo daemon + AionUi-style orchestrator mode, with remote WebUI and desktop app",
+  "scripts": {
+    "setup": "sh scripts/setup.sh",
+    "dev": "npm --prefix vendor/paseo run dev",
+    "daemon:start": "npm --prefix vendor/paseo run cli -- daemon start",
+    "daemon:status": "npm --prefix vendor/paseo run cli -- daemon status",
+    "daemon:stop": "npm --prefix vendor/paseo run cli -- daemon stop",
+    "build:webui": "npm --prefix vendor/paseo/packages/app run build:web",
+    "serve:webui": "node scripts/serve-webui.mjs",
+    "build:dmg": "npm --prefix vendor/paseo/packages/desktop run build",
+    "icons": "python3 scripts/brand/make-icons.py vendor/paseo/packages/desktop/assets"
+  }
+}

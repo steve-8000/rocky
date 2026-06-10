@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "daemon": {
+    "listen": "0.0.0.0:7767",
+    "hostnames": [
+      "localhost",
+      "127.0.0.1"
+    ],
+    "cors": {
+      "allowedOrigins": [
+        "http://localhost:7780",
+        "http://127.0.0.1:7780"
+      ]
+    },
+    "mcp": {
+      "enabled": true,
+      "injectIntoAgents": true
+    }
+  },
+  "agents": {
+    "providers": {
+      "amaze": {
+        "extends": "acp",
+        "label": "Amaze",
+        "command": [
+          "amaze",
+          "acp"
+        ]
+      }
+    }
+  }
+}

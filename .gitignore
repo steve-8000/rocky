@@ -1,0 +1,5 @@
+# vendored paseo is a git worktree with its own index
+vendor/paseo
+node_modules/
+*.log
+.DS_Store
