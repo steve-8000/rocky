@@ -1,9 +1,9 @@
 node_modules/
-vendor/paseo/node_modules/
-vendor/paseo/packages/*/node_modules/
-vendor/paseo/packages/*/dist/
-vendor/paseo/packages/desktop/release/
-vendor/paseo/packages/app/.expo/
+core/node_modules/
+core/packages/*/node_modules/
+core/packages/*/dist/
+core/packages/desktop/release/
+core/packages/app/.expo/
 vendor/amaze/node_modules/
 vendor/amaze/packages/*/node_modules/
 vendor/amaze/packages/coding-agent/dist/

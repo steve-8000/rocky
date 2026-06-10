@@ -21,9 +21,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── preconditions ──────────────────────────────────────────────────────────
-[ -f "$ROOT/vendor/paseo/packages/server/dist/server/server/exports.js" ] \
-  || fail "paseo dist missing — run npm run setup"
-[ -f "$ROOT/vendor/paseo/packages/app/dist/index.html" ] \
+[ -f "$ROOT/core/packages/server/dist/server/server/exports.js" ] \
+  || fail "rocky dist missing — run npm run setup"
+[ -f "$ROOT/core/packages/app/dist/index.html" ] \
   || fail "webui bundle missing — run npm run setup"
 [ -d "$ROOT/vendor/amaze/node_modules" ] \
   || fail "amaze deps missing — run npm run setup"
@@ -66,13 +66,23 @@ echo "ok: API on same origin"
 if [ "${SMOKE_SKIP_AGENT_RUN:-0}" = "1" ]; then
   echo "skip: daemon amaze agent run (SMOKE_SKIP_AGENT_RUN=1)"
 else
-  ( cd "$ROOT/vendor/paseo" && PASEO_HOME="$HOME_DIR" PASEO_LISTEN="127.0.0.1:$PORT" \
-      timeout 180 npm run cli --silent -- agent run --provider amaze --cwd "$WORK_DIR" \
+  ( cd "$ROOT/core" && ROCKY_HOME="$HOME_DIR" ROCKY_LISTEN="127.0.0.1:$PORT" \
+      timeout 180 npm run cli --silent -- agent run --provider amaze \
+      --model anthropic/claude-fable-5 --thinking medium --cwd "$WORK_DIR" \
       "Create a file named smoke.txt containing exactly 'rocky smoke' and stop." ) > /dev/null 2>&1 \
     || fail "daemon amaze agent run failed"
   [ "$(cat "$WORK_DIR/smoke.txt" 2>/dev/null)" = "rocky smoke" ] \
     || fail "agent did not produce expected smoke.txt"
   echo "ok: daemon ⇄ amaze E2E agent run"
 fi
+
+# ── check 6: brand scrub — no upstream names in the served bundle ──────────
+BUNDLE_PATH=$(curl -s "http://127.0.0.1:$PORT/" | grep -o '/_expo/static/js/web/[^"]*\.js' | head -1)
+[ -n "$BUNDLE_PATH" ] || fail "could not locate web bundle path"
+if curl -s "http://127.0.0.1:$PORT$BUNDLE_PATH" | grep -qi "paseo\|aionui"; then
+  fail "served web bundle still contains upstream branding"
+fi
+curl -s "http://127.0.0.1:$PORT/" | grep -qi "paseo\|aionui" && fail "index.html contains upstream branding"
+echo "ok: brand scrub (no paseo/aionui in served UI)"
 
 echo "PASS: single-port single-UI regression green"

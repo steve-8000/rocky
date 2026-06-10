@@ -1,6 +1,6 @@
 #!/bin/sh
 # Rocky setup — fully self-contained: installs deps for both vendored trees,
-# builds the Paseo server library, installs the orchestrator skill, and writes
+# builds the Rocky server library, installs the orchestrator skill, and writes
 # ~/.rocky/config.json with the vendored amaze registered as an ACP provider.
 set -eu
 
@@ -10,11 +10,11 @@ ROCKY_HOME="${ROCKY_HOME:-$HOME/.rocky}"
 command -v node >/dev/null 2>&1 || { echo "error: node (>=23) required" >&2; exit 1; }
 command -v bun  >/dev/null 2>&1 || { echo "error: bun (>=1.3) required — https://bun.sh" >&2; exit 1; }
 
-echo "==> Installing vendored Paseo dependencies"
-cd "$ROOT/vendor/paseo"
+echo "==> Installing vendored Rocky dependencies"
+cd "$ROOT/core"
 [ -d node_modules ] || npm ci --no-audit --no-fund
 
-echo "==> Building Paseo server dist (rockyd imports the built library)"
+echo "==> Building Rocky server dist (rockyd imports the built library)"
 [ -f packages/server/dist/server/server/exports.js ] || npm run build:server
 
 echo "==> Installing vendored amaze dependencies"
@@ -33,9 +33,9 @@ else
   echo "    exists — left untouched. Template: config/rocky.config.json (__ROCKY_ROOT__ → $ROOT)"
 fi
 
-if [ ! -f "$ROOT/vendor/paseo/packages/app/dist/index.html" ]; then
+if [ ! -f "$ROOT/core/packages/app/dist/index.html" ]; then
   echo "==> Building Rocky WebUI (Expo web export)"
-  cd "$ROOT/vendor/paseo/packages/app" && npm run build:web
+  cd "$ROOT/core/packages/app" && npm run build:web
 fi
 
 echo "==> Done. Start with: npm start  →  http://<host>:7767 (UI + API + WS, one port)"

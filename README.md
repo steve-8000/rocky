@@ -1,47 +1,43 @@
 # Rocky
 
-amaze (agent runtime) + Paseo (server core & UI) + AionUi's Team Mode orchestration, integrated into **one self-contained project: one process, one port, one UI**.
+Self-contained agent-orchestration platform: a daemon, a web UI, a CLI, a
+desktop app, and the amaze agent runtime — **one process, one port, one UI**.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the integration design and [DESIGN.md](DESIGN.md) for the decision record.
+## Quick start
 
-## Quickstart
-
-Prerequisites: Node ≥ 23 (native TS), Bun ≥ 1.3, npm registry access.
-
-```bash
-npm run setup     # vendor deps, paseo build, webui export, skill link, ~/.rocky/config.json
-npm start         # rockyd → http://<host>:7767  (UI + API + WS, single origin)
-npm run smoke     # regression contract
+```sh
+npm run setup    # install deps, build server + web UI, write ~/.rocky/config.json
+npm start        # rockyd → http://<host>:7767 (UI + API + WS + MCP, one port)
 ```
 
-Set a daemon password before exposing 7767 beyond localhost:
+Before exposing port 7767 anywhere, set a daemon password:
 
-```bash
+```sh
 npm run cli -- daemon set-password
 ```
 
-Environment knobs: `ROCKY_HOME` (default `~/.rocky`); listen address/port live in `~/.rocky/config.json` (`daemon.listen`).
+## Commands
 
-## amaze
+| Command | Effect |
+| --- | --- |
+| `npm run setup` | Full self-contained setup (no network besides npm). |
+| `npm start` | Start rockyd in the foreground. |
+| `npm run smoke` | Regression contract: 7 acceptance checks incl. an end-to-end amaze agent run and a brand scrub. |
+| `npm run cli -- <cmd>` | Rocky CLI (`agent run`, `daemon set-password`, …). |
+| `npm run build:webui` | Rebuild the web UI bundle. |
+| `npm run build:dmg` | Build the Rocky macOS app + DMG. |
+| `npm run icons` | Regenerate all brand assets from the faceted-rock mark. |
 
-Vendored at `vendor/amaze`, run from source via Bun — never from PATH. Registered as an ACP provider in `~/.rocky/config.json`; each agent session is its own short-lived process.
+## Orchestrator mode
 
-```bash
-npm run cli -- agent run --provider amaze --cwd <repo> "task"
-```
+The `rocky-orchestrate` skill (installed to `~/.agents/skills` by setup) turns
+any agent into a Leader that decomposes a goal, spawns parallel Teammate
+agents through Rocky's MCP tools, tracks a shared task board, and aggregates
+results. See `skills/rocky-orchestrate/SKILL.md`.
 
-## Orchestrator mode (from AionUi Team Mode)
+## Layout
 
-`/rocky-orchestrate` — installed to `~/.agents/skills` by setup, bundled in the desktop app. A Leader agent decomposes the goal, delegates to parallel Teammate agents (worktree-isolated), tracks `TEAM_BOARD.md`, communicates over a daemon chat-room mailbox, and escalates silent agents. Runs on the daemon's MCP tools — works from the UI or any agent session.
-
-## Desktop app (DMG)
-
-```bash
-npm run build:dmg   # → vendor/paseo/packages/desktop/release/Rocky-<version>-arm64.dmg
-```
-
-Ad-hoc signed (no Developer ID on this machine): on another Mac run `xattr -dr com.apple.quarantine /Applications/Rocky.app` once. The app manages its own daemon (`~/.rocky`, id `one.clab.rocky`) and ships a `rocky` CLI shim.
-
-## Self-containment
-
-`vendor/{amaze,paseo}` are full source trees committed here. One committed binary: the amaze darwin-arm64 native addon (rebuildable with Rust nightly via `bun run build:native` in vendor/amaze). AionUi is integrated as re-implemented behavior, not vendored code — see ARCHITECTURE.md for the mapping.
+- `server/rockyd.ts` — single server entry
+- `core/` — Rocky runtime monorepo (server, app, cli, desktop, protocol)
+- `vendor/amaze` — vendored agent runtime (ACP provider)
+- `ARCHITECTURE.md` — full design

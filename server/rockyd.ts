@@ -2,13 +2,13 @@
  * rockyd — the single Rocky server runtime.
  *
  * ONE Node process, ONE port (:7767), ONE UI:
- *   - Paseo daemon core (in-process library call) — agents, workspaces,
+ *   - Rocky daemon core (in-process library call) — agents, workspaces,
  *     worktrees, models, attachments, terminals, schedules, MCP, relay.
  *   - Rocky WebUI (Expo SPA) served at the daemon root, so http://host:7767
  *     is the UI and ws://host:7767 is the protocol — same origin, no extra
  *     server, no CORS hop.
  *
- * Orchestrator mode (from AionUi Team Mode) is native: the bundled
+ * Orchestrator mode is native: the bundled
  * `rocky-orchestrate` skill drives Leader/Teammate orchestration over the
  * daemon's own MCP tools (chat room = mailbox, TEAM_BOARD.md = task board,
  * worktrees = teammate isolation, permission queue = per-agent dialogs).
@@ -25,24 +25,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  createPaseoDaemon,
+  createRockyDaemon,
   loadConfig,
-  resolvePaseoHome,
-} from "../vendor/paseo/packages/server/dist/server/server/exports.js";
-import { createRootLogger } from "../vendor/paseo/packages/server/dist/server/server/logger.js";
+  resolveRockyHome,
+} from "../core/packages/server/dist/server/server/exports.js";
+import { createRootLogger } from "../core/packages/server/dist/server/server/logger.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const WEB_UI_DIST = path.join(ROOT, "vendor", "paseo", "packages", "app", "dist");
+const WEB_UI_DIST = path.join(ROOT, "core", "packages", "app", "dist");
 
 process.title = "rockyd";
 
 async function main() {
-  process.env.PASEO_HOME ??= path.join(process.env.HOME ?? "~", ".rocky");
+  process.env.ROCKY_HOME ??= path.join(process.env.HOME ?? "~", ".rocky");
 
-  const paseoHome = resolvePaseoHome(process.env);
-  const config = loadConfig(paseoHome);
+  const rockyHome = resolveRockyHome(process.env);
+  const config = loadConfig(rockyHome);
 
-  const staticDir = path.join(paseoHome, "public");
+  const staticDir = path.join(rockyHome, "public");
   mkdirSync(staticDir, { recursive: true });
   config.staticDir = staticDir;
 
@@ -51,14 +51,14 @@ async function main() {
   }
   config.webUiDir = WEB_UI_DIST;
 
-  const logger = createRootLogger({ log: config.log }, { paseoHome, file: true });
-  const daemon = await createPaseoDaemon(config, logger);
+  const logger = createRootLogger({ log: config.log }, { rockyHome, file: true });
+  const daemon = await createRockyDaemon(config, logger);
   await daemon.start();
 
   const listen = daemon.getListenTarget();
   const listenLabel =
     listen?.type === "tcp" ? `${listen.host}:${listen.port}` : (listen?.path ?? "?");
-  console.log(`[rockyd] up — UI + API + WS on http://${listenLabel} (home ${paseoHome})`);
+  console.log(`[rockyd] up — UI + API + WS on http://${listenLabel} (home ${rockyHome})`);
 
   let shuttingDown = false;
   const shutdown = async (signal: string) => {

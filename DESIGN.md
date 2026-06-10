@@ -1,67 +1,55 @@
-# Rocky — Design
+# Rocky Design Notes
 
-Rocky is a single server + remote WebUI + desktop app that integrates three systems:
+Version 0.1.0 — the first fully Rocky-branded release.
 
-| Layer | Source | What Rocky takes |
-| --- | --- | --- |
-| Agent runtime | **amaze** (`~/roy/amaze/amaze`) | The full amaze CLI, unchanged. Exposed to Rocky over ACP (`amaze acp`). |
-| Server core | **Paseo** (vendored at `vendor/paseo`) | Session daemon, workspace/worktree registry, model/provider catalog, file attachments, terminals, schedules, MCP server, relay, web client. |
-| Orchestration | **AionUi** (Team Mode concept) | Leader/Teammate orchestrator mode, re-implemented as a Rocky skill on top of the Paseo MCP/CLI surface instead of AionUi's Electron-internal Team MCP server. |
+## Principles
 
-## Why this shape
+1. **One process, one port, one UI.** `server/rockyd.ts` boots the daemon
+   core as an in-process library and serves the SPA, REST API, WebSocket
+   stream, and agent MCP endpoint from port 7767. No sidecar processes
+   except per-session agent CLIs.
+2. **Self-contained.** Everything needed to run lives in this repository:
+   the runtime monorepo (`core/`), the vendored agent runtime
+   (`vendor/amaze`), skills, scripts, and config templates. No hosted relay,
+   no update feed, no telemetry.
+3. **amaze stays a separate CLI.** Per-session process isolation: rockyd
+   spawns `bun vendor/amaze/.../cli.ts acp` for each agent session over ACP
+   (stdio). A crashed agent never takes the server down.
+4. **Orchestrator mode is a skill, not a subsystem.** A Leader agent
+   decomposes a goal and delegates to parallel Teammate agents using the
+   daemon's own MCP tools (`create_agent`, `wait_for_agent`,
+   `send_agent_prompt`, …). Teammates default to isolated git worktrees;
+   permissions stay per-agent in the daemon permission queue. See
+   `skills/rocky-orchestrate/SKILL.md`.
 
-A rewrite of Paseo's daemon (agent lifecycle, timeline sync, E2E relay, binary terminal frames) would be months of high-risk work for zero product delta. Likewise, AionUi's Team Mode is tightly coupled to its Electron main process; what is portable is the *behavior*: a Leader agent that decomposes work, delegates to parallel Teammates, tracks a shared task board, and aggregates results. Paseo's daemon already exposes every primitive that behavior needs (`create_agent`, `wait_for_agent`, `send_agent_prompt`, chat rooms as the async mailbox, worktrees as isolation). So:
+## Identity
 
-- **Paseo daemon = Rocky server.** Vendored as a git worktree (`vendor/paseo`, branch `rocky`) so upstream merges stay one `git merge` away. Branding/config diffs live on the `rocky` branch.
-- **amaze = first-class provider.** Paseo supports ACP providers in config; amaze ships `amaze acp` (stdio ACP server with default/plan modes, model selection, file attachments via ACP content blocks). No code change needed on either side — pure configuration in `~/.rocky/config.json` (`ROCKY_HOME` → `PASEO_HOME`).
-- **Orchestrator mode = skill + MCP.** `skills/rocky-orchestrate` implements the AionUi Leader/Teammate protocol using Paseo MCP tools. Any provider (amaze, Claude Code, Codex) can be the Leader; Teammates run in parallel as daemon-managed agents sharing the workspace, with per-agent permission queues — same semantics as AionUi's team-isolated workspace.
+- Package scope `@getrocky/*`, version `0.1.0`, app/bundle id
+  `one.clab.rocky`, home `~/.rocky`, port `7767`.
+- Brand mark: a faceted rock. One geometry drives the desktop icon, web
+  favicons (idle/running/attention), PWA icons, splash, and the in-app
+  `RockyLogo` component. `npm run icons` regenerates all of them from
+  `scripts/brand/make-icons.py`.
+- Default theme: warm charcoal + copper (`rockyDarkColors` in
+  `core/packages/app/src/styles/theme.ts`).
 
-## Architecture
+## Operational decisions
 
-```
-┌────────────┐   ┌────────────┐   ┌─────────────────────┐
-│ Rocky.app   │   │ Browser    │   │ Paseo mobile app    │
-│ (Electron,  │   │ (remote    │   │ (optional, Direct/  │
-│  DMG)       │   │  WebUI)    │   │  relay connection)  │
-└──────┬──────┘   └─────┬──────┘   └──────────┬──────────┘
-       │ managed daemon │ ws://host:7767      │
-       └────────────┬───┴─────────────────────┘
-              ┌─────▼──────┐
-              │ Rocky      │  = Paseo daemon, ROCKY_HOME=~/.rocky
-              │ daemon     │  listen 0.0.0.0:7767, password auth
-              └─────┬──────┘
-        ┌───────────┼───────────────┬─────────────┐
-  ┌─────▼─────┐ ┌───▼──────────┐ ┌──▼───────┐ ┌───▼────┐
-  │ amaze     │ │ Claude Code  │ │ Codex    │ │  ...   │
-  │ (ACP)     │ │              │ │          │ │        │
-  └───────────┘ └──────────────┘ └──────────┘ └────────┘
-        Leader agent ──MCP──► create_agent / wait_for_agent /
-                              send_agent_prompt / chat mailbox
-                              (rocky-orchestrate skill)
-```
+- Daemon binds loopback; remote access terminates TLS at an edge proxy
+  (e.g. Caddy at `rocky.clab.one`) and reverse-proxies to 127.0.0.1:7767.
+- Daemon password (bcrypt) gates all surfaces except `/api/health`.
+  Agent-injected MCP self-calls use a boot-scoped `?rockyToken=` query
+  secret accepted only under `/mcp/`.
+- Relay/pairing is disabled by default (`relayEnabled: false`) since no
+  hosted relay exists for a self-contained deployment.
+- The amaze provider pins a known-good default model via
+  `additionalModels[].isDefault` in `config/rocky.config.json`, so agent
+  runs do not depend on whatever default the local agent config happens to
+  carry.
 
-### Core technology carried over from Paseo
+## Regression contract
 
-- **Session daemon** — agent lifecycle state machine, append-only timeline with epochs, reconnect-safe sync.
-- **Workspaces & worktrees** — project/workspace registry, Paseo-managed git worktrees for isolated parallel work (this is what makes parallel Teammates safe).
-- **Models/providers** — provider catalog with custom providers, profiles, per-provider model lists; amaze added as ACP entry.
-- **File attachments** — composer attachments + binary file-transfer frames, work end-to-end through daemon to providers (ACP content blocks for amaze).
-- **Remote access** — direct `0.0.0.0` listen with password + host allowlist, or the E2E-encrypted relay; WebUI is the Expo web export served at the daemon origin.
-
-### Orchestrator mode (from AionUi Team Mode)
-
-`skills/rocky-orchestrate/SKILL.md` defines the protocol:
-
-1. **Leader** receives the goal, writes a task board (`TEAM_BOARD.md` in the workspace — AionUi's shared task board equivalent).
-2. Decomposes into independent subtasks; for each, creates a **Teammate** agent via `create_agent` (optionally `worktree: true` for conflict-free parallel edits; AionUi shares one folder — Rocky supports both, worktree is the default for code).
-3. A daemon **chat room** is the async mailbox: Teammates post completion/blockers, Leader `wait`s on the room.
-4. Leader monitors with `wait_for_agent` / `get_agent_activity`, reassigns or kills silent agents (AionUi's auto-escalate-failed), aggregates results, updates the board, reports.
-5. Permissions stay per-agent (daemon permission queue = AionUi's per-agent permission dialogs).
-
-## Key decisions (current — see ARCHITECTURE.md for the authoritative layout)
-
-- **Self-contained vendoring.** `vendor/{amaze,paseo,aionui}` are full source trees committed to this repository (originally a git worktree of `~/roy/paseo`; detached when self-containment became a requirement). Upstream sync is a re-export + replay of Rocky commits.
-- **One server process.** Paseo daemon and AionUi web-host run inside a single Node runtime (`server/rockyd.ts`). aioncore (AionUi's closed-source Rust backend) is the only managed child process; amaze stays a separate CLI for per-session process isolation.
-- **Port 7767, home `~/.rocky`.** Avoids colliding with stock Paseo (6767/`~/.paseo`). All Rocky state, including AionUi's, lives under `~/.rocky`.
-- **amaze is vendored, not PATH-resolved.** Both the daemon ACP provider and the AionUi custom agent point at `vendor/amaze/packages/coding-agent/src/cli.ts` via Bun.
-- **DMG ad-hoc signed for now.** No Developer ID identity on this machine. Signing/notarization is a config flip in `vendor/paseo/packages/desktop/electron-builder.yml` when credentials exist.
+`scripts/smoke.sh` is the acceptance gate (run via `npm run smoke`):
+single binary process, single origin for UI/SPA/API, a real end-to-end
+agent run that writes a file, and a brand scrub asserting no upstream
+branding ships in the served bundle.

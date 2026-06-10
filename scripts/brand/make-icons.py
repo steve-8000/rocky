@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the Rocky icon set (macOS .icns, Windows .ico, Linux PNGs).
+"""Generate the complete Rocky brand asset set from one faceted-rock mark.
 
-Draws a faceted rock mark on a dark rounded-square tile and writes every
-size the vendored desktop build expects under packages/desktop/assets/.
+Usage:
+    python3 scripts/brand/make-icons.py <repo-root>
 
-Usage: python3 make-icons.py <desktop-assets-dir>
+Writes:
+    core/packages/desktop/assets/        icon.icns / icon.ico / linux PNGs
+    core/packages/app/assets/images/     expo icon, splash, android, favicons
+    core/packages/app/public/            pwa icons, apple-touch-icon
 """
 
 from __future__ import annotations
@@ -17,24 +20,39 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 BASE = 1024
-BG_TOP = (38, 42, 54)
-BG_BOTTOM = (18, 20, 28)
+
+# Warm charcoal tile behind the copper rock (matches app theme surface0 #1B1916)
+BG_TOP = (43, 38, 32)
+BG_BOTTOM = (20, 17, 14)
+
+# Faceted rock — same geometry as RockyLogo (rocky-logo.tsx), copper palette.
 ROCK_FACES = [
     # polygon (normalized coords), fill
-    ([(0.50, 0.16), (0.78, 0.34), (0.50, 0.50)], (235, 137, 52)),
-    ([(0.50, 0.16), (0.22, 0.34), (0.50, 0.50)], (255, 170, 80)),
-    ([(0.22, 0.34), (0.18, 0.66), (0.50, 0.50)], (214, 116, 38)),
-    ([(0.78, 0.34), (0.82, 0.66), (0.50, 0.50)], (188, 96, 28)),
-    ([(0.18, 0.66), (0.50, 0.84), (0.50, 0.50)], (240, 148, 60)),
-    ([(0.82, 0.66), (0.50, 0.84), (0.50, 0.50)], (164, 80, 22)),
+    ([(0.50, 0.16), (0.78, 0.34), (0.50, 0.50)], (222, 138, 66)),   # top-right
+    ([(0.50, 0.16), (0.22, 0.34), (0.50, 0.50)], (245, 166, 92)),   # top-left
+    ([(0.22, 0.34), (0.18, 0.66), (0.50, 0.50)], (196, 113, 44)),   # left
+    ([(0.78, 0.34), (0.82, 0.66), (0.50, 0.50)], (168, 92, 32)),    # right
+    ([(0.18, 0.66), (0.50, 0.84), (0.50, 0.50)], (230, 148, 72)),   # bottom-left
+    ([(0.82, 0.66), (0.50, 0.84), (0.50, 0.50)], (146, 76, 24)),    # bottom-right
 ]
 
+STATUS_COLORS = {
+    "running": (59, 130, 246),    # blue
+    "attention": (245, 158, 11),  # amber
+}
 
-def rounded_tile(size: int) -> Image.Image:
+
+def draw_rock(draw: ImageDraw.ImageDraw, size: int, mono: tuple[int, int, int] | None = None) -> None:
+    for i, (points, fill) in enumerate(ROCK_FACES):
+        if mono is not None:
+            # opacity-stepped mono variant (matches RockyLogo facet opacities)
+            opacities = [235, 255, 199, 153, 224, 122]
+            fill = mono + (opacities[i],)
+        draw.polygon([(x * size, y * size) for x, y in points], fill=fill)
+
+
+def rounded_tile(size: int, radius_ratio: float = 0.225) -> Image.Image:
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    radius = int(size * 0.225)
-    # vertical gradient
     grad = Image.new("RGBA", (1, size))
     for y in range(size):
         t = y / max(size - 1, 1)
@@ -44,10 +62,28 @@ def rounded_tile(size: int) -> Image.Image:
         )
     grad = grad.resize((size, size))
     mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [0, 0, size - 1, size - 1], radius=int(size * radius_ratio), fill=255
+    )
     img.paste(grad, (0, 0), mask)
-    for points, fill in ROCK_FACES:
-        draw.polygon([(x * size, y * size) for x, y in points], fill=fill)
+    draw_rock(ImageDraw.Draw(img), size)
+    return img
+
+
+def bare_rock(size: int, mono: tuple[int, int, int] | None = None) -> Image.Image:
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw_rock(ImageDraw.Draw(img), size, mono=mono)
+    return img
+
+
+def favicon(size: int, scheme: str, status: str | None) -> Image.Image:
+    mono = (245, 245, 244) if scheme == "dark" else (26, 24, 20)
+    img = bare_rock(size, mono=mono)
+    if status:
+        draw = ImageDraw.Draw(img)
+        r = size * 0.18
+        cx = cy = size * 0.78
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=STATUS_COLORS[status] + (255,))
     return img
 
 
@@ -66,20 +102,53 @@ def make_icns(master: Image.Image, out_path: Path) -> None:
 
 
 def main() -> None:
-    assets = Path(sys.argv[1]).expanduser()
-    assets.mkdir(parents=True, exist_ok=True)
+    root = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path.cwd()
+    desktop = root / "core/packages/desktop/assets"
+    images = root / "core/packages/app/assets/images"
+    public = root / "core/packages/app/public"
+    for d in (desktop, images, public):
+        d.mkdir(parents=True, exist_ok=True)
+
     master = rounded_tile(BASE)
 
-    master.resize((512, 512), Image.LANCZOS).save(assets / "icon.png")
+    # Desktop (electron-builder)
+    master.resize((512, 512), Image.LANCZOS).save(desktop / "icon.png")
     for size in (32, 64, 128):
-        master.resize((size, size), Image.LANCZOS).save(assets / f"{size}x{size}.png")
-    master.resize((256, 256), Image.LANCZOS).save(assets / "128x128@2x.png")
+        master.resize((size, size), Image.LANCZOS).save(desktop / f"{size}x{size}.png")
+    master.resize((256, 256), Image.LANCZOS).save(desktop / "128x128@2x.png")
     master.save(
-        assets / "icon.ico",
+        desktop / "icon.ico",
         sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )
-    make_icns(master, assets / "icon.icns")
-    print(f"wrote Rocky icons to {assets}")
+    make_icns(master, desktop / "icon.icns")
+
+    # Expo app images
+    master.resize((1024, 1024), Image.LANCZOS).save(images / "icon.png")
+    master.resize((48, 48), Image.LANCZOS).save(images / "favicon.png")
+    bare_rock(1024).resize((512, 512), Image.LANCZOS).save(images / "android-icon-foreground.png")
+    bare_rock(1024, mono=(255, 255, 255)).resize((96, 96), Image.LANCZOS).save(
+        images / "notification-icon.png"
+    )
+    # splash: bare rock centered on transparent canvas
+    splash = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+    rock = bare_rock(640)
+    splash.paste(rock, ((1024 - 640) // 2, (1024 - 640) // 2), rock)
+    splash.save(images / "splash-icon.png")
+
+    # Status favicons (web tab indicator)
+    for scheme in ("dark", "light"):
+        for status in (None, "running", "attention"):
+            suffix = f"-{status}" if status else ""
+            favicon(96, scheme, status).resize((48, 48), Image.LANCZOS).save(
+                images / f"favicon-{scheme}{suffix}.png"
+            )
+
+    # PWA / web public
+    master.resize((192, 192), Image.LANCZOS).save(public / "pwa-icon-192.png")
+    master.resize((512, 512), Image.LANCZOS).save(public / "pwa-icon-512.png")
+    master.resize((180, 180), Image.LANCZOS).save(public / "apple-touch-icon.png")
+
+    print(f"wrote Rocky brand assets under {root}")
 
 
 if __name__ == "__main__":

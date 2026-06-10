@@ -1,16 +1,16 @@
 {
   "name": "rocky",
-  "version": "0.3.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Rocky: amaze + Paseo + AionUi integrated into one self-contained server with remote WebUIs and a desktop app",
+  "description": "Rocky — self-contained agent orchestration platform: one process, one port, one UI",
   "scripts": {
     "setup": "sh scripts/setup.sh",
     "start": "sh scripts/rockyd.sh",
-    "cli": "npm --prefix vendor/paseo run cli --silent --",
-    "build:webui": "npm --prefix vendor/paseo/packages/app run build:web",
-    "build:dmg": "npm --prefix vendor/paseo/packages/desktop run build",
-    "icons": "python3 scripts/brand/make-icons.py vendor/paseo/packages/desktop/assets",
+    "cli": "npm --prefix core run cli --silent --",
+    "build:webui": "npm --prefix core/packages/app run build:web",
+    "build:dmg": "npm --prefix core/packages/desktop run build",
+    "icons": "python3 scripts/brand/make-icons.py .",
     "smoke": "sh scripts/smoke.sh"
   }
 }

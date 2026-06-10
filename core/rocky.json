@@ -1,0 +1,23 @@
+{
+  "worktree": {
+    "setup": [
+      "npm ci",
+      "npm run build:server",
+      "npm run build --workspace=@getrocky/expo-two-way-audio",
+      "cp \"$ROCKY_SOURCE_CHECKOUT_PATH/packages/server/.env\" \"$ROCKY_WORKTREE_PATH/packages/server/.env\""
+    ]
+  },
+  "scripts": {
+    "daemon": {
+      "type": "service",
+      "command": "ROCKY_SKIP_DEV_SERVER_BUILD=1 ROCKY_LISTEN=0.0.0.0:$ROCKY_PORT ./scripts/dev-daemon.sh"
+    },
+    "app": {
+      "type": "service",
+      "command": "BROWSER=none EXPO_PUBLIC_LOCAL_DAEMON=\"localhost:${ROCKY_SERVICE_DAEMON_PORT}\" npm run start:expo --workspace=@getrocky/app -- --port $ROCKY_PORT"
+    },
+    "typecheck": {
+      "command": "npm run typecheck"
+    }
+  }
+}

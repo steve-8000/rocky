@@ -1,0 +1,256 @@
+#!/usr/bin/env npx tsx
+
+/**
+ * Regression: app-style restart requests must trigger supervised worker restart
+ * (worker PID changes) while keeping the daemon healthy.
+ */
+
+import assert from "node:assert";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { $ } from "zx";
+import { tryConnectToDaemon } from "../src/utils/client.ts";
+import { getAvailablePort } from "./helpers/network.ts";
+
+$.verbose = false;
+
+const pollIntervalMs = 100;
+const testEnv = {
+  ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD: process.env.ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD ?? "0",
+  ROCKY_DICTATION_ENABLED: process.env.ROCKY_DICTATION_ENABLED ?? "0",
+  ROCKY_VOICE_MODE_ENABLED: process.env.ROCKY_VOICE_MODE_ENABLED ?? "0",
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProcessRunning(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readWorkerPid(supervisorPid: number): number | null {
+  if (!Number.isInteger(supervisorPid) || supervisorPid <= 0) {
+    return null;
+  }
+
+  const result = spawnSync("ps", ["ax", "-o", "pid=,ppid="], { encoding: "utf8" });
+  if (result.status !== 0 || result.error) {
+    return null;
+  }
+
+  for (const line of result.stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const [pidToken, ppidToken] = trimmed.split(/\s+/);
+    const pid = Number.parseInt(pidToken ?? "", 10);
+    const ppid = Number.parseInt(ppidToken ?? "", 10);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) {
+      continue;
+    }
+    if (ppid === supervisorPid && pid > 0) {
+      return pid;
+    }
+  }
+
+  return null;
+}
+
+interface DaemonStatus {
+  localDaemon: string | null;
+  pid: number | null;
+}
+
+async function readDaemonStatus(rockyHome: string): Promise<DaemonStatus> {
+  const result =
+    await $`ROCKY_HOME=${rockyHome} ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD=${testEnv.ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD} ROCKY_DICTATION_ENABLED=${testEnv.ROCKY_DICTATION_ENABLED} ROCKY_VOICE_MODE_ENABLED=${testEnv.ROCKY_VOICE_MODE_ENABLED} npx rocky daemon status --home ${rockyHome} --json`.nothrow();
+  if (result.exitCode !== 0) {
+    return { localDaemon: null, pid: null };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout) as { localDaemon?: unknown; pid?: unknown };
+    const localDaemon = typeof parsed.localDaemon === "string" ? parsed.localDaemon : null;
+    const pid =
+      typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0
+        ? parsed.pid
+        : null;
+    return { localDaemon, pid };
+  } catch {
+    return { localDaemon: null, pid: null };
+  }
+}
+
+async function readCapturedSupervisorLogs(rockyHome: string, recentLogs: string): Promise<string> {
+  const durableLogs = await readFile(join(rockyHome, "daemon.log"), "utf8").catch(() => "");
+  return `${recentLogs}\n${durableLogs}`;
+}
+
+async function waitFor(
+  check: () => Promise<boolean> | boolean,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  async function poll(): Promise<void> {
+    if (await check()) return;
+    if (Date.now() >= deadline) throw new Error(message);
+    await sleep(pollIntervalMs);
+    return poll();
+  }
+
+  return poll();
+}
+
+console.log("=== Daemon Restart (supervisor regression) ===\n");
+
+const port = await getAvailablePort();
+const rockyHome = await mkdtemp(join(tmpdir(), "rocky-restart-supervisor-"));
+const cliRoot = join(import.meta.dirname, "..");
+const host = `127.0.0.1:${port}`;
+
+let supervisorProcess: ChildProcess | null = null;
+let recentSupervisorLogs = "";
+
+try {
+  console.log("Test 1: start supervisor-entrypoint in dev mode with isolated ROCKY_HOME");
+
+  supervisorProcess = spawn(
+    process.execPath,
+    ["--import", "tsx", "../server/scripts/supervisor-entrypoint.ts", "--dev"],
+    {
+      cwd: cliRoot,
+      env: {
+        ...process.env,
+        ...testEnv,
+        ROCKY_HOME: rockyHome,
+        ROCKY_LISTEN: host,
+        ROCKY_RELAY_ENABLED: "false",
+        CI: "true",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+
+  supervisorProcess.stdout?.on("data", (chunk) => {
+    recentSupervisorLogs = (recentSupervisorLogs + chunk.toString()).slice(-8000);
+  });
+  supervisorProcess.stderr?.on("data", (chunk) => {
+    recentSupervisorLogs = (recentSupervisorLogs + chunk.toString()).slice(-8000);
+  });
+
+  await waitFor(
+    async () => {
+      const status = await readDaemonStatus(rockyHome);
+      return (
+        status.localDaemon === "running" && status.pid !== null && isProcessRunning(status.pid)
+      );
+    },
+    120000,
+    "daemon did not become running in time",
+  );
+
+  const statusBeforeRestart = await readDaemonStatus(rockyHome);
+  const supervisorPid = statusBeforeRestart.pid;
+  assert.strictEqual(
+    statusBeforeRestart.localDaemon,
+    "running",
+    "daemon should be running before restart",
+  );
+  assert(supervisorPid !== null, "supervisor pid should exist once daemon starts");
+  assert(isProcessRunning(supervisorPid), "supervisor process should be running");
+  const workerPidBeforeRestart = readWorkerPid(supervisorPid);
+  assert(workerPidBeforeRestart !== null, "supervisor should have a worker process before restart");
+  assert(
+    isProcessRunning(workerPidBeforeRestart),
+    "worker process should be running before restart",
+  );
+  console.log(
+    `✓ daemon running with supervisor ${supervisorPid} and worker ${workerPidBeforeRestart}\n`,
+  );
+
+  console.log("Test 2: app-style restart request should restart worker and keep daemon healthy");
+  const client = await tryConnectToDaemon({ host, timeout: 5000 });
+  assert(client, "daemon client should connect");
+  try {
+    const restartAck = await client.restartServer("settings_update");
+    assert.strictEqual(
+      restartAck.status,
+      "restart_requested",
+      "restart request should be acknowledged",
+    );
+  } finally {
+    await client?.close().catch(() => undefined);
+  }
+
+  await waitFor(
+    () => {
+      const workerPid = readWorkerPid(supervisorPid);
+      return (
+        workerPid !== null && workerPid !== workerPidBeforeRestart && isProcessRunning(workerPid)
+      );
+    },
+    20000,
+    "worker pid did not change after restart request",
+  );
+
+  const workerPidAfterRestart = readWorkerPid(supervisorPid);
+  assert(workerPidAfterRestart !== null, "worker process should exist after restart");
+  assert.notStrictEqual(
+    workerPidAfterRestart,
+    workerPidBeforeRestart,
+    "worker pid should change after restart",
+  );
+
+  const statusAfterRestart = await readDaemonStatus(rockyHome);
+  assert.strictEqual(
+    statusAfterRestart.localDaemon,
+    "running",
+    "daemon should stay running after restart",
+  );
+  assert.strictEqual(
+    statusAfterRestart.pid,
+    supervisorPid,
+    "supervisor pid should remain stable across restart",
+  );
+  const capturedSupervisorLogs = await readCapturedSupervisorLogs(rockyHome, recentSupervisorLogs);
+  assert(
+    capturedSupervisorLogs.includes("Restart requested by worker. Stopping worker for restart..."),
+    `restart should route through supervisor restart intent, logs:\n${capturedSupervisorLogs}`,
+  );
+  console.log("✓ app-style restart keeps daemon healthy and restarts worker\n");
+} finally {
+  if (supervisorProcess?.pid && isProcessRunning(supervisorProcess.pid)) {
+    supervisorProcess.kill("SIGTERM");
+    await waitFor(
+      () => !isProcessRunning(supervisorProcess!.pid ?? -1),
+      5000,
+      "supervisor cleanup timed out",
+    ).catch(() => {
+      supervisorProcess?.kill("SIGKILL");
+    });
+  }
+
+  await $`ROCKY_HOME=${rockyHome} ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD=${testEnv.ROCKY_LOCAL_SPEECH_AUTO_DOWNLOAD} ROCKY_DICTATION_ENABLED=${testEnv.ROCKY_DICTATION_ENABLED} ROCKY_VOICE_MODE_ENABLED=${testEnv.ROCKY_VOICE_MODE_ENABLED} npx rocky daemon stop --home ${rockyHome} --force`.nothrow();
+  await rm(rockyHome, { recursive: true, force: true });
+}
+
+if (recentSupervisorLogs.trim().length === 0) {
+  console.log("(no supervisor logs captured)");
+}
+
+console.log("=== Supervisor restart regression test passed ===");

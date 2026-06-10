@@ -6,12 +6,6 @@
       "localhost",
       "127.0.0.1"
     ],
-    "cors": {
-      "allowedOrigins": [
-        "http://localhost:7780",
-        "http://127.0.0.1:7780"
-      ]
-    },
     "mcp": {
       "enabled": true,
       "injectIntoAgents": true
@@ -26,6 +20,24 @@
           "bun",
           "__ROCKY_ROOT__/vendor/amaze/packages/coding-agent/src/cli.ts",
           "acp"
+        ],
+        "additionalModels": [
+          {
+            "id": "anthropic/claude-fable-5",
+            "label": "Claude Fable 5",
+            "isDefault": true,
+            "thinkingOptions": [
+              {
+                "id": "medium",
+                "label": "Medium",
+                "isDefault": true
+              },
+              {
+                "id": "high",
+                "label": "High"
+              }
+            ]
+          }
         ]
       }
     }
