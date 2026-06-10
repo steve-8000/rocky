@@ -849,6 +849,43 @@ export class AgentManager {
       : { persistSession: options.persistSession };
   }
 
+  // The daemon injects a `rocky` MCP server whose URL carries a boot-scoped
+  // `rockyToken` (minted fresh on every daemon start) plus a `callerAgentId`
+  // marker. That full URL is persisted with the agent config, so after a
+  // restart the token is stale and resumed agents hit HTTP 401. Re-derive the
+  // injected entry from the current `mcpBaseUrl` on every resume/reload. The
+  // `callerAgentId` query param is only ever appended by daemon injection, so
+  // user-provided rocky configs (which lack it) are left untouched. Returns the
+  // same reference when nothing changed.
+  private refreshInjectedRockyMcpServer(
+    config: AgentSessionConfig,
+    agentId: string,
+  ): AgentSessionConfig {
+    const rocky = config.mcpServers?.rocky;
+    const isInjected =
+      rocky != null && rocky.type === "http" && rocky.url.includes("callerAgentId=");
+    if (!isInjected) {
+      return config;
+    }
+    const { rocky: _stale, ...rest } = config.mcpServers ?? {};
+    if (this.mcpBaseUrl == null) {
+      // Injection is disabled now (it was enabled when this config was
+      // persisted) — drop the stale entry rather than resurrect a dead URL.
+      const hasRemaining = Object.keys(rest).length > 0;
+      return { ...config, mcpServers: hasRemaining ? rest : undefined };
+    }
+    return {
+      ...config,
+      mcpServers: {
+        rocky: {
+          type: "http" as const,
+          url: `${this.mcpBaseUrl}${this.mcpBaseUrl.includes("?") ? "&" : "?"}callerAgentId=${agentId}`,
+        },
+        ...rest,
+      },
+    };
+  }
+
   // Reconstruct an agent from provider persistence. Callers should explicitly
   // hydrate timeline history after resume.
   async resumeAgentFromPersistence(
@@ -872,8 +909,13 @@ export class AgentManager {
       ...overrides,
       provider: handle.provider,
     } as AgentSessionConfig;
+    // Re-derive the daemon-injected rocky MCP URL from the live mcpBaseUrl so a
+    // resumed agent never reuses a stale boot-scoped token. Done before
+    // normalize so normalizedConfig (and thus re-persistence) carries the fresh
+    // URL.
+    const refreshedConfig = this.refreshInjectedRockyMcpServer(mergedConfig, resolvedAgentId);
     const normalizedConfig = this.applyDaemonAppendSystemPrompt(
-      await this.normalizeConfig(mergedConfig),
+      await this.normalizeConfig(refreshedConfig),
     );
     const resumeOverrides: Partial<AgentSessionConfig> = { ...overrides };
     let hasResumeOverrides = overrides !== undefined;
@@ -890,6 +932,11 @@ export class AgentManager {
 
     if (metadata.daemonAppendSystemPrompt !== normalizedConfig.daemonAppendSystemPrompt) {
       resumeOverrides.daemonAppendSystemPrompt = normalizedConfig.daemonAppendSystemPrompt;
+      hasResumeOverrides = true;
+    }
+
+    if (refreshedConfig !== mergedConfig) {
+      resumeOverrides.mcpServers = refreshedConfig.mcpServers;
       hasResumeOverrides = true;
     }
 
@@ -938,8 +985,12 @@ export class AgentManager {
       ...overrides,
       provider,
     } as AgentSessionConfig;
+    // Refresh the daemon-injected rocky MCP URL before normalize so the
+    // normalizedConfig handed to resumeSession (and re-persisted) carries a live
+    // token rather than the stale boot-scoped one from disk.
+    const refreshedConfig = this.refreshInjectedRockyMcpServer(refreshConfig, agentId);
     const normalizedConfig = this.applyDaemonAppendSystemPrompt(
-      await this.normalizeConfig(refreshConfig),
+      await this.normalizeConfig(refreshedConfig),
     );
     const launchContext = this.buildLaunchContext(agentId);
 

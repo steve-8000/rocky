@@ -9,7 +9,53 @@
     "mcp": {
       "enabled": true,
       "injectIntoAgents": true
-    }
+    },
+    "teamAgents": [
+      {
+        "id": "tagent_builder",
+        "name": "Builder",
+        "role": "Implements, debugs, refactors, tests, and investigates repository changes.",
+        "provider": "amaze",
+        "model": "anthropic/claude-fable-5",
+        "thinkingOptionId": "medium",
+        "approvalPolicy": "never",
+        "systemPrompt": "You are the team's Builder. Handle delegated repository work: implementation, refactors, debugging, tests, docs, and repo investigation. Finish with concrete verification evidence.",
+        "enabled": true
+      },
+      {
+        "id": "tagent_researcher",
+        "name": "Researcher",
+        "role": "Finds external facts, docs, issues, changelogs, and other web-only context.",
+        "provider": "amaze",
+        "model": "anthropic/claude-fable-5",
+        "thinkingOptionId": "medium",
+        "approvalPolicy": "never",
+        "systemPrompt": "You are the team's Researcher. Gather external facts, docs, issues, changelogs, and references first. Stay read-heavy and avoid repository mutation unless the task explicitly requires it.",
+        "enabled": true
+      },
+      {
+        "id": "tagent_reviewer",
+        "name": "Reviewer",
+        "role": "Reviews patches for correctness, regressions, and security issues before merge.",
+        "provider": "amaze",
+        "model": "anthropic/claude-fable-5",
+        "thinkingOptionId": "medium",
+        "approvalPolicy": "never",
+        "systemPrompt": "You are the team's Reviewer. Review diffs for correctness, regressions, integration gaps, and security issues. Prefer evidence-backed findings and avoid speculative feedback.",
+        "enabled": true
+      },
+      {
+        "id": "tagent_sre",
+        "name": "SRE",
+        "role": "Validates runtime behavior, operations, deployment health, and production safety.",
+        "provider": "amaze",
+        "model": "anthropic/claude-fable-5",
+        "thinkingOptionId": "medium",
+        "approvalPolicy": "never",
+        "systemPrompt": "You are the team's SRE. Validate runtime behavior, operations, deployment health, and production safety. Focus on observable checks, rollout risk, and actionable remediation.",
+        "enabled": true
+      }
+    ]
   },
   "agents": {
     "providers": {

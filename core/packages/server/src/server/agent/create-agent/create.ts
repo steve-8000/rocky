@@ -92,6 +92,7 @@ export interface CreateAgentFromMcpInput {
   features?: Record<string, unknown>;
   labels?: Record<string, string>;
   mode?: string;
+  approvalPolicy?: string;
   background: boolean;
   notifyOnFinish: boolean;
   detached?: boolean;
@@ -261,10 +262,10 @@ async function resolveMcpCreateAgent(
     await dependencies.providerSnapshotManager.resolveCreateConfig({
       cwd: resolvedCwd,
       provider,
-      requestedMode: input.mode,
+      requestedMode: input.mode ?? input.approvalPolicy,
       featureValues: input.features,
       parent: parentAgent,
-      unattended: false,
+      unattended: input.approvalPolicy === "never",
     });
 
   const labels = mergeLabels({
@@ -283,6 +284,7 @@ async function resolveMcpCreateAgent(
       title: input.title.trim(),
       model: resolvedProviderModel.model,
       thinkingOptionId: input.thinking,
+      ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
       ...(resolvedFeatures ? { featureValues: resolvedFeatures } : {}),
     },
     createOptions: labels ? { labels } : undefined,

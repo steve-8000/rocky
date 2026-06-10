@@ -231,6 +231,7 @@ export const PersistedConfigSchema = z
                 provider: z.string(),
                 model: z.string().optional(),
                 thinkingOptionId: z.string().optional(),
+                approvalPolicy: z.string().optional(),
                 systemPrompt: z.string().optional(),
                 enabled: z.boolean().optional(),
               })

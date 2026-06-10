@@ -10,9 +10,16 @@ const LEGACY_SETTINGS_KEY = "@rocky:settings";
 export type SendBehavior = "interrupt" | "queue";
 export type ReleaseChannel = "stable" | "beta";
 export type ServiceUrlBehavior = "ask" | "in-app" | "external";
+export type GlobalAgentModePreference = "provider-default" | "ask" | "default" | "bypass";
 
 const VALID_THEMES = new Set<string>([...Object.keys(THEME_TO_UNISTYLES), "auto"]);
 const VALID_SERVICE_URL_BEHAVIORS = new Set<ServiceUrlBehavior>(["ask", "in-app", "external"]);
+const VALID_GLOBAL_AGENT_MODE_PREFERENCES = new Set<GlobalAgentModePreference>([
+  "provider-default",
+  "ask",
+  "default",
+  "bypass",
+]);
 export const DEFAULT_TERMINAL_SCROLLBACK_LINES = 10_000;
 export const MIN_TERMINAL_SCROLLBACK_LINES = 0;
 export const MAX_TERMINAL_SCROLLBACK_LINES = 1_000_000;
@@ -28,6 +35,7 @@ export interface AppSettings {
   theme: ThemeName | "auto";
   sendBehavior: SendBehavior;
   serviceUrlBehavior: ServiceUrlBehavior;
+  defaultAgentMode: GlobalAgentModePreference;
   terminalScrollbackLines: number;
   uiFontFamily: string; // "" = platform default UI stack
   monoFontFamily: string; // "" = platform default mono stack
@@ -45,6 +53,7 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   theme: "auto",
   sendBehavior: "interrupt",
   serviceUrlBehavior: "ask",
+  defaultAgentMode: "provider-default",
   terminalScrollbackLines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
   uiFontFamily: "",
   monoFontFamily: "",
@@ -157,6 +166,12 @@ function pickAppSettings(stored: Partial<AppSettings>): Partial<AppSettings> {
     VALID_SERVICE_URL_BEHAVIORS.has(stored.serviceUrlBehavior)
   ) {
     result.serviceUrlBehavior = stored.serviceUrlBehavior;
+  }
+  if (
+    typeof stored.defaultAgentMode === "string" &&
+    VALID_GLOBAL_AGENT_MODE_PREFERENCES.has(stored.defaultAgentMode)
+  ) {
+    result.defaultAgentMode = stored.defaultAgentMode;
   }
   const terminalScrollbackLines = parseTerminalScrollbackLines(stored.terminalScrollbackLines);
   if (terminalScrollbackLines !== null) {

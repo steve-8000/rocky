@@ -19,6 +19,7 @@ interface TeamAgentDraft {
   provider: string;
   model: string;
   thinkingOptionId: string;
+  approvalPolicy: string;
   systemPrompt: string;
   enabled: boolean;
 }
@@ -31,6 +32,7 @@ function emptyDraft(defaultProvider: string): TeamAgentDraft {
     provider: defaultProvider,
     model: "",
     thinkingOptionId: "",
+    approvalPolicy: "",
     systemPrompt: "",
     enabled: true,
   };
@@ -44,6 +46,7 @@ function draftFromAgent(agent: TeamAgent): TeamAgentDraft {
     provider: agent.provider,
     model: agent.model ?? "",
     thinkingOptionId: agent.thinkingOptionId ?? "",
+    approvalPolicy: typeof agent.approvalPolicy === "string" ? agent.approvalPolicy : "",
     systemPrompt: agent.systemPrompt ?? "",
     enabled: agent.enabled !== false,
   };
@@ -57,6 +60,7 @@ export function draftToAgent(draft: TeamAgentDraft): TeamAgent {
     provider: draft.provider,
     ...(draft.model.trim() ? { model: draft.model.trim() } : {}),
     ...(draft.thinkingOptionId.trim() ? { thinkingOptionId: draft.thinkingOptionId.trim() } : {}),
+    ...(draft.approvalPolicy.trim() ? { approvalPolicy: draft.approvalPolicy.trim() } : {}),
     ...(draft.systemPrompt.trim() ? { systemPrompt: draft.systemPrompt.trim() } : {}),
     enabled: draft.enabled,
   };
@@ -197,6 +201,14 @@ function TeamAgentEditorSheet({
     ];
   }, [selectedModel]);
 
+  const modeOptions = useMemo<ComboboxOption[]>(() => {
+    const modes = selectedEntry?.modes ?? [];
+    return [
+      { id: "", label: "Provider default" },
+      ...modes.map((mode) => ({ id: mode.id, label: mode.label, description: mode.description })),
+    ];
+  }, [selectedEntry]);
+
   const providerLabel =
     providerOptions.find((option) => option.id === draft.provider)?.label ||
     draft.provider ||
@@ -205,15 +217,20 @@ function TeamAgentEditorSheet({
   const thinkingLabel =
     thinkingOptions.find((option) => option.id === draft.thinkingOptionId)?.label ??
     draft.thinkingOptionId;
+  const approvalPolicyLabel =
+    modeOptions.find((option) => option.id === draft.approvalPolicy)?.label ?? draft.approvalPolicy;
 
   const handleSelectProvider = useCallback((id: string) => {
-    setDraft((prev) => ({ ...prev, provider: id, model: "", thinkingOptionId: "" }));
+    setDraft((prev) => ({ ...prev, provider: id, model: "", thinkingOptionId: "", approvalPolicy: "" }));
   }, []);
   const handleSelectModel = useCallback((id: string) => {
     setDraft((prev) => ({ ...prev, model: id, thinkingOptionId: "" }));
   }, []);
   const handleSelectThinking = useCallback((id: string) => {
     setDraft((prev) => ({ ...prev, thinkingOptionId: id }));
+  }, []);
+  const handleSelectApprovalPolicy = useCallback((id: string) => {
+    setDraft((prev) => ({ ...prev, approvalPolicy: id }));
   }, []);
   const handleSetName = useCallback((name: string) => setDraft((prev) => ({ ...prev, name })), []);
   const handleSetRole = useCallback((role: string) => setDraft((prev) => ({ ...prev, role })), []);
@@ -286,6 +303,15 @@ function TeamAgentEditorSheet({
           onSelect={handleSelectThinking}
           searchable={false}
           testID="team-agent-thinking-trigger"
+        />
+        <SelectField
+          label="Execution mode"
+          triggerLabel={approvalPolicyLabel || "Provider default"}
+          options={modeOptions}
+          value={draft.approvalPolicy}
+          onSelect={handleSelectApprovalPolicy}
+          searchable={false}
+          testID="team-agent-approval-policy-trigger"
         />
         <FormField label="System prompt">
           <TextInput
@@ -418,7 +444,14 @@ export function TeamAgentsSection({ serverId }: { serverId: string }) {
                   {agent.name}
                 </Text>
                 <Text style={styles.agentMeta} numberOfLines={1}>
-                  {[agent.role, agent.provider, agent.model].filter(Boolean).join(" · ")}
+                  {[
+                    agent.role,
+                    agent.provider,
+                    agent.model,
+                    agent.approvalPolicy,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </Text>
               </View>
               <Switch

@@ -76,6 +76,30 @@ describe("loadAppSettingsFromStorage", () => {
     expect(result.terminalScrollbackLines).toBe(1_000_000);
   });
 
+  it("loads configured default agent mode from app settings", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ defaultAgentMode: "bypass" }),
+      }),
+    });
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.defaultAgentMode).toBe("bypass");
+  });
+
+  it("ignores invalid default agent mode values from storage", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ defaultAgentMode: "unknown" }),
+      }),
+    });
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.defaultAgentMode).toBe(DEFAULT_CLIENT_SETTINGS.defaultAgentMode);
+  });
+
   it("migrates the legacy theme key into the new settings object", async () => {
     const deps = makeDeps({
       storage: createInMemoryKeyValueStorage({

@@ -35,6 +35,7 @@ import {
   type ReleaseChannel,
   type SendBehavior,
   type ServiceUrlBehavior,
+  type GlobalAgentModePreference,
   type Settings,
   type SettingsDeps,
 } from "./storage";
@@ -63,6 +64,7 @@ export type {
   ReleaseChannel,
   SendBehavior,
   ServiceUrlBehavior,
+  GlobalAgentModePreference,
   Settings,
   SettingsDeps,
 };

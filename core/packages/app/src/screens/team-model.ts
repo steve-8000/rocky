@@ -48,12 +48,13 @@ export function buildLeaderBriefing(goal: string, roster: readonly TeamAgent[] =
       ? [
           "",
           "Registered team agents — prefer these presets when spawning Teammates",
-          "(pass their provider/model/thinking and include their system prompt in the briefing):",
+          "(pass their provider/model/thinking/approval policy and include their system prompt in the briefing):",
           ...enabledRoster.map((agent) => {
             const spec = [
               `provider=${agent.provider}`,
               agent.model ? `model=${agent.model}` : null,
               agent.thinkingOptionId ? `thinking=${agent.thinkingOptionId}` : null,
+              agent.approvalPolicy ? `approvalPolicy=${agent.approvalPolicy}` : null,
             ]
               .filter(Boolean)
               .join(", ");

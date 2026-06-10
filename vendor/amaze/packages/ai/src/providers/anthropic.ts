@@ -2001,7 +2001,17 @@ function buildParams(
 				}
 			}
 		} else if (options?.thinkingEnabled === false) {
-			params.thinking = { type: "disabled" };
+			// Adaptive-thinking models (Claude 4.6+: Opus 4.7+, Fable, Mythos) have no
+			// "disabled" thinking mode — they reject `thinking: { type: "disabled" }`
+			// with a 400 invalid_request_error and default to adaptive when the field is
+			// omitted. Only budget-based models accept an explicit disable. Sending
+			// disabled to an adaptive model breaks every request (incl. title generation
+			// and tool turns), so omit the field for adaptive models instead.
+			const mode = model.thinking?.mode;
+			const compat = getAnthropicCompat(model);
+			if (!(mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking)) {
+				params.thinking = { type: "disabled" };
+			}
 		}
 	}
 

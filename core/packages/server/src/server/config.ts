@@ -323,6 +323,7 @@ function resolveTeamAgents(
   return (persisted.daemon?.teamAgents ?? []).map((agent) => ({
     ...agent,
     role: agent.role ?? "",
+    approvalPolicy: agent.approvalPolicy?.trim() || undefined,
     enabled: agent.enabled ?? true,
   }));
 }

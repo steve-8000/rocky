@@ -1131,6 +1131,27 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.thinking).toEqual({ type: "disabled" });
 	});
 
+	it("omits thinking for adaptive models when thinking is explicitly disabled", async () => {
+		// Adaptive-thinking models (Fable/Mythos, Opus 4.7+) reject `thinking: { type: "disabled" }`
+		// with a 400 invalid_request_error. The disable path must omit the field so the API
+		// falls back to adaptive thinking instead of failing the whole request.
+		const payload = (await captureAnthropicPayload(
+			{
+				...ANTHROPIC_MODEL,
+				id: "claude-fable-5",
+				name: "Claude Fable 5",
+				thinking: { mode: "anthropic-adaptive", minLevel: Effort.Low, maxLevel: Effort.XHigh },
+			},
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: false },
+		)) as { thinking?: { type?: string } };
+
+		expect(payload.thinking).toBeUndefined();
+	});
+
 	it("drops temperature and sampling params for Opus 4.7 without enabled thinking", async () => {
 		const payload = (await captureAnthropicPayload(
 			{ ...ANTHROPIC_MODEL, id: "claude-opus-4-7", name: "Claude Opus 4.7" },

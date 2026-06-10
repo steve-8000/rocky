@@ -53,6 +53,7 @@ import {
   type AppSettings,
   type SendBehavior,
   type ServiceUrlBehavior,
+  type GlobalAgentModePreference,
   type Settings as EffectiveSettings,
 } from "@/hooks/use-settings";
 import {
@@ -214,6 +215,13 @@ const SERVICE_URL_BEHAVIOR_LABELS: Record<ServiceUrlBehavior, string> = {
 
 const SERVICE_URL_BEHAVIOR_VALUES: ServiceUrlBehavior[] = ["ask", "in-app", "external"];
 
+const DEFAULT_AGENT_MODE_OPTIONS = [
+  { value: "provider-default" as const, label: "Provider default" },
+  { value: "ask" as const, label: "Ask" },
+  { value: "default" as const, label: "Default" },
+  { value: "bypass" as const, label: "Bypass" },
+];
+
 // ---------------------------------------------------------------------------
 // Section components
 // ---------------------------------------------------------------------------
@@ -223,6 +231,7 @@ interface GeneralSectionProps {
   isDesktopApp: boolean;
   handleSendBehaviorChange: (behavior: SendBehavior) => void;
   handleServiceUrlBehaviorChange: (behavior: ServiceUrlBehavior) => void;
+  handleDefaultAgentModeChange: (mode: GlobalAgentModePreference) => void;
   handleTerminalScrollbackLinesChange: (lines: number) => void;
 }
 
@@ -252,6 +261,7 @@ function GeneralSection({
   isDesktopApp,
   handleSendBehaviorChange,
   handleServiceUrlBehaviorChange,
+  handleDefaultAgentModeChange,
   handleTerminalScrollbackLinesChange,
 }: GeneralSectionProps) {
   const { theme } = useUnistyles();
@@ -296,6 +306,20 @@ function GeneralSection({
             value={settings.sendBehavior}
             onValueChange={handleSendBehaviorChange}
             options={SEND_BEHAVIOR_OPTIONS}
+          />
+        </View>
+        <View style={ROW_WITH_BORDER_STYLE}>
+          <View style={settingsStyles.rowContent}>
+            <Text style={settingsStyles.rowTitle}>Default permission mode</Text>
+            <Text style={settingsStyles.rowHint}>
+              Applied globally when starting new agents, when the provider supports it
+            </Text>
+          </View>
+          <SegmentedControl
+            size="sm"
+            value={settings.defaultAgentMode}
+            onValueChange={handleDefaultAgentModeChange}
+            options={DEFAULT_AGENT_MODE_OPTIONS}
           />
         </View>
         {isDesktopApp ? (
@@ -1152,6 +1176,13 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
     [updateSettings],
   );
 
+  const handleDefaultAgentModeChange = useCallback(
+    (defaultAgentMode: GlobalAgentModePreference) => {
+      void updateSettings({ defaultAgentMode });
+    },
+    [updateSettings],
+  );
+
   const handleTerminalScrollbackLinesChange = useCallback(
     (terminalScrollbackLines: number) => {
       void updateSettings({ terminalScrollbackLines });
@@ -1358,6 +1389,7 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
               isDesktopApp={isDesktopApp}
               handleSendBehaviorChange={handleSendBehaviorChange}
               handleServiceUrlBehaviorChange={handleServiceUrlBehaviorChange}
+              handleDefaultAgentModeChange={handleDefaultAgentModeChange}
               handleTerminalScrollbackLinesChange={handleTerminalScrollbackLinesChange}
             />
           );

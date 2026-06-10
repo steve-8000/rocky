@@ -935,6 +935,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
           features: parsedArgs.settings?.features,
           labels: parsedArgs.labels,
           mode: parsedArgs.settings?.modeId,
+          approvalPolicy: parsedArgs.settings?.modeId === "never" ? "never" : undefined,
           background: requestedBackground,
           notifyOnFinish,
           detached,

@@ -117,7 +117,7 @@ const MutableMetadataGenerationConfigSchema = z
   .passthrough();
 
 // A registered team agent: a reusable named preset (role, provider, model,
-// system prompt) managed in Settings -> Agents and used by Team missions.
+// system prompt, and optional execution policy) managed in Settings -> Agents and used by Team missions.
 export const TeamAgentSchema = z
   .object({
     id: z.string().min(1),
@@ -126,6 +126,7 @@ export const TeamAgentSchema = z
     provider: z.string().min(1),
     model: z.string().optional(),
     thinkingOptionId: z.string().optional(),
+    approvalPolicy: z.string().optional(),
     systemPrompt: z.string().optional(),
     enabled: z.boolean().default(true),
   })

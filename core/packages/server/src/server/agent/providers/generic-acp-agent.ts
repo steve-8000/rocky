@@ -1,7 +1,13 @@
 import { homedir } from "node:os";
 import type { Logger } from "pino";
 
-import type { AgentProvider } from "../agent-sdk-types.js";
+import type {
+  AgentMode,
+  AgentProvider,
+  ResolveAgentCreateConfigInput,
+  ResolveAgentCreateConfigResult,
+} from "../agent-sdk-types.js";
+import { resolveDefaultAgentCreateConfig } from "../create-agent-mode.js";
 import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
 import {
   ACPAgentClient,
@@ -19,6 +25,36 @@ import {
 
 const ACP_DIAGNOSTIC_INITIALIZE_TIMEOUT_MS = 8_000;
 const ACP_DIAGNOSTIC_SESSION_TIMEOUT_MS = 8_000;
+
+const ROCKY_AUTONOMOUS_APPROVAL_MODES = new Set([
+  "never",
+  "bypass",
+  "bypassPermissions",
+  "full-access",
+  "allow-all",
+]);
+
+// Canonical id Rocky advertises for autonomous approval on generic ACP agents.
+// Most ACP agents (e.g. Amaze) only expose default/plan over the wire; Rocky
+// handles bypass itself (providerModeWriter + autonomous permission grants), so
+// we surface it as a selectable mode for the UI's global permission preference.
+const ROCKY_BYPASS_MODE: AgentMode = {
+  id: "bypass",
+  label: "Bypass",
+  description: "Auto-approve all permission requests (handled by Rocky, not the agent)",
+  isUnattended: true,
+};
+
+function isRockyAutonomousApprovalPolicy(value: string | null | undefined): boolean {
+  return typeof value === "string" && ROCKY_AUTONOMOUS_APPROVAL_MODES.has(value);
+}
+
+function appendRockyBypassMode(modes: AgentMode[]): AgentMode[] {
+  if (modes.some((mode) => ROCKY_AUTONOMOUS_APPROVAL_MODES.has(mode.id))) {
+    return modes;
+  }
+  return [...modes, ROCKY_BYPASS_MODE];
+}
 
 interface GenericACPAgentClientOptions {
   logger: Logger;
@@ -45,11 +81,33 @@ export class GenericACPAgentClient extends ACPAgentClient {
       defaultCommand: options.command,
       waitForInitialCommands: options.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: options.initialCommandsWaitTimeoutMs,
+      modesTransformer: appendRockyBypassMode,
+      providerModeWriter: async (context) => {
+        if (!isRockyAutonomousApprovalPolicy(context.requestedModeId)) {
+          return { handled: false };
+        }
+        // Don't forward to the agent (it doesn't know this mode); report the
+        // requested mode as current so clients see bypass as active.
+        return { handled: true };
+      },
+      isAutonomousPermissionMode: isRockyAutonomousApprovalPolicy,
     });
 
     this.command = options.command;
     this.providerId = options.providerId;
     this.label = options.label;
+  }
+
+  // Rocky autonomous-approval aliases ("never", "bypassPermissions", ...) all
+  // collapse to the advertised "bypass" mode so create-time validation accepts
+  // them regardless of which alias the caller (MCP, team roster, CLI) used.
+  resolveCreateConfig(input: ResolveAgentCreateConfigInput): ResolveAgentCreateConfigResult {
+    const requestedMode =
+      isRockyAutonomousApprovalPolicy(input.requestedMode) &&
+      !input.availableModes?.some((mode) => mode.id === input.requestedMode)
+        ? ROCKY_BYPASS_MODE.id
+        : input.requestedMode;
+    return resolveDefaultAgentCreateConfig({ ...input, requestedMode });
   }
 
   protected override async resolveLaunchCommand(): Promise<{ command: string; args: string[] }> {

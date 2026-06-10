@@ -138,9 +138,15 @@ function RosterRow({ preset }: { preset: TeamAgent }) {
           {preset.name}
         </Text>
         <Text style={styles.agentMeta} numberOfLines={1}>
-          {[preset.role, preset.provider, preset.model, disabled ? "disabled" : null]
+          {[
+            preset.role,
+            preset.provider,
+            preset.model,
+            preset.approvalPolicy,
+            disabled ? "disabled" : null,
+          ]
             .filter(Boolean)
-            .join(" \u00b7 ")}
+            .join(" · ")}
         </Text>
       </View>
     </View>

@@ -1370,6 +1370,241 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
   });
 });
 
+test("resumeAgentFromPersistence refreshes a stale injected rocky MCP token", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-rocky-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+
+  class ResumeCaptureClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    lastResumeOverrides: Partial<AgentSessionConfig> | undefined;
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async listModels() {
+      return [{ provider: "codex", id: "gpt-5.4", label: "GPT-5.4", isDefault: true }];
+    }
+
+    async resumeSession(
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      this.lastResumeOverrides = overrides;
+      const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+      const merged: AgentSessionConfig = {
+        ...metadata,
+        ...overrides,
+        provider: "codex",
+        cwd: overrides?.cwd ?? metadata.cwd ?? process.cwd(),
+      };
+      return new TestAgentSession(merged);
+    }
+  }
+
+  const client = new ResumeCaptureClient();
+  const agentId = "00000000-0000-4000-8000-000000000201";
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:7767/mcp/agents?rockyToken=fresh-token",
+    idFactory: () => agentId,
+  });
+
+  const handle: AgentPersistenceHandle = {
+    provider: "codex",
+    sessionId: "resume-rocky-1",
+    metadata: {
+      provider: "codex",
+      cwd: workdir,
+      mcpServers: {
+        rocky: {
+          type: "http",
+          url: `http://127.0.0.1:7767/mcp/agents?rockyToken=stale-token&callerAgentId=${agentId}`,
+        },
+        custom: {
+          type: "stdio",
+          command: "custom-mcp",
+        },
+      },
+    },
+  };
+
+  const resumed = await manager.resumeAgentFromPersistence(handle);
+
+  const expectedUrl = `http://127.0.0.1:7767/mcp/agents?rockyToken=fresh-token&callerAgentId=${agentId}`;
+  expect(client.lastResumeOverrides?.mcpServers).toEqual({
+    rocky: { type: "http", url: expectedUrl },
+    custom: { type: "stdio", command: "custom-mcp" },
+  });
+  expect(resumed.config.mcpServers).toEqual({
+    rocky: { type: "http", url: expectedUrl },
+    custom: { type: "stdio", command: "custom-mcp" },
+  });
+  expect(JSON.stringify(resumed.config)).not.toContain("stale-token");
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test("resumeAgentFromPersistence drops a stale injected rocky entry when injection is disabled", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-rocky-off-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+
+  class ResumeCaptureClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    lastResumeOverrides: Partial<AgentSessionConfig> | undefined;
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async listModels() {
+      return [{ provider: "codex", id: "gpt-5.4", label: "GPT-5.4", isDefault: true }];
+    }
+
+    async resumeSession(
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      this.lastResumeOverrides = overrides;
+      const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+      const merged: AgentSessionConfig = {
+        ...metadata,
+        ...overrides,
+        provider: "codex",
+        cwd: overrides?.cwd ?? metadata.cwd ?? process.cwd(),
+      };
+      return new TestAgentSession(merged);
+    }
+  }
+
+  const client = new ResumeCaptureClient();
+  const agentId = "00000000-0000-4000-8000-000000000202";
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: null,
+    idFactory: () => agentId,
+  });
+
+  const handle: AgentPersistenceHandle = {
+    provider: "codex",
+    sessionId: "resume-rocky-2",
+    metadata: {
+      provider: "codex",
+      cwd: workdir,
+      mcpServers: {
+        rocky: {
+          type: "http",
+          url: `http://127.0.0.1:7767/mcp/agents?rockyToken=stale-token&callerAgentId=${agentId}`,
+        },
+        custom: {
+          type: "stdio",
+          command: "custom-mcp",
+        },
+      },
+    },
+  };
+
+  const resumed = await manager.resumeAgentFromPersistence(handle);
+
+  expect(resumed.config.mcpServers).toEqual({
+    custom: { type: "stdio", command: "custom-mcp" },
+  });
+  expect(resumed.config.mcpServers?.rocky).toBeUndefined();
+  expect(client.lastResumeOverrides?.mcpServers).toEqual({
+    custom: { type: "stdio", command: "custom-mcp" },
+  });
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test("resumeAgentFromPersistence preserves a user-provided rocky MCP config", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-rocky-user-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+
+  class ResumeCaptureClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    lastResumeOverrides: Partial<AgentSessionConfig> | undefined;
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TestAgentSession(config);
+    }
+
+    async listModels() {
+      return [{ provider: "codex", id: "gpt-5.4", label: "GPT-5.4", isDefault: true }];
+    }
+
+    async resumeSession(
+      handle: AgentPersistenceHandle,
+      overrides?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      this.lastResumeOverrides = overrides;
+      const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+      const merged: AgentSessionConfig = {
+        ...metadata,
+        ...overrides,
+        provider: "codex",
+        cwd: overrides?.cwd ?? metadata.cwd ?? process.cwd(),
+      };
+      return new TestAgentSession(merged);
+    }
+  }
+
+  const client = new ResumeCaptureClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:7767/mcp/agents?rockyToken=fresh-token",
+    idFactory: () => "00000000-0000-4000-8000-000000000203",
+  });
+
+  const handle: AgentPersistenceHandle = {
+    provider: "codex",
+    sessionId: "resume-rocky-3",
+    metadata: {
+      provider: "codex",
+      cwd: workdir,
+      mcpServers: {
+        rocky: {
+          type: "http",
+          url: "https://example.com/custom-rocky",
+        },
+      },
+    },
+  };
+
+  const resumed = await manager.resumeAgentFromPersistence(handle);
+
+  expect(resumed.config.mcpServers).toEqual({
+    rocky: { type: "http", url: "https://example.com/custom-rocky" },
+  });
+  expect(client.lastResumeOverrides?.mcpServers).toBeUndefined();
+
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("findPersistedAgent returns matching descriptors by session id or native handle", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-find-persisted-"));
   const storagePath = join(workdir, "agents");

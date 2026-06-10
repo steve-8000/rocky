@@ -339,6 +339,48 @@ describe("resolveFormState", () => {
     expect(resolved.thinkingOptionId).toBe("");
   });
 
+  it("uses the global ask permission mode when the provider supports it", () => {
+    const resolved = resolveFormState(
+      undefined,
+      { provider: "claude", providerPreferences: { claude: { mode: "bypassPermissions" } } },
+      null,
+      INITIAL_USER_MODIFIED,
+      makeState({ provider: "claude" }).form,
+      claudeProviderMap,
+      "ask",
+    );
+
+    expect(resolved.modeId).toBe("default");
+  });
+
+  it("uses the global bypass permission mode when the provider supports it", () => {
+    const resolved = resolveFormState(
+      undefined,
+      { provider: "codex", providerPreferences: { codex: { mode: "auto" } } },
+      null,
+      INITIAL_USER_MODIFIED,
+      makeState({ provider: "codex" }).form,
+      codexProviderMap,
+      "bypass",
+    );
+
+    expect(resolved.modeId).toBe("full-access");
+  });
+
+  it("falls back to provider preferences when the global permission mode is unsupported", () => {
+    const resolved = resolveFormState(
+      undefined,
+      { provider: "codex", providerPreferences: { codex: { mode: "full-access" } } },
+      null,
+      INITIAL_USER_MODIFIED,
+      makeState({ provider: "codex" }).form,
+      codexProviderMap,
+      "ask",
+    );
+
+    expect(resolved.modeId).toBe("full-access");
+  });
+
   it("does not auto-select a model on fresh drafts without preferences", () => {
     const resolved = resolveFormState(
       undefined,

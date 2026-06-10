@@ -277,6 +277,7 @@ interface ACPAgentClientOptions {
   defaultCommand: [string, ...string[]];
   defaultModes?: AgentMode[];
   modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
+  modesTransformer?: (modes: AgentMode[]) => AgentMode[];
   sessionResponseTransformer?: (response: SessionStateResponse) => SessionStateResponse;
   configOptionsTransformer?: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
   modeIdTransformer?: (modeId: string) => string | null;
@@ -290,6 +291,7 @@ interface ACPAgentClientOptions {
     sessionId: string,
     thinkingOptionId: string,
   ) => Promise<void>;
+  isAutonomousPermissionMode?: (modeId: string | null | undefined) => boolean;
   capabilities?: AgentCapabilityFlags;
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
@@ -302,6 +304,7 @@ interface ACPAgentSessionOptions {
   defaultCommand: [string, ...string[]];
   defaultModes: AgentMode[];
   modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
+  modesTransformer?: (modes: AgentMode[]) => AgentMode[];
   sessionResponseTransformer?: (response: SessionStateResponse) => SessionStateResponse;
   configOptionsTransformer?: (configOptions: SessionConfigOption[]) => SessionConfigOption[];
   modeIdTransformer?: (modeId: string) => string | null;
@@ -315,6 +318,7 @@ interface ACPAgentSessionOptions {
     sessionId: string,
     thinkingOptionId: string,
   ) => Promise<void>;
+  isAutonomousPermissionMode?: (modeId: string | null | undefined) => boolean;
   capabilities: AgentCapabilityFlags;
   handle?: AgentPersistenceHandle;
   agentId?: string;
@@ -547,6 +551,7 @@ export class ACPAgentClient implements AgentClient {
   protected readonly defaultCommand: [string, ...string[]];
   protected readonly defaultModes: AgentMode[];
   private readonly modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
+  private readonly modesTransformer?: (modes: AgentMode[]) => AgentMode[];
   private readonly sessionResponseTransformer?: (
     response: SessionStateResponse,
   ) => SessionStateResponse;
@@ -566,6 +571,7 @@ export class ACPAgentClient implements AgentClient {
     sessionId: string,
     thinkingOptionId: string,
   ) => Promise<void>;
+  private readonly isAutonomousPermissionMode?: (modeId: string | null | undefined) => boolean;
   private readonly waitForInitialCommands: boolean;
   private readonly initialCommandsWaitTimeoutMs: number;
 
@@ -580,6 +586,7 @@ export class ACPAgentClient implements AgentClient {
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes ?? [];
     this.modelTransformer = options.modelTransformer;
+    this.modesTransformer = options.modesTransformer;
     this.sessionResponseTransformer = options.sessionResponseTransformer;
     this.configOptionsTransformer = options.configOptionsTransformer;
     this.modeIdTransformer = options.modeIdTransformer;
@@ -587,6 +594,7 @@ export class ACPAgentClient implements AgentClient {
     this.providerModeWriter = options.providerModeWriter;
     this.beforeModeWriter = options.beforeModeWriter;
     this.thinkingOptionWriter = options.thinkingOptionWriter;
+    this.isAutonomousPermissionMode = options.isAutonomousPermissionMode;
     this.waitForInitialCommands = options.waitForInitialCommands ?? false;
     this.initialCommandsWaitTimeoutMs = options.initialCommandsWaitTimeoutMs ?? 1500;
   }
@@ -605,6 +613,7 @@ export class ACPAgentClient implements AgentClient {
         defaultCommand: this.defaultCommand,
         defaultModes: this.defaultModes,
         modelTransformer: this.modelTransformer,
+        modesTransformer: this.modesTransformer,
         sessionResponseTransformer: this.sessionResponseTransformer,
         configOptionsTransformer: this.configOptionsTransformer,
         modeIdTransformer: this.modeIdTransformer,
@@ -612,6 +621,7 @@ export class ACPAgentClient implements AgentClient {
         providerModeWriter: this.providerModeWriter,
         beforeModeWriter: this.beforeModeWriter,
         thinkingOptionWriter: this.thinkingOptionWriter,
+        isAutonomousPermissionMode: this.isAutonomousPermissionMode,
         capabilities: this.capabilities,
         agentId: launchContext?.agentId,
         launchEnv: launchContext?.env,
@@ -651,6 +661,7 @@ export class ACPAgentClient implements AgentClient {
       defaultCommand: this.defaultCommand,
       defaultModes: this.defaultModes,
       modelTransformer: this.modelTransformer,
+      modesTransformer: this.modesTransformer,
       sessionResponseTransformer: this.sessionResponseTransformer,
       configOptionsTransformer: this.configOptionsTransformer,
       modeIdTransformer: this.modeIdTransformer,
@@ -658,6 +669,7 @@ export class ACPAgentClient implements AgentClient {
       providerModeWriter: this.providerModeWriter,
       beforeModeWriter: this.beforeModeWriter,
       thinkingOptionWriter: this.thinkingOptionWriter,
+      isAutonomousPermissionMode: this.isAutonomousPermissionMode,
       capabilities: this.capabilities,
       handle,
       agentId: launchContext?.agentId,
@@ -703,7 +715,7 @@ export class ACPAgentClient implements AgentClient {
         transformed.modes,
         transformed.configOptions,
       );
-      return modeInfo.modes;
+      return this.modesTransformer ? this.modesTransformer(modeInfo.modes) : modeInfo.modes;
     } finally {
       await this.closeProbe(probe);
     }
@@ -905,6 +917,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly defaultCommand: [string, ...string[]];
   private readonly defaultModes: AgentMode[];
   protected readonly modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
+  private readonly modesTransformer?: (modes: AgentMode[]) => AgentMode[];
   private readonly sessionResponseTransformer?: (
     response: SessionStateResponse,
   ) => SessionStateResponse;
@@ -924,6 +937,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     sessionId: string,
     thinkingOptionId: string,
   ) => Promise<void>;
+  private readonly isAutonomousPermissionMode?: (modeId: string | null | undefined) => boolean;
   private readonly agentId?: string;
   private readonly launchEnv?: Record<string, string>;
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
@@ -959,6 +973,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
+  private autonomousPermissionsEnabled = false;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
     this.provider = options.provider;
@@ -968,6 +983,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes;
     this.modelTransformer = options.modelTransformer;
+    this.modesTransformer = options.modesTransformer;
     this.sessionResponseTransformer = options.sessionResponseTransformer;
     this.configOptionsTransformer = options.configOptionsTransformer;
     this.modeIdTransformer = options.modeIdTransformer;
@@ -975,12 +991,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.providerModeWriter = options.providerModeWriter;
     this.beforeModeWriter = options.beforeModeWriter;
     this.thinkingOptionWriter = options.thinkingOptionWriter;
+    this.isAutonomousPermissionMode = options.isAutonomousPermissionMode;
     this.availableModes = options.defaultModes;
     this.agentId = options.agentId;
     this.launchEnv = options.launchEnv;
     this.initialHandle = options.handle;
     this.config = { ...config, provider: options.provider };
     this.currentMode = config.modeId ?? null;
+    this.autonomousPermissionsEnabled = this.resolveAutonomousPermissionsEnabled(config.modeId);
     this.currentModel = config.model ?? null;
     this.thinkingOptionId = config.thinkingOptionId ?? null;
     this.currentTitle = config.title ?? null;
@@ -1216,6 +1234,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     await this.setModeWithSelection({ modeId, selection });
   }
 
+  private resolveAutonomousPermissionsEnabled(modeId: string | null | undefined): boolean {
+    return this.isAutonomousPermissionMode?.(modeId) ?? false;
+  }
+
   // Mode/model selection updates stay after ACP RPC success; this intentionally diverges from Zed's optimistic rollback path (acp.rs:3080-3104).
   private async setModeWithSelection({
     modeId,
@@ -1234,10 +1256,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       : { handled: false };
     if (providerResult.handled) {
       this.currentMode = providerResult.currentModeId ?? modeId;
+      this.autonomousPermissionsEnabled = this.resolveAutonomousPermissionsEnabled(modeId);
       if (providerResult.configOptions) {
         this.configOptions = this.transformConfigOptions(providerResult.configOptions);
+        this.availableModes = this.transformModes(
+          deriveModesFromACP(this.defaultModes, null, this.configOptions).modes,
+        );
       }
-      this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1285,6 +1310,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (selection.hasAvailableModes) {
       await this.connection.setSessionMode({ sessionId: this.sessionId, modeId });
       this.currentMode = modeId;
+      this.autonomousPermissionsEnabled = this.resolveAutonomousPermissionsEnabled(modeId);
       this.pushEvent({
         type: "mode_changed",
         provider: this.provider,
@@ -1311,7 +1337,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       requestedValue: modeId,
       label: "mode",
     });
-    this.availableModes = deriveModesFromACP(this.defaultModes, null, this.configOptions).modes;
+    this.autonomousPermissionsEnabled = this.resolveAutonomousPermissionsEnabled(modeId);
+    this.availableModes = this.transformModes(
+      deriveModesFromACP(this.defaultModes, null, this.configOptions).modes,
+    );
     this.pushEvent({
       type: "mode_changed",
       provider: this.provider,
@@ -1620,7 +1649,6 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    // Match Zed acp.rs:3189-3220: generic ACP permission requests stay pure pass-through.
     const requestId = randomUUID();
     let toolSnapshot =
       this.toolCalls.get(params.toolCall.toolCallId) ??
@@ -1629,6 +1657,25 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       toolSnapshot = this.toolSnapshotTransformer(toolSnapshot);
     }
     const request = mapPermissionRequest(this.provider, requestId, params, toolSnapshot);
+
+    if (this.autonomousPermissionsEnabled) {
+      const selectedOption = selectPermissionOption(params.options, { behavior: "allow" });
+      this.pushEvent({
+        type: "permission_resolved",
+        provider: this.provider,
+        requestId,
+        resolution: selectedOption ? { behavior: "allow" } : { behavior: "deny", interrupt: true },
+        turnId: this.activeForegroundTurnId ?? undefined,
+      });
+      return selectedOption
+        ? {
+            outcome: {
+              outcome: "selected",
+              optionId: selectedOption.optionId,
+            },
+          }
+        : { outcome: { outcome: "cancelled" } };
+    }
 
     const promise = new Promise<RequestPermissionResponse>((resolve, reject) => {
       this.pendingPermissions.set(requestId, {
@@ -1870,7 +1917,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.configOptions = this.transformConfigOptions(transformed.configOptions ?? []);
 
     const modeInfo = deriveModesFromACP(this.defaultModes, transformed.modes, this.configOptions);
-    this.availableModes = modeInfo.modes;
+    this.availableModes = this.transformModes(modeInfo.modes);
     this.currentMode = modeInfo.currentModeId ?? this.currentMode;
 
     this.availableModels = transformed.models?.availableModels ?? null;
@@ -1884,6 +1931,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     return this.configOptionsTransformer
       ? this.configOptionsTransformer(configOptions)
       : configOptions;
+  }
+
+  private transformModes(modes: AgentMode[]): AgentMode[] {
+    return this.modesTransformer ? this.modesTransformer(modes) : modes;
   }
 
   private transformModeId(modeId: string): string | null {
@@ -2050,7 +2101,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     const nextModel = deriveCurrentConfigValue(this.configOptions, "model");
     const nextThinkingOptionId = deriveCurrentConfigValue(this.configOptions, "thought_level");
 
-    this.availableModes = modeInfo.modes;
+    this.availableModes = this.transformModes(modeInfo.modes);
     this.currentMode = nextMode ?? this.currentMode;
     this.currentModel = nextModel ?? this.currentModel;
     this.thinkingOptionId = nextThinkingOptionId ?? this.thinkingOptionId;

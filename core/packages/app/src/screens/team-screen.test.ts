@@ -87,6 +87,7 @@ describe("buildLeaderBriefing roster", () => {
         provider: "amaze",
         model: "anthropic/claude-fable-5",
         thinkingOptionId: "high",
+        approvalPolicy: "never",
         systemPrompt: "Be strict.",
         enabled: true,
       },
@@ -99,7 +100,9 @@ describe("buildLeaderBriefing roster", () => {
       },
     ]);
     expect(briefing).toContain("Backend reviewer — Reviews server code");
-    expect(briefing).toContain("provider=amaze, model=anthropic/claude-fable-5, thinking=high");
+    expect(briefing).toContain(
+      "provider=amaze, model=anthropic/claude-fable-5, thinking=high, approvalPolicy=never",
+    );
     expect(briefing).toContain("system prompt: Be strict.");
     expect(briefing).not.toContain("Disabled one");
   });

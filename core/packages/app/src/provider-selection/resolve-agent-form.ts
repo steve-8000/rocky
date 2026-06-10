@@ -9,6 +9,7 @@ import {
   type FormPreferences,
   type ProviderPreferences,
 } from "@/hooks/use-form-preferences";
+import type { GlobalAgentModePreference } from "@/hooks/use-settings";
 
 export interface FormInitialValues {
   serverId?: string | null;
@@ -66,6 +67,7 @@ export type AgentFormAction =
       preferences: FormPreferences | null;
       availableModels: AgentModelDefinition[] | null;
       allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>;
+      defaultAgentMode?: GlobalAgentModePreference;
     }
   | { type: "SET_SERVER_ID"; value: string | null }
   | { type: "SET_SERVER_ID_FROM_USER"; value: string | null }
@@ -75,6 +77,7 @@ export type AgentFormAction =
       providerModels: AgentModelDefinition[] | null;
       providerDef: AgentProviderDefinition | undefined;
       providerPrefs: ProviderPrefs | undefined;
+      defaultAgentMode?: GlobalAgentModePreference;
     }
   | {
       type: "SET_PROVIDER_AND_MODEL_FROM_USER";
@@ -83,6 +86,7 @@ export type AgentFormAction =
       providerDef: AgentProviderDefinition | undefined;
       providerModels: AgentModelDefinition[] | null;
       providerPrefs?: ProviderPrefs | undefined;
+      defaultAgentMode?: GlobalAgentModePreference;
     }
   | { type: "SET_MODE_FROM_USER"; modeId: string }
   | {
@@ -254,9 +258,17 @@ function resolveModeId(input: {
   initialValues: FormInitialValues | undefined;
   providerDef: AgentProviderDefinition | undefined;
   providerPrefs: ProviderPrefs | undefined;
+  defaultAgentMode: GlobalAgentModePreference;
 }): string {
-  const { provider, userModified, currentModeId, initialValues, providerDef, providerPrefs } =
-    input;
+  const {
+    provider,
+    userModified,
+    currentModeId,
+    initialValues,
+    providerDef,
+    providerPrefs,
+    defaultAgentMode,
+  } = input;
   if (userModified) return currentModeId;
   if (!provider) return "";
   const validModeIds = providerDef?.modes.map((m) => m.id) ?? [];
@@ -266,6 +278,13 @@ function resolveModeId(input: {
     validModeIds.includes(initialValues.modeId)
   ) {
     return initialValues.modeId;
+  }
+  const globalDefaultMode = resolveGlobalAgentMode({
+    preference: defaultAgentMode,
+    providerDef,
+  });
+  if (globalDefaultMode) {
+    return globalDefaultMode;
   }
   if (providerPrefs?.mode && validModeIds.includes(providerPrefs.mode)) {
     return providerPrefs.mode;
@@ -330,6 +349,7 @@ export function resolveFormState(
   userModified: UserModifiedFields,
   currentState: FormState,
   allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>,
+  defaultAgentMode: GlobalAgentModePreference = "provider-default",
 ): FormState {
   const result = { ...currentState };
 
@@ -353,6 +373,7 @@ export function resolveFormState(
     initialValues,
     providerDef,
     providerPrefs,
+    defaultAgentMode,
   });
 
   result.model = resolveModelField({
@@ -406,12 +427,43 @@ function pickNextModelForProvider(input: {
   return defaultModelId;
 }
 
+function resolveGlobalAgentMode(input: {
+  preference: GlobalAgentModePreference;
+  providerDef: AgentProviderDefinition | undefined;
+}): string | null {
+  if (input.preference === "provider-default") {
+    return null;
+  }
+
+  const modes = input.providerDef?.modes ?? [];
+  const validModeIds = new Set(modes.map((mode) => mode.id));
+
+  if (input.preference === "default") {
+    const defaultModeId = input.providerDef?.defaultModeId;
+    return defaultModeId && validModeIds.has(defaultModeId) ? defaultModeId : null;
+  }
+
+  const candidates =
+    input.preference === "ask"
+      ? ["ask", "default"]
+      : ["bypass", "bypassPermissions", "full-access", "allow-all"];
+  return candidates.find((candidate) => validModeIds.has(candidate)) ?? null;
+}
+
 function pickNextModeForProvider(input: {
   providerDef: AgentProviderDefinition | undefined;
   providerPrefs: ProviderPrefs | undefined;
+  defaultAgentMode: GlobalAgentModePreference;
 }): string {
-  const { providerDef, providerPrefs } = input;
+  const { providerDef, providerPrefs, defaultAgentMode } = input;
   const validModeIds = providerDef?.modes.map((m) => m.id) ?? [];
+  const globalDefaultMode = resolveGlobalAgentMode({
+    preference: defaultAgentMode,
+    providerDef,
+  });
+  if (globalDefaultMode) {
+    return globalDefaultMode;
+  }
   if (providerPrefs?.mode && validModeIds.includes(providerPrefs.mode)) {
     return providerPrefs.mode;
   }
@@ -424,6 +476,7 @@ function pickNextModeForProviderAndModel(input: {
   provider: AgentProvider;
   providerDef: AgentProviderDefinition | undefined;
   providerPrefs: ProviderPrefs | undefined;
+  defaultAgentMode: GlobalAgentModePreference;
 }): string {
   const validModeIds = input.providerDef?.modes.map((m) => m.id) ?? [];
   if (
@@ -436,6 +489,7 @@ function pickNextModeForProviderAndModel(input: {
   return pickNextModeForProvider({
     providerDef: input.providerDef,
     providerPrefs: input.providerPrefs,
+    defaultAgentMode: input.defaultAgentMode,
   });
 }
 
@@ -455,6 +509,12 @@ function pickNextThinkingOptionForProvider(input: {
   });
 }
 
+function getActionDefaultAgentMode(action: AgentFormAction): GlobalAgentModePreference {
+  return "defaultAgentMode" in action
+    ? (action.defaultAgentMode ?? "provider-default")
+    : "provider-default";
+}
+
 export function resolveAgentForm(
   state: AgentFormReducerState,
   action: AgentFormAction,
@@ -468,6 +528,7 @@ export function resolveAgentForm(
         state.userModified,
         state.form,
         action.allowedProviderMap,
+        getActionDefaultAgentMode(action),
       );
       if (!hasFormStateChanged(state.form, resolved)) return state;
       return { ...state, form: resolved };
@@ -490,6 +551,7 @@ export function resolveAgentForm(
       const nextModeId = pickNextModeForProvider({
         providerDef: action.providerDef,
         providerPrefs: action.providerPrefs,
+        defaultAgentMode: getActionDefaultAgentMode(action),
       });
       const nextThinkingOptionId = pickNextThinkingOptionForProvider({
         providerModels: action.providerModels,
@@ -522,6 +584,7 @@ export function resolveAgentForm(
         provider: action.provider,
         providerDef: action.providerDef,
         providerPrefs: action.providerPrefs,
+        defaultAgentMode: getActionDefaultAgentMode(action),
       });
       return {
         form: {

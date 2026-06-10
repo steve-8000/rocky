@@ -13,6 +13,7 @@ import {
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
 import { useProvidersSnapshot } from "./use-providers-snapshot";
+import { useAppSettings } from "@/hooks/use-settings";
 import {
   useFormPreferences,
   mergeProviderPreferences,
@@ -169,6 +170,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
   } = options;
 
   const { preferences, isLoading: isPreferencesLoading, updatePreferences } = useFormPreferences();
+  const { settings: appSettings } = useAppSettings();
 
   const daemons = useHosts();
 
@@ -296,6 +298,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
       preferences: hydrationPreferences,
       availableModels,
       allowedProviderMap: snapshotResolvableProviderDefinitionMap,
+      defaultAgentMode: appSettings.defaultAgentMode,
     });
 
     hasResolvedRef.current = true;
@@ -307,6 +310,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
     preferences,
     availableModels,
     snapshotResolvableProviderDefinitionMap,
+    appSettings.defaultAgentMode,
   ]);
 
   const onlineServerIdsKey = onlineServerIds.join("|");
@@ -356,12 +360,14 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
         providerModels,
         providerDef,
         providerPrefs,
+        defaultAgentMode: appSettings.defaultAgentMode,
       });
       void updatePreferences({ provider });
     },
     [
       allProviderModels,
       preferences?.providerPreferences,
+      appSettings.defaultAgentMode,
       selectableProviderDefinitionMap,
       updatePreferences,
     ],
@@ -385,6 +391,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
         providerDef,
         providerModels,
         providerPrefs,
+        defaultAgentMode: appSettings.defaultAgentMode,
       });
       void updatePreferences((current) =>
         mergeSelectedComposerPreferences({
@@ -400,6 +407,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions = {}): UseAg
       allProviderModels,
       preferences?.providerPreferences,
       selectableProviderDefinitionMap,
+      appSettings.defaultAgentMode,
       updatePreferences,
     ],
   );
