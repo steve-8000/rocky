@@ -28,6 +28,18 @@
             "isDefault": true,
             "thinkingOptions": [
               {
+                "id": "off",
+                "label": "Off"
+              },
+              {
+                "id": "minimal",
+                "label": "Minimal"
+              },
+              {
+                "id": "low",
+                "label": "Low"
+              },
+              {
                 "id": "medium",
                 "label": "Medium",
                 "isDefault": true
@@ -35,6 +47,10 @@
               {
                 "id": "high",
                 "label": "High"
+              },
+              {
+                "id": "xhigh",
+                "label": "Extra high"
               }
             ]
           }

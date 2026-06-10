@@ -1,5 +1,5 @@
 import { router, usePathname } from "expo-router";
-import { FolderPlus, Home, MessagesSquare, Plus, Search, Settings, X } from "lucide-react-native";
+import { FolderPlus, Home, MessagesSquare, Plus, Search, Settings, Users, X } from "lucide-react-native";
 import {
   type Dispatch,
   memo,
@@ -68,6 +68,7 @@ import {
   buildHostOpenProjectRoute,
   buildHostNewWorkspaceRoute,
   buildHostSessionsRoute,
+  buildHostTeamRoute,
   buildSettingsRoute,
   mapPathnameToServer,
 } from "@/utils/host-routes";
@@ -120,12 +121,14 @@ interface MobileSidebarProps extends SidebarSharedProps {
   isOpen: boolean;
   closeToAgent: () => void;
   handleViewMoreNavigate: () => void;
+  handleViewTeamNavigate: () => void;
 }
 
 interface DesktopSidebarProps extends SidebarSharedProps {
   insetsTop: number;
   isOpen: boolean;
   handleViewMore: () => void;
+  handleViewTeam: () => void;
 }
 
 export const LeftSidebar = memo(function LeftSidebar({
@@ -256,6 +259,13 @@ export const LeftSidebar = memo(function LeftSidebar({
     router.push(buildHostSessionsRoute(activeServerId));
   }, [activeServerId]);
 
+  const handleViewTeamNavigate = useCallback(() => {
+    if (!activeServerId) {
+      return;
+    }
+    router.push(buildHostTeamRoute(activeServerId));
+  }, [activeServerId]);
+
   const handleHostSelect = useCallback(
     (nextServerId: string) => {
       if (!nextServerId) {
@@ -302,6 +312,7 @@ export const LeftSidebar = memo(function LeftSidebar({
         handleHome={handleHomeMobile}
         handleSettings={handleSettingsMobile}
         handleViewMoreNavigate={handleViewMoreNavigate}
+        handleViewTeamNavigate={handleViewTeamNavigate}
       />
     );
   }
@@ -315,6 +326,7 @@ export const LeftSidebar = memo(function LeftSidebar({
       handleHome={handleHomeDesktop}
       handleSettings={handleSettingsDesktop}
       handleViewMore={handleViewMoreNavigate}
+      handleViewTeam={handleViewTeamNavigate}
     />
   );
 });
@@ -562,9 +574,11 @@ function MobileSidebar({
   isOpen,
   closeToAgent,
   handleViewMoreNavigate,
+  handleViewTeamNavigate,
 }: MobileSidebarProps) {
   const pathname = usePathname();
   const isSessionsActive = pathname.includes("/sessions");
+  const isTeamActive = pathname.includes("/team");
   const {
     translateX,
     backdropOpacity,
@@ -597,6 +611,23 @@ function MobileSidebar({
     backdropOpacity,
     closeToAgent,
     handleViewMoreNavigate,
+    translateX,
+    windowWidth,
+  ]);
+
+  const handleViewTeam = useCallback(() => {
+    if (!activeServerId) {
+      return;
+    }
+    translateX.value = -windowWidth;
+    backdropOpacity.value = 0;
+    closeToAgent();
+    handleViewTeamNavigate();
+  }, [
+    activeServerId,
+    backdropOpacity,
+    closeToAgent,
+    handleViewTeamNavigate,
     translateX,
     windowWidth,
   ]);
@@ -744,6 +775,13 @@ function MobileSidebar({
                 isActive={isSessionsActive}
                 testID="sidebar-sessions"
               />
+              <SidebarHeaderRow
+                icon={Users}
+                label="Team"
+                onPress={handleViewTeam}
+                isActive={isTeamActive}
+                testID="sidebar-team"
+              />
             </View>
             <WorkspacesSectionHeader serverId={activeServerId} />
             <Pressable
@@ -832,9 +870,11 @@ function DesktopSidebar({
   insetsTop,
   isOpen,
   handleViewMore,
+  handleViewTeam,
 }: DesktopSidebarProps) {
   const pathname = usePathname();
   const isSessionsActive = pathname.includes("/sessions");
+  const isTeamActive = pathname.includes("/team");
   const padding = useWindowControlsPadding("sidebar");
   const sidebarWidth = usePanelStore((state) => state.sidebarWidth);
   const setSidebarWidth = usePanelStore((state) => state.setSidebarWidth);
@@ -910,6 +950,13 @@ function DesktopSidebar({
               onPress={handleViewMore}
               isActive={isSessionsActive}
               testID="sidebar-sessions"
+            />
+            <SidebarHeaderRow
+              icon={Users}
+              label="Team"
+              onPress={handleViewTeam}
+              isActive={isTeamActive}
+              testID="sidebar-team"
             />
           </View>
         </View>
