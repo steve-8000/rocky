@@ -781,3 +781,86 @@ async fn set_agent_thinking_missing_agent_is_rejected() {
     assert_eq!(out["message"]["payload"]["accepted"], false);
     assert!(!out["message"]["payload"]["error"].is_null());
 }
+
+#[tokio::test]
+async fn update_agent_sets_title_and_merges_labels() {
+    // update_agent edits metadata (name -> title, labels merged). It is a pure
+    // storage edit, so it must accept and be reflected in the fetched snapshot
+    // without any live provider involvement.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts));
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-update").await;
+    let env = envelope(json!({
+        "type": "update_agent_request",
+        "requestId": "ua",
+        "agentId": agent_id,
+        "name": "  Renamed Agent  ",
+        "labels": { "lane": "phase-1" },
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["type"], "update_agent_response");
+    assert_eq!(out["message"]["payload"]["accepted"], true);
+
+    let fetched = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "fetch_agent_request",
+            "requestId": "uf",
+            "agentId": agent_id,
+        })))
+        .await
+        .unwrap();
+    let agent = &fetched["message"]["payload"]["agent"];
+    assert_eq!(agent["title"], "Renamed Agent", "title trimmed and set");
+    assert_eq!(agent["labels"]["lane"], "phase-1", "label merged in");
+}
+
+#[tokio::test]
+async fn update_agent_without_name_or_labels_is_rejected() {
+    // Mirrors TS updateAgentCommand: nothing to update -> accepted:false.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts));
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-update-empty").await;
+    let out = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "update_agent_request",
+            "requestId": "ue",
+            "agentId": agent_id,
+            "name": "   ",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(out["message"]["payload"]["accepted"], false);
+    assert!(!out["message"]["payload"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn update_agent_missing_agent_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts));
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    let out = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "update_agent_request",
+            "requestId": "um",
+            "agentId": "does-not-exist",
+            "name": "X",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(out["message"]["payload"]["accepted"], false);
+    assert!(!out["message"]["payload"]["error"].is_null());
+}

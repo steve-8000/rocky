@@ -506,20 +506,23 @@ async fn list_provider_models_live_returns_claude_model() {
             .any(|m| m["id"].as_str().is_some_and(|s| s.contains("claude"))),
         "expected an anthropic/claude model id"
     );
-    // Live amaze advertises a `thought_level` selector (off/minimal/low/medium/
-    // high/xhigh); every model must carry it so the WebUI thinking picker works.
-    let thinking = models[0]["thinkingOptions"]
-        .as_array()
-        .expect("live model should carry thinkingOptions");
-    assert!(
-        thinking.len() > 1,
-        "expected multiple thinking options, got {}",
-        thinking.len()
-    );
-    assert!(
-        models[0].get("defaultThinkingOptionId").is_some(),
-        "expected a defaultThinkingOptionId"
-    );
+    // Live amaze advertises a `thought_level` selector and attaches it to every
+    // model (deriveModelDefinitionsFromACP). The set of options is the agent's
+    // decision (model-dependent; can be a single `off`), so assert the wiring —
+    // every model carries a `thinkingOptions` array — rather than a brittle
+    // count. When the agent offers any options, a `defaultThinkingOptionId` is
+    // attached.
+    for model in models {
+        let thinking = model["thinkingOptions"]
+            .as_array()
+            .expect("every live model should carry a thinkingOptions array");
+        if !thinking.is_empty() {
+            assert!(
+                model.get("defaultThinkingOptionId").is_some(),
+                "a model with thinking options must carry defaultThinkingOptionId"
+            );
+        }
+    }
 }
 
 #[tokio::test]

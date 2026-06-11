@@ -704,6 +704,42 @@ impl AgentManager {
         Ok(agent)
     }
 
+    /// Update an agent's metadata (title and/or labels). Pure storage edit —
+    /// needs no live provider session, so it works for hydrated agents too.
+    /// Mirrors TS `updateAgentMetadata`: a non-empty trimmed title replaces the
+    /// title; labels are merged (not replaced). At least one of the two must be
+    /// present (the ws handler enforces the "nothing to update" guard). Returns
+    /// the updated agent so the caller can broadcast an `agent_update`.
+    pub async fn update_agent_metadata(
+        &self,
+        id: &str,
+        title: Option<String>,
+        labels: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<ManagedAgent, AgentError> {
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            if let Some(title) = title {
+                let trimmed = title.trim();
+                if !trimmed.is_empty() {
+                    agent.title = Some(trimmed.to_string());
+                }
+            }
+            if let Some(labels) = labels {
+                for (k, v) in labels {
+                    agent.labels.insert(k, v);
+                }
+            }
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        Ok(agent)
+    }
+
     /// Update an agent's runtime info (provider/model/mode/session id).
     pub async fn update_runtime_info(
         &self,

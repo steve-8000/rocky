@@ -902,9 +902,32 @@ async fn handle_set_agent_feature(
 }
 
 async fn handle_update_agent(manager: &AgentManager, msg: Value) -> Result<Value, SessionRpcError> {
-    // update_agent_request edits agent metadata (name/labels) via the durable
-    // agent-storage layer, which is not wired into this slice.
-    Ok(config_mutation_response(manager, "update_agent_response", "update_agent_request", &msg).await)
+    // update_agent_request edits agent metadata (name/labels). This is a pure
+    // storage edit (no live provider session needed), mirroring TS
+    // `updateAgentCommand` -> `updateAgentMetadata`: a trimmed non-empty name
+    // sets the title, labels are merged, and at least one must be present.
+    let req_id = request_id(&msg);
+    let agent_id = opt_str(&msg, "agentId").unwrap_or_default();
+    let name = opt_str(&msg, "name");
+    let labels: Option<std::collections::HashMap<String, String>> = msg
+        .get("labels")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .filter(|m: &std::collections::HashMap<String, String>| !m.is_empty());
+    let has_title = name.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !has_title && labels.is_none() {
+        return Ok(action_response(
+            "update_agent_response",
+            &req_id,
+            &agent_id,
+            false,
+            Some("Nothing to update (provide name and/or labels)".to_string()),
+        ));
+    }
+    let result = manager
+        .update_agent_metadata(&agent_id, name, labels)
+        .await
+        .map(|_| ());
+    Ok(action_result("update_agent_response", &req_id, &agent_id, result))
 }
 
 async fn handle_refresh_agent(manager: &AgentManager, msg: Value) -> Result<Value, SessionRpcError> {
