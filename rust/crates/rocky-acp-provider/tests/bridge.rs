@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rocky_acp_provider::AcpProvider;
+use rocky_acp_provider::{AcpProvider, AmazeAcpProvider};
 use rocky_agent_domain::{AgentStreamEvent, AgentTimelineItem};
-use rocky_agents::{AgentManager, CreateAgentOptions, PromptInput};
+use rocky_agents::{AgentManager, AgentProvider, CreateAgentOptions, PromptInput};
 use tempfile::TempDir;
 
 const REPO_ROOT: &str = "/Users/steve/roy/rocky";
@@ -31,9 +31,16 @@ fn amaze_command() -> Vec<String> {
     ]
 }
 
+/// Serializes the live amaze ACP probes in this binary: each spawns a real
+/// `bun ... acp` subprocess and shares the per-process discovery cache + the
+/// daemon on :7767, so running them concurrently (e.g. `--ignored` runs both)
+/// races. Hold this guard for the duration of a probe so only one runs at once.
+static LIVE_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "spawns bun + amaze ACP agent; run with --ignored"]
 async fn amaze_bridge_creates_session_and_streams_events() {
+    let _g = LIVE_PROBE_LOCK.lock().await;
     let home = TempDir::new().unwrap();
     let manager = AgentManager::new(home.path());
     let provider = AcpProvider::new(
@@ -124,4 +131,62 @@ async fn amaze_bridge_creates_session_and_streams_events() {
     }
 
     manager.close(&agent.id).await.expect("close should succeed");
+}
+
+/// Live discovery probe: `AmazeAcpProvider::list_models` / `list_modes` spin up
+/// a short-lived ACP session, read the agent's advertised models/modes from the
+/// `session/new` result, and shut the child down. Asserts real amaze data and
+/// that the probe completes (no leaked/hung child).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns bun + amaze ACP agent; run with --ignored"]
+async fn amaze_provider_probes_models_and_modes() {
+    let _g = LIVE_PROBE_LOCK.lock().await;
+    let provider = AmazeAcpProvider::new(REPO_ROOT);
+
+    let models = provider
+        .list_models(REPO_ROOT)
+        .await
+        .expect("list_models probe should succeed (is `bun` on PATH?)");
+    assert!(!models.is_empty(), "amaze should advertise at least one model");
+    assert!(
+        models.iter().all(|m| m.provider == "amaze"),
+        "every model should be tagged with the provider id"
+    );
+    assert!(
+        models
+            .iter()
+            .any(|m| m.id.contains("claude") || m.id.contains("anthropic")),
+        "expected an anthropic/claude model id, got: {:?}",
+        models.iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+
+    let modes = provider
+        .list_modes(REPO_ROOT)
+        .await
+        .expect("list_modes probe should succeed");
+    assert!(
+        modes.iter().any(|m| m.id == "default"),
+        "expected a `default` mode, got: {:?}",
+        modes.iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+    assert!(
+        modes.iter().any(|m| m.id == "plan"),
+        "expected a `plan` mode, got: {:?}",
+        modes.iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+    // The session layer appends a synthetic Rocky `bypass` mode.
+    assert!(
+        modes.iter().any(|m| m.id == "bypass"),
+        "expected the synthetic `bypass` mode"
+    );
+
+    // features: amaze exposes none over ACP.
+    let features = provider.list_features(REPO_ROOT).await.expect("list_features");
+    assert!(features.is_empty());
+
+    eprintln!(
+        "live amaze probe: {} models, {} modes",
+        models.len(),
+        modes.len()
+    );
 }

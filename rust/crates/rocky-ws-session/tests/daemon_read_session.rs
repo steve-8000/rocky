@@ -50,6 +50,51 @@ fn envelope(inner: Value) -> Value {
     json!({ "type": "session", "message": inner })
 }
 
+/// Serializes the live amaze ACP probes below: each `build_live()` dispatch
+/// spawns a short-lived `bun ... acp` subprocess and shares a per-process
+/// discovery cache + the daemon on :7767, so running them concurrently (the
+/// default `cargo test` parallelism) races. Hold this guard for the duration of
+/// a probe so only one subprocess runs at a time.
+static LIVE_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Run a live discovery dispatch under `LIVE_PROBE_LOCK`, retrying up to 4 times
+/// with a small backoff until `ok(payload)` holds, so transient probe contention
+/// self-heals. Returns the final `message` object (with `type` + `payload`).
+///
+/// The daemon memoizes discovery per `provider+cwd` in a process-static cache
+/// with a 60s TTL, so a single transient empty-but-`Ok` probe (a cold-start
+/// `session/new` race that yields no advertised models/modes) would otherwise
+/// poison every live test for the whole run. Before each attempt we dispatch
+/// `refresh_providers_snapshot_request`, whose handler clears that cache, so a
+/// retry actually spawns a fresh probe instead of re-reading the poisoned entry.
+async fn live_probe<F>(req: Value, ok: F) -> Value
+where
+    F: Fn(&Value) -> bool,
+{
+    let _g = LIVE_PROBE_LOCK.lock().await;
+    let mut last = Value::Null;
+    for attempt in 0..4u32 {
+        let d = build_live();
+        // Bust the process-static discovery cache so this attempt re-probes the
+        // live agent rather than returning a possibly-poisoned cached result.
+        let _ = d
+            .dispatch_envelope(&envelope(json!({
+                "type": "refresh_providers_snapshot_request",
+                "requestId": "live-probe-refresh",
+            })))
+            .await
+            .unwrap();
+        let out = d.dispatch_envelope(&envelope(req.clone())).await.unwrap();
+        last = out["message"].clone();
+        if ok(&last["payload"]) {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300 * u64::from(attempt + 1)))
+            .await;
+    }
+    last
+}
+
 #[tokio::test]
 async fn get_daemon_config_returns_config_object() {
     let home = TempDir::new().unwrap();
@@ -235,4 +280,284 @@ async fn read_project_config_missing_repo_root_is_structured_error() {
     let m = &out["message"];
     assert_eq!(m["payload"]["ok"], false);
     assert!(m["payload"]["error"]["message"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// Per-provider discovery RPCs (models / modes / features) + snapshot catalog
+// ---------------------------------------------------------------------------
+
+/// A mock provider returning fixed models/modes without spawning a subprocess,
+/// so the response-shape tests run without `bun`.
+struct MockProvider;
+
+#[async_trait]
+impl AgentProvider for MockProvider {
+    fn id(&self) -> &str {
+        "amaze"
+    }
+    async fn create_session(
+        &self,
+        _config: ProviderSessionConfig,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        Err(AgentError::Provider("not used".to_string()))
+    }
+    async fn list_models(
+        &self,
+        _cwd: &str,
+    ) -> Result<Vec<rocky_agents::AgentModelDef>, AgentError> {
+        Ok(vec![rocky_agents::AgentModelDef {
+            provider: "amaze".to_string(),
+            id: "anthropic/claude-sonnet".to_string(),
+            label: "Claude Sonnet".to_string(),
+            description: Some("mock".to_string()),
+        }])
+    }
+    async fn list_modes(
+        &self,
+        _cwd: &str,
+    ) -> Result<Vec<rocky_agent_domain::AgentMode>, AgentError> {
+        Ok(vec![
+            rocky_agent_domain::AgentMode {
+                id: "default".to_string(),
+                label: "Default".to_string(),
+                description: None,
+            },
+            rocky_agent_domain::AgentMode {
+                id: "plan".to_string(),
+                label: "Plan".to_string(),
+                description: Some("planning".to_string()),
+            },
+        ])
+    }
+}
+
+fn build_with(home: &TempDir, provider: Arc<dyn AgentProvider>) -> SessionDispatcher {
+    let ctx = DaemonReadContext {
+        server_id: "srv-test".to_string(),
+        version: Some("0.1.0".to_string()),
+        listen: Some("127.0.0.1:7767".to_string()),
+        pid: 4242,
+        node_path: "/usr/bin/rockyd".to_string(),
+        started_at: Some("2026-06-11T00:00:00Z".to_string()),
+        rocky_home: home.path().to_path_buf(),
+        repo_root: REPO_ROOT.to_string(),
+        provider,
+    };
+    let mut d = SessionDispatcher::new();
+    handlers::daemon_read::register(&mut d, ctx);
+    d
+}
+
+#[tokio::test]
+async fn list_provider_models_mock_response_shape() {
+    let home = TempDir::new().unwrap();
+    let d = build_with(&home, Arc::new(MockProvider));
+    // Unique cwd avoids the process-wide discovery cache colliding with the
+    // live tests (keyed by provider+cwd).
+    let env = envelope(json!({
+        "type": "list_provider_models_request",
+        "provider": "amaze",
+        "cwd": "/tmp/mock-models-cwd",
+        "requestId": "lm-mock",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    let m = &out["message"];
+    assert_eq!(m["type"], "list_provider_models_response");
+    let p = &m["payload"];
+    assert_eq!(p["provider"], "amaze");
+    assert_eq!(p["requestId"], "lm-mock");
+    assert!(p["fetchedAt"].is_string());
+    assert!(p["error"].is_null());
+    let models = p["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["id"], "anthropic/claude-sonnet");
+    assert_eq!(models[0]["label"], "Claude Sonnet");
+    assert_eq!(models[0]["description"], "mock");
+    // Optional fields we do not own must NOT be fabricated.
+    assert!(models[0].get("isDefault").is_none());
+    assert!(models[0].get("thinkingOptions").is_none());
+}
+
+#[tokio::test]
+async fn list_provider_modes_mock_response_shape() {
+    let home = TempDir::new().unwrap();
+    let d = build_with(&home, Arc::new(MockProvider));
+    let env = envelope(json!({
+        "type": "list_provider_modes_request",
+        "provider": "amaze",
+        "cwd": "/tmp/mock-modes-cwd",
+        "requestId": "lmo-mock",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    let m = &out["message"];
+    assert_eq!(m["type"], "list_provider_modes_response");
+    let p = &m["payload"];
+    assert_eq!(p["provider"], "amaze");
+    assert_eq!(p["requestId"], "lmo-mock");
+    assert!(p["fetchedAt"].is_string());
+    assert!(p["error"].is_null());
+    let modes = p["modes"].as_array().unwrap();
+    assert_eq!(modes.len(), 2);
+    assert_eq!(modes[0]["id"], "default");
+    assert_eq!(modes[1]["id"], "plan");
+    // description omitted when None (serde skip_serializing_if).
+    assert!(modes[0].get("description").is_none());
+}
+
+#[tokio::test]
+async fn list_provider_features_mock_is_empty_no_error() {
+    let home = TempDir::new().unwrap();
+    let d = build_with(&home, Arc::new(MockProvider));
+    let env = envelope(json!({
+        "type": "list_provider_features_request",
+        "provider": "amaze",
+        "cwd": "/tmp/mock-features-cwd",
+        "requestId": "lf-mock",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    let m = &out["message"];
+    assert_eq!(m["type"], "list_provider_features_response");
+    let p = &m["payload"];
+    assert_eq!(p["provider"], "amaze");
+    assert_eq!(p["requestId"], "lf-mock");
+    assert!(p["fetchedAt"].is_string());
+    assert!(p["error"].is_null());
+    assert_eq!(p["features"], json!([]));
+}
+
+/// Build a dispatcher around the real `AmazeAcpProvider` rooted at the rocky
+/// repo. Live tests probe the agent over ACP (spawns `bun`).
+fn build_live() -> SessionDispatcher {
+    let home = TempDir::new().unwrap();
+    let provider: Arc<dyn AgentProvider> =
+        Arc::new(rocky_acp_provider::AmazeAcpProvider::new(REPO_ROOT));
+    // Keep `home` alive for the dispatcher's lifetime by leaking it; the test
+    // process is short-lived.
+    std::mem::forget(home);
+    let ctx = DaemonReadContext {
+        server_id: "srv-live".to_string(),
+        version: Some("0.1.0".to_string()),
+        listen: Some("127.0.0.1:7767".to_string()),
+        pid: std::process::id(),
+        node_path: "/usr/bin/rockyd".to_string(),
+        started_at: Some("2026-06-11T00:00:00Z".to_string()),
+        rocky_home: std::env::temp_dir(),
+        repo_root: REPO_ROOT.to_string(),
+        provider,
+    };
+    let mut d = SessionDispatcher::new();
+    handlers::daemon_read::register(&mut d, ctx);
+    d
+}
+
+#[tokio::test]
+async fn list_provider_models_live_returns_claude_model() {
+    let has_claude = |p: &Value| {
+        p["error"].is_null()
+            && p["models"].as_array().is_some_and(|models| {
+                !models.is_empty()
+                    && models
+                        .iter()
+                        .any(|m| m["id"].as_str().is_some_and(|s| s.contains("claude")))
+            })
+    };
+    let msg = live_probe(
+        json!({
+            "type": "list_provider_models_request",
+            "provider": "amaze",
+            "requestId": "lm-live",
+        }),
+        has_claude,
+    )
+    .await;
+    let p = &msg["payload"];
+    assert_eq!(msg["type"], "list_provider_models_response");
+    assert!(p["error"].is_null(), "live probe errored: {:?}", p["error"]);
+    let models = p["models"].as_array().unwrap();
+    assert!(!models.is_empty(), "expected non-empty models");
+    assert!(
+        models
+            .iter()
+            .any(|m| m["id"].as_str().is_some_and(|s| s.contains("claude"))),
+        "expected an anthropic/claude model id"
+    );
+}
+
+#[tokio::test]
+async fn list_provider_modes_live_returns_default_plan_bypass() {
+    let has_modes = |p: &Value| {
+        p["error"].is_null()
+            && p["modes"].as_array().is_some_and(|modes| {
+                let ids: Vec<&str> = modes.iter().filter_map(|m| m["id"].as_str()).collect();
+                ["default", "plan", "bypass"].iter().all(|w| ids.contains(w))
+            })
+    };
+    let msg = live_probe(
+        json!({
+            "type": "list_provider_modes_request",
+            "provider": "amaze",
+            "requestId": "lmo-live",
+        }),
+        has_modes,
+    )
+    .await;
+    let p = &msg["payload"];
+    assert!(p["error"].is_null(), "live probe errored: {:?}", p["error"]);
+    let modes = p["modes"].as_array().unwrap();
+    let ids: Vec<&str> = modes.iter().filter_map(|m| m["id"].as_str()).collect();
+    for want in ["default", "plan", "bypass"] {
+        assert!(ids.contains(&want), "expected mode `{want}` in {ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn list_provider_features_live_is_empty() {
+    let msg = live_probe(
+        json!({
+            "type": "list_provider_features_request",
+            "provider": "amaze",
+            "requestId": "lf-live",
+        }),
+        |p| p["error"].is_null(),
+    )
+    .await;
+    let p = &msg["payload"];
+    assert!(p["error"].is_null());
+    assert_eq!(p["features"], json!([]));
+}
+
+#[tokio::test]
+async fn providers_snapshot_live_amaze_has_models_and_modes() {
+    let amaze_ready = |p: &Value| {
+        p["entries"].as_array().is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e["provider"] == "amaze"
+                    && e["status"] == "ready"
+                    && e["models"].as_array().is_some_and(|m| !m.is_empty())
+                    && e["modes"].as_array().is_some_and(|m| !m.is_empty())
+                    && e["defaultModeId"].is_string()
+            })
+        })
+    };
+    let msg = live_probe(
+        json!({
+            "type": "get_providers_snapshot_request",
+            "requestId": "snap-live",
+        }),
+        amaze_ready,
+    )
+    .await;
+    let entries = msg["payload"]["entries"].as_array().unwrap();
+    let amaze = entries
+        .iter()
+        .find(|e| e["provider"] == "amaze")
+        .expect("amaze entry present");
+    assert_eq!(amaze["status"], "ready", "entry: {amaze}");
+    assert!(
+        !amaze["models"].as_array().unwrap().is_empty(),
+        "expected non-empty models"
+    );
+    let modes = amaze["modes"].as_array().unwrap();
+    assert!(!modes.is_empty(), "expected non-empty modes");
+    assert!(amaze["defaultModeId"].is_string());
 }

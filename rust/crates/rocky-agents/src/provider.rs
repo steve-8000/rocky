@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use rocky_agent_domain::{AgentRuntimeInfo, AgentStreamEvent};
 use rocky_store::PersistenceHandle;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
 
@@ -32,6 +33,26 @@ pub struct PromptInput {
     pub text: String,
     /// Optional client-supplied message id (used for idempotency upstream).
     pub message_id: Option<String>,
+}
+
+/// A model a provider advertises for a cwd, as surfaced to the WebUI by the
+/// `list_provider_models` RPC.
+///
+/// `rocky-agent-domain` has no model type (it only carries the *selected* model
+/// as a `String` on `AgentRuntimeInfo` and `ProviderSessionConfig`), so this
+/// minimal, serde-serializable shape lives here for the ws layer to emit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelDef {
+    /// Provider id this model belongs to (`AgentProvider::id`).
+    pub provider: String,
+    /// Stable model id (e.g. `anthropic/claude-...`).
+    pub id: String,
+    /// Human-facing label.
+    pub label: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A live provider session. Stream events flow from the provider into the
@@ -80,4 +101,26 @@ pub trait AgentProvider: Send + Sync {
         &self,
         config: ProviderSessionConfig,
     ) -> Result<Box<dyn AgentSession>, AgentError>;
+
+    /// Discover the models this provider exposes for `cwd`. Maps to the WebUI
+    /// `list_provider_models` RPC. Default: empty (providers that cannot probe
+    /// models, and mocks, do not break).
+    async fn list_models(&self, _cwd: &str) -> Result<Vec<AgentModelDef>, AgentError> {
+        Ok(vec![])
+    }
+
+    /// Discover the modes this provider exposes for `cwd`. Maps to the WebUI
+    /// `list_provider_modes` RPC. Default: empty.
+    async fn list_modes(
+        &self,
+        _cwd: &str,
+    ) -> Result<Vec<rocky_agent_domain::AgentMode>, AgentError> {
+        Ok(vec![])
+    }
+
+    /// Discover the features this provider exposes for `cwd`. Maps to the WebUI
+    /// `list_provider_features` RPC. Default: empty (amaze exposes none over ACP).
+    async fn list_features(&self, _cwd: &str) -> Result<Vec<serde_json::Value>, AgentError> {
+        Ok(vec![])
+    }
 }

@@ -102,6 +102,7 @@ pub fn register(
     }
 
     reg!("fetch_agents_request", handle_fetch_agents);
+    reg!("fetch_agent_history_request", handle_fetch_agent_history);
     reg!("fetch_agent_request", handle_fetch_agent);
     reg!("fetch_agent_timeline_request", handle_fetch_agent_timeline);
     reg!("cancel_agent_request", handle_cancel_agent);
@@ -335,11 +336,11 @@ fn rpc_error(req_id: &str, request_type: &str, error: String, code: &str) -> Val
 // Fetch handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_fetch_agents(
-    manager: &AgentManager,
-    msg: Value,
-) -> Result<Value, SessionRpcError> {
-    let req_id = request_id(&msg);
+/// Build the full list of `AgentDirectoryResponseEntry` values
+/// (`{agent: AgentSnapshotPayload, project: ProjectPlacementPayload}`,
+/// messages.ts:2504-2507) for every hydrated agent the manager owns. Shared by
+/// `fetch_agents_request` and `fetch_agent_history_request`.
+async fn directory_entries(manager: &AgentManager) -> Result<Vec<Value>, SessionRpcError> {
     let agents = manager.list().await;
     let mut entries = Vec::with_capacity(agents.len());
     for agent in &agents {
@@ -349,12 +350,63 @@ async fn handle_fetch_agents(
             "project": project_placement(&agent.cwd),
         }));
     }
+    Ok(entries)
+}
+
+async fn handle_fetch_agents(
+    manager: &AgentManager,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let entries = directory_entries(manager).await?;
     Ok(json!({
         "type": "fetch_agents_response",
         "payload": {
             "requestId": req_id,
             "entries": entries,
             "pageInfo": { "nextCursor": Value::Null, "prevCursor": Value::Null, "hasMore": false },
+        }
+    }))
+}
+
+/// `fetch_agent_history_request` -> `fetch_agent_history_response`
+/// `{requestId, entries:[{agent, project}], pageInfo:{nextCursor,prevCursor,hasMore}}`
+/// (request messages.ts:979-997; response messages.ts:2525-2532; entry
+/// messages.ts:2504-2507). Reuses the exact entry projection as
+/// `fetch_agents_request`.
+///
+/// Honors `page.limit` (messages.ts:991-996): entries are capped to `limit` and
+/// `hasMore` is set when more hydrated agents exist than were returned. The
+/// `AgentManager` has no cursor pagination, so `nextCursor`/`prevCursor` stay
+/// `null` (no fabricated cursors). `filter`/`sort` (messages.ts:982-990) are
+/// accepted but not yet applied — the hydrated agents are the full set, so
+/// returning them all (capped by `limit`) is correct for a well-formed request.
+async fn handle_fetch_agent_history(
+    manager: &AgentManager,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let limit = msg
+        .get("page")
+        .and_then(|p| p.get("limit"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
+    let mut entries = directory_entries(manager).await?;
+    let has_more = match limit {
+        Some(limit) if entries.len() > limit => {
+            entries.truncate(limit);
+            true
+        }
+        _ => false,
+    };
+
+    Ok(json!({
+        "type": "fetch_agent_history_response",
+        "payload": {
+            "requestId": req_id,
+            "entries": entries,
+            "pageInfo": { "nextCursor": Value::Null, "prevCursor": Value::Null, "hasMore": has_more },
         }
     }))
 }

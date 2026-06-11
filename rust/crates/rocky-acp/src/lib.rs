@@ -27,5 +27,5 @@ pub mod transport;
 
 pub use error::{AcpError, AcpResult};
 pub use process::{expand_rocky_root, AcpProcess, ProcessSpec, ROCKY_ROOT_TOKEN};
-pub use session::{AcpSession, SessionConfig, SessionInit, ACP_PROVIDER, PROTOCOL_VERSION};
+pub use session::{AcpModel, AcpSession, SessionConfig, SessionInit, ACP_PROVIDER, PROTOCOL_VERSION};
 pub use transport::{Inbound, InboundReceiver, Transport};

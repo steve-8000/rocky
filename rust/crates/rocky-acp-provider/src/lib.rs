@@ -25,17 +25,22 @@ use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rocky_acp::process::ProcessSpec;
+use rocky_acp::process::{expand_rocky_root, ProcessSpec};
 use rocky_acp::session::{AcpSession, SessionConfig, SessionInit};
-use rocky_agent_domain::{AgentRuntimeInfo, AgentStreamEvent};
+use rocky_agent_domain::{AgentMode, AgentRuntimeInfo, AgentStreamEvent};
 use rocky_agents::{
-    AgentError, AgentProvider, AgentSession, PromptInput, ProviderSessionConfig,
+    AgentError, AgentModelDef, AgentProvider, AgentSession, PromptInput, ProviderSessionConfig,
 };
 use tokio::sync::{broadcast, mpsc};
 
 /// Broadcast capacity for the per-session event fan-out. Matches the manager's
 /// broadcast capacity so a slow pump does not lag behind a chatty turn.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Upper bound on a short-lived discovery probe (`session/new` to read the
+/// agent's advertised models/modes). A hung agent must not block the WebUI's
+/// `list_provider_models/modes` RPCs indefinitely.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The default amaze coding-agent ACP command. `__ROCKY_ROOT__` is expanded to
 /// the configured repo root at spawn time (mirrors `scripts/setup.sh`).
@@ -78,6 +83,47 @@ impl AcpProvider {
         self.mcp_servers = servers;
         self
     }
+
+    /// Short-lived discovery probe: spawn an ACP session via `session/new`,
+    /// invoke `read` against the live [`AcpSession`], then shut the child down
+    /// (best-effort, so no process leaks). Wrapped in [`PROBE_TIMEOUT`] so a
+    /// hung agent surfaces an error rather than blocking the caller forever.
+    async fn probe<T, F>(&self, cwd: &str, read: F) -> Result<T, AgentError>
+    where
+        F: FnOnce(&AcpSession) -> T,
+    {
+        // `create_session` passes cwd straight into the ProcessSpec; mirror that
+        // here but also expand `__ROCKY_ROOT__` so callers may pass the token.
+        let cwd = expand_rocky_root(cwd, &self.repo_root);
+        let mut process = ProcessSpec::new(self.command.clone(), self.repo_root.clone(), cwd);
+        process.env = self.env.clone();
+        let session_config = SessionConfig {
+            process,
+            init: SessionInit::New,
+            mcp_servers: self.mcp_servers.clone(),
+            approval_policy: None,
+        };
+
+        let result = tokio::time::timeout(PROBE_TIMEOUT, async {
+            let session = AcpSession::connect(session_config)
+                .await
+                .map_err(|e| AgentError::Provider(e.to_string()))?;
+            let value = read(&session);
+            // Best-effort shutdown: close stdin, SIGTERM, wait, SIGKILL. Ensures
+            // the probed child does not leak.
+            session.shutdown().await;
+            Ok::<T, AgentError>(value)
+        })
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(AgentError::Provider(format!(
+                "ACP discovery probe timed out after {}s",
+                PROBE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
 }
 
 /// Convenience alias preset to launch the amaze coding agent over ACP.
@@ -117,6 +163,37 @@ impl AgentProvider for AcpProvider {
             .map_err(|e| AgentError::Provider(e.to_string()))?;
 
         Ok(Box::new(AcpAgentSession::new(session, &config)))
+    }
+
+    async fn list_models(&self, cwd: &str) -> Result<Vec<AgentModelDef>, AgentError> {
+        let id = self.id.clone();
+        self.probe(cwd, move |session| {
+            session
+                .available_models()
+                .iter()
+                .map(|m| AgentModelDef {
+                    provider: id.clone(),
+                    id: m.id.clone(),
+                    label: m.label.clone(),
+                    description: m.description.clone(),
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn list_modes(&self, cwd: &str) -> Result<Vec<AgentMode>, AgentError> {
+        // `AcpSession::available_modes` already returns domain `AgentMode`s
+        // (including the synthetic Rocky `bypass` mode appended at the session
+        // layer), so they map through directly.
+        self.probe(cwd, |session| session.available_modes().to_vec())
+            .await
+    }
+
+    async fn list_features(&self, _cwd: &str) -> Result<Vec<serde_json::Value>, AgentError> {
+        // amaze exposes no discrete "features" over ACP (only modes + models +
+        // configOptions), so there is nothing to probe. Return empty.
+        Ok(vec![])
     }
 }
 

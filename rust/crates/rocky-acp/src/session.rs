@@ -42,6 +42,20 @@ pub const PROTOCOL_VERSION: i64 = 1;
 /// Provider id Rocky tags ACP events with (matches `provider: "acp"`).
 pub const ACP_PROVIDER: &str = "acp";
 
+/// A model the ACP agent advertises for a session. Mirrors the minimal fields
+/// of amaze's `AgentModelDefinition`. Captured live `session/new` result shape
+/// (see `session.ts` / module docs):
+/// `result.models = { availableModels: [ { modelId, name, description } ] }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpModel {
+    /// Stable model id (`modelId`), e.g. `anthropic/claude-...`.
+    pub id: String,
+    /// Human label (`name`).
+    pub label: String,
+    /// Optional description (`description`).
+    pub description: Option<String>,
+}
+
 /// How a session is initialized.
 pub enum SessionInit {
     /// Fresh `session/new`.
@@ -91,6 +105,8 @@ pub struct AcpSession {
     provider: String,
     autonomous: bool,
     available_modes: Vec<AgentMode>,
+    available_models: Vec<AcpModel>,
+    current_mode_id: Option<String>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentStreamEvent>>>,
     lifecycle_tx: mpsc::UnboundedSender<AgentStreamEvent>,
     pending: PendingPermissions,
@@ -140,6 +156,8 @@ impl AcpSession {
         };
 
         let available_modes = extract_modes(&session_state);
+        let available_models = extract_models(&session_state);
+        let current_mode_id = extract_current_mode_id(&session_state);
         let autonomous = config
             .approval_policy
             .as_deref()
@@ -173,6 +191,8 @@ impl AcpSession {
             provider: ACP_PROVIDER.to_string(),
             autonomous,
             available_modes: append_rocky_bypass_mode(available_modes),
+            available_models,
+            current_mode_id,
             events_rx: Mutex::new(Some(events_rx)),
             lifecycle_tx: events_tx,
             pending,
@@ -192,6 +212,16 @@ impl AcpSession {
     /// Available modes including the synthetic `bypass` mode when appropriate.
     pub fn available_modes(&self) -> &[AgentMode] {
         &self.available_modes
+    }
+
+    /// Models the agent advertised for this session (from `session/new`).
+    pub fn available_models(&self) -> &[AcpModel] {
+        &self.available_models
+    }
+
+    /// The session's current mode id (`modes.currentModeId`), if any.
+    pub fn current_mode_id(&self) -> Option<&str> {
+        self.current_mode_id.as_deref()
     }
 
     /// Take the event receiver. Returns `None` if already taken.
@@ -700,6 +730,50 @@ fn extract_modes(state: &Value) -> Vec<AgentMode> {
         .unwrap_or_default()
 }
 
+/// Extract [`AcpModel`]s from a `session/new`/`session/load` state response.
+///
+/// Captured live amaze `session/new` result shape (cf. `session.ts`):
+/// `result.models = { availableModels: [ { modelId, name, description } ] }`.
+/// Tolerates absence (no `models` / `availableModels`) by returning `[]`.
+fn extract_models(state: &Value) -> Vec<AcpModel> {
+    let Some(models) = state
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            Some(AcpModel {
+                id: m.get("modelId").and_then(Value::as_str)?.to_string(),
+                label: m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                description: m
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// Read `modes.currentModeId` from a `session/new`/`session/load` state response.
+///
+/// Captured live amaze shape (cf. `session.ts`):
+/// `result.modes = { availableModes: [...], currentModeId: "default" }`.
+fn extract_current_mode_id(state: &Value) -> Option<String> {
+    state
+        .get("modes")
+        .and_then(|m| m.get("currentModeId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// `mapACPUsage` (acp-agent.ts:429-439). Reads token counts from a usage object
 /// (in a `session/prompt` response or a `usage_update`).
 fn map_usage(value: &Value) -> Option<AgentUsage> {
@@ -905,6 +979,60 @@ mod tests {
         // append_rocky_bypass_mode would add bypass on top.
         let with_bypass = append_rocky_bypass_mode(modes);
         assert!(with_bypass.iter().any(|m| m.id == "bypass"));
+    }
+
+    #[test]
+    fn extract_models_from_real_session_new_result() {
+        // Captured live amaze session/new result:
+        // result.models = { availableModels: [ { modelId, name, description } ] }.
+        let state = json!({
+            "sessionId": "s",
+            "models": {
+                "availableModels": [
+                    {
+                        "modelId": "anthropic/claude-sonnet-4",
+                        "name": "Claude Sonnet 4",
+                        "description": "Anthropic Claude Sonnet 4"
+                    },
+                    {
+                        "modelId": "openai/gpt-5",
+                        "name": "GPT-5",
+                        "description": null
+                    }
+                ]
+            }
+        });
+        let models = extract_models(&state);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "anthropic/claude-sonnet-4");
+        assert_eq!(models[0].label, "Claude Sonnet 4");
+        assert_eq!(models[0].description.as_deref(), Some("Anthropic Claude Sonnet 4"));
+        assert_eq!(models[1].id, "openai/gpt-5");
+        assert_eq!(models[1].description, None);
+    }
+
+    #[test]
+    fn extract_models_tolerates_absence() {
+        assert!(extract_models(&json!({})).is_empty());
+        assert!(extract_models(&json!({ "models": {} })).is_empty());
+        assert!(extract_models(&json!({ "models": { "availableModels": [] } })).is_empty());
+    }
+
+    #[test]
+    fn extract_current_mode_id_reads_modes_block() {
+        // Captured live amaze shape:
+        // result.modes = { availableModes: [...], currentModeId: "default" }.
+        let state = json!({
+            "modes": {
+                "availableModes": [
+                    { "id": "default", "name": "Default", "description": "d" }
+                ],
+                "currentModeId": "default"
+            }
+        });
+        assert_eq!(extract_current_mode_id(&state).as_deref(), Some("default"));
+        assert_eq!(extract_current_mode_id(&json!({})), None);
+        assert_eq!(extract_current_mode_id(&json!({ "modes": {} })), None);
     }
 
     #[test]

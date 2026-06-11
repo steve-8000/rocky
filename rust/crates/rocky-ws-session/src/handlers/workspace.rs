@@ -112,6 +112,7 @@ pub fn register(dispatcher: &mut SessionDispatcher, ctx: WorkspaceHandlerContext
     reg!("archive_workspace_request", handle_archive_workspace);
     reg!("open_project_request", handle_open_project);
     reg!("checkout_status_request", handle_checkout_status);
+    reg!("workspace_setup_status_request", handle_workspace_setup_status);
     reg!("validate_branch_request", handle_validate_branch);
     reg!("create_rocky_worktree_request", handle_create_worktree);
     reg!("rocky_worktree_list_request", handle_worktree_list);
@@ -422,6 +423,34 @@ async fn handle_checkout_status(
         Err(message) => not_git_payload(&cwd, &req_id, Some(checkout_error("UNKNOWN", message))),
     };
     Ok(json!({ "type": "checkout_status_response", "payload": payload }))
+}
+
+/// `workspace_setup_status_request` -> `workspace_setup_status_response`
+/// `{requestId, workspaceId, snapshot: WorkspaceSetupSnapshot|null}`
+/// (request messages.ts:1599-1603; response messages.ts:2595-2602).
+///
+/// A `WorkspaceSetupSnapshot` (messages.ts:2589-2593) only models an in-flight
+/// or finished worktree-setup run: its `status` enum is `running|completed|
+/// failed` with no idle/none variant. The Rust daemon does not yet run worktree
+/// setup commands, so there is never a setup run to report. Per the schema's
+/// `snapshot: WorkspaceSetupSnapshotSchema.nullable()` (messages.ts:2600), the
+/// correct schema-valid "no setup in progress / none recorded" value is `null`
+/// — NOT a fabricated snapshot. `requestId` and `workspaceId` are echoed back
+/// from the request.
+async fn handle_workspace_setup_status(
+    _ctx: &WorkspaceHandlerContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let workspace_id = opt_str(&msg, "workspaceId").unwrap_or_default();
+    Ok(json!({
+        "type": "workspace_setup_status_response",
+        "payload": {
+            "requestId": req_id,
+            "workspaceId": workspace_id,
+            "snapshot": Value::Null,
+        }
+    }))
 }
 
 /// `CheckoutStatusNotGitSchema` payload (messages.ts:2932-2944).

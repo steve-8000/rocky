@@ -30,5 +30,7 @@ pub use manager::{
     AgentManager, AgentStreamBroadcast, CreateAgentOptions, ManagedAgent, PARENT_AGENT_ID_LABEL,
 };
 pub use permissions::{FollowUp, PendingPermission, PermissionQueue, Resolution};
-pub use provider::{AgentProvider, AgentSession, ProviderSessionConfig, PromptInput};
+pub use provider::{
+    AgentModelDef, AgentProvider, AgentSession, ProviderSessionConfig, PromptInput,
+};
 pub use timeline::{Timeline, TimelineRow};

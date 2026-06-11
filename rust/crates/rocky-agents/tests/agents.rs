@@ -71,6 +71,16 @@ impl AgentProvider for MockProvider {
     }
 }
 
+#[tokio::test]
+async fn provider_discovery_defaults_are_empty() {
+    // The new AgentProvider discovery methods have default impls returning empty
+    // vecs so existing providers/mocks compile and behave inertly.
+    let provider = MockProvider { id: "mock".to_string() };
+    assert!(provider.list_models("/tmp").await.unwrap().is_empty());
+    assert!(provider.list_modes("/tmp").await.unwrap().is_empty());
+    assert!(provider.list_features("/tmp").await.unwrap().is_empty());
+}
+
 fn assistant(text: &str) -> AgentTimelineItem {
     AgentTimelineItem::AssistantMessage {
         text: text.to_string(),

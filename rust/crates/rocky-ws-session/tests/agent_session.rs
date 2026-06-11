@@ -215,6 +215,63 @@ async fn fetch_agents_lists_created_agent_entry() {
 }
 
 #[tokio::test]
+async fn fetch_agent_history_lists_all_entries_with_page_info() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let id_a = create_agent(&manager, "/tmp/proj-hist-a").await;
+    let id_b = create_agent(&manager, "/tmp/proj-hist-b").await;
+    let d = build_dispatcher(manager);
+
+    let env = envelope(json!({ "type": "fetch_agent_history_request", "requestId": "h1" }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+
+    let m = &out["message"];
+    assert_eq!(m["type"], "fetch_agent_history_response");
+    assert_eq!(m["payload"]["requestId"], "h1");
+    let entries = m["payload"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|e| e["agent"]["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&id_a.as_str()));
+    assert!(ids.contains(&id_b.as_str()));
+    for entry in entries {
+        assert!(entry.get("agent").is_some());
+        assert!(entry.get("project").is_some());
+    }
+    assert_eq!(m["payload"]["pageInfo"]["hasMore"], false);
+    assert!(m["payload"]["pageInfo"]["nextCursor"].is_null());
+    assert!(m["payload"]["pageInfo"]["prevCursor"].is_null());
+}
+
+#[tokio::test]
+async fn fetch_agent_history_honors_page_limit_and_sets_has_more() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    create_agent(&manager, "/tmp/proj-hist-1").await;
+    create_agent(&manager, "/tmp/proj-hist-2").await;
+    let d = build_dispatcher(manager);
+
+    let env = envelope(json!({
+        "type": "fetch_agent_history_request",
+        "requestId": "h2",
+        "page": { "limit": 1 },
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+
+    let m = &out["message"];
+    assert_eq!(m["type"], "fetch_agent_history_response");
+    let entries = m["payload"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].get("agent").is_some());
+    assert!(entries[0].get("project").is_some());
+    assert_eq!(m["payload"]["pageInfo"]["hasMore"], true);
+    assert!(m["payload"]["pageInfo"]["nextCursor"].is_null());
+    assert!(m["payload"]["pageInfo"]["prevCursor"].is_null());
+}
+
+#[tokio::test]
 async fn fetch_agent_timeline_returns_rows() {
     let home = TempDir::new().unwrap();
     let manager = Arc::new(AgentManager::new(home.path()));

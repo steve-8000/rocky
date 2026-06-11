@@ -398,3 +398,27 @@ async fn open_project_then_archive_round_trip() {
     assert_eq!(archived["payload"]["error"], Value::Null);
     assert!(archived["payload"]["archivedAt"].is_string());
 }
+
+/// `workspace_setup_status_request` -> `workspace_setup_status_response` with a
+/// null snapshot (the Rust daemon runs no worktree setup; messages.ts:2595-2602,
+/// `snapshot` nullable at messages.ts:2600). Needs no git repo.
+#[tokio::test]
+async fn workspace_setup_status_returns_null_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, _term) = build_dispatcher(home.path());
+
+    let resp = dispatch(
+        &dispatcher,
+        json!({
+            "type": "workspace_setup_status_request",
+            "workspaceId": "ws-123",
+            "requestId": "r-setup",
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["type"], "workspace_setup_status_response");
+    assert_eq!(resp["payload"]["requestId"], "r-setup");
+    assert_eq!(resp["payload"]["workspaceId"], "ws-123");
+    assert_eq!(resp["payload"]["snapshot"], Value::Null);
+}

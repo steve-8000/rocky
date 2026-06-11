@@ -39,20 +39,27 @@
 //!   `{providers, error, fetchedAt, requestId}` (messages.ts:3515-3523;
 //!   session.ts:3833-3862).
 //!
-//! ## No fabricated state
-//! The Rust daemon does not own a rich provider catalog (models/modes are owned
-//! by the live ACP agent). Provider availability is probed structurally: the
-//! `amaze` provider is `ready` iff its launch command (`bun`) is on `PATH` and
-//! the amaze CLI entrypoint exists under the repo root, else `unavailable` with
-//! a non-null `error`. Models/modes are reported empty rather than fabricated.
+//! ## Models / modes via live ACP discovery
+//! The Rust daemon does not own a static provider catalog. Models/modes are
+//! discovered from the live ACP agent via [`AgentProvider::list_models`] /
+//! [`AgentProvider::list_modes`] (a short-lived probe that spawns the agent
+//! subprocess). To avoid probing on every snapshot/RPC, discovery is cached per
+//! `provider+cwd` with a short TTL (see [`DISCOVERY_TTL`]). Availability/status
+//! is still probed structurally (launch command on PATH + CLI entrypoint
+//! present). Nothing is fabricated: on probe failure the typed `_response`
+//! carries a non-null `error` and empty arrays.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
-use rocky_agents::AgentProvider;
+use rocky_agent_domain::AgentMode;
+use rocky_agents::{AgentModelDef, AgentProvider};
 use rocky_notify::PushTokenStore;
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::sync::Mutex;
 
 use crate::dispatch::{SessionDispatcher, SessionRpcError};
 
@@ -104,6 +111,9 @@ pub fn register(dispatcher: &mut SessionDispatcher, ctx: DaemonReadContext) {
     reg!("get_providers_snapshot_request", handle_get_providers_snapshot);
     reg!("refresh_providers_snapshot_request", handle_refresh_providers_snapshot);
     reg!("list_available_providers_request", handle_list_available_providers);
+    reg!("list_provider_models_request", handle_list_provider_models);
+    reg!("list_provider_modes_request", handle_list_provider_modes);
+    reg!("list_provider_features_request", handle_list_provider_features);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,13 +152,89 @@ fn expand_rocky_root(arg: &str, repo_root: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Provider discovery (models / modes) — cached live ACP probe
+// ---------------------------------------------------------------------------
+
+/// TTL for the per-`provider+cwd` models/modes cache. The ACP discovery probe
+/// spawns the agent subprocess (~1.5s); caching avoids re-probing on every
+/// snapshot call and every `list_provider_*` RPC within the window.
+const DISCOVERY_TTL: Duration = Duration::from_secs(60);
+
+/// Cached models+modes for one provider/cwd.
+#[derive(Clone, Default)]
+struct ProviderDiscovery {
+    models: Vec<AgentModelDef>,
+    modes: Vec<AgentMode>,
+}
+
+type DiscoveryCache = Mutex<HashMap<String, (Instant, ProviderDiscovery)>>;
+
+/// Process-wide discovery cache, keyed by `provider\0cwd`. Lives in the handler
+/// module (not on `DaemonReadContext`) so `server.rs` needs no new field; the
+/// TTL bounds staleness and the daemon hosts a single provider.
+static DISCOVERY_CACHE: LazyLock<DiscoveryCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Discover models+modes for `cwd` via the live provider, memoized per
+/// `provider+cwd` for [`DISCOVERY_TTL`]. On probe error the error string is
+/// returned (callers surface it in the typed `_response`); failures are not
+/// cached so a transient probe error self-heals on the next call.
+async fn discover(ctx: &DaemonReadContext, cwd: &str) -> Result<ProviderDiscovery, String> {
+    let key = format!("{}\u{0}{}", ctx.provider.id(), cwd);
+    {
+        let cache = DISCOVERY_CACHE.lock().await;
+        if let Some((at, disc)) = cache.get(&key) {
+            if at.elapsed() < DISCOVERY_TTL {
+                return Ok(disc.clone());
+            }
+        }
+    }
+    let models = ctx
+        .provider
+        .list_models(cwd)
+        .await
+        .map_err(|e| e.to_string())?;
+    let modes = ctx
+        .provider
+        .list_modes(cwd)
+        .await
+        .map_err(|e| e.to_string())?;
+    let disc = ProviderDiscovery { models, modes };
+    // Do NOT cache an empty-models result: a cold-start ACP `session/new` can
+    // transiently return Ok with no advertised models, and caching that would
+    // pin an empty model picker for the whole TTL (the exact "provider lookup
+    // empty" symptom). Only memoize a non-empty discovery; otherwise return it
+    // once and re-probe on the next call so it self-heals.
+    if !disc.models.is_empty() {
+        let mut cache = DISCOVERY_CACHE.lock().await;
+        cache.insert(key, (Instant::now(), disc.clone()));
+    }
+    Ok(disc)
+}
+
+/// `defaultModeId` for a snapshot entry: prefer an explicit `default` mode, else
+/// the first advertised mode, else `null`.
+fn default_mode_id(modes: &[AgentMode]) -> Value {
+    if modes.iter().any(|m| m.id == "default") {
+        return Value::String("default".to_string());
+    }
+    match modes.first() {
+        Some(m) => Value::String(m.id.clone()),
+        None => Value::Null,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Provider snapshot
 // ---------------------------------------------------------------------------
 
-/// A single `ProviderSnapshotEntry` (messages.ts:261-272). `models`/`modes` are
-/// omitted (the rust daemon does not own a catalog); `status`/`label` carry the
-/// determinable availability.
-fn provider_snapshot_entry(provider_id: &str, repo_root: &str) -> Value {
+/// A single `ProviderSnapshotEntry` (messages.ts:261-272). Structural
+/// availability (`status`/`label`/`error`) is determined locally; for a `ready`
+/// amaze entry, `models`/`modes`/`defaultModeId` are filled from live ACP
+/// discovery (cached). Discovery failure downgrades the entry to `error` with a
+/// non-null `error` rather than fabricating a catalog.
+async fn provider_snapshot_entry(ctx: &DaemonReadContext, cwd: &str) -> Value {
+    let provider_id = ctx.provider.id();
+    let repo_root = ctx.repo_root.as_str();
     let (status, error, label, description) = match provider_id {
         "amaze" => {
             // amaze launch command: `bun __ROCKY_ROOT__/vendor/amaze/.../cli.ts acp`.
@@ -189,6 +275,28 @@ fn provider_snapshot_entry(provider_id: &str, repo_root: &str) -> Value {
         ),
     };
 
+    // For a structurally-ready provider, populate models/modes from live
+    // discovery. A probe failure downgrades to `error` (the WebUI shows the
+    // reason) rather than presenting an empty catalog as `ready`.
+    let mut status = status;
+    let mut error = error;
+    let mut models = Vec::new();
+    let mut modes = Vec::new();
+    let mut default_mode = Value::Null;
+    if status == "ready" {
+        match discover(ctx, cwd).await {
+            Ok(disc) => {
+                default_mode = default_mode_id(&disc.modes);
+                models = disc.models;
+                modes = disc.modes;
+            }
+            Err(e) => {
+                status = "error";
+                error = Some(e);
+            }
+        }
+    }
+
     let mut entry = json!({
         "provider": provider_id,
         "status": status,
@@ -196,6 +304,9 @@ fn provider_snapshot_entry(provider_id: &str, repo_root: &str) -> Value {
         "label": label,
         "description": description,
         "fetchedAt": now_rfc3339(),
+        "models": models,
+        "modes": modes,
+        "defaultModeId": default_mode,
     });
     if let Some(err) = error {
         entry
@@ -206,10 +317,11 @@ fn provider_snapshot_entry(provider_id: &str, repo_root: &str) -> Value {
     entry
 }
 
-/// Build the provider-snapshot array for `cwd` (cwd is accepted for parity with
-/// the TS per-cwd snapshot but does not change structural availability).
-pub fn provider_snapshot(ctx: &DaemonReadContext, _cwd: Option<&str>) -> Vec<Value> {
-    vec![provider_snapshot_entry(ctx.provider.id(), &ctx.repo_root)]
+/// Build the provider-snapshot array for `cwd` (defaults to the repo root when
+/// absent). `cwd` selects the discovery probe's working directory.
+pub async fn provider_snapshot(ctx: &DaemonReadContext, cwd: Option<&str>) -> Vec<Value> {
+    let cwd = cwd.unwrap_or(&ctx.repo_root);
+    vec![provider_snapshot_entry(ctx, cwd).await]
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +384,7 @@ async fn handle_daemon_get_status(
     msg: Value,
 ) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
-    let entries = provider_snapshot(ctx, None);
+    let entries = provider_snapshot(ctx, None).await;
     // `providers` is the `{provider, available, error}` availability list
     // (messages.ts:2797-2804). Derive it from the snapshot entries.
     let providers: Vec<Value> = entries
@@ -415,7 +527,7 @@ async fn handle_get_providers_snapshot(
 ) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
     let cwd = msg.get("cwd").and_then(Value::as_str);
-    let entries = provider_snapshot(ctx, cwd);
+    let entries = provider_snapshot(ctx, cwd).await;
     Ok(json!({
         "type": "get_providers_snapshot_response",
         "payload": {
@@ -431,8 +543,9 @@ async fn handle_refresh_providers_snapshot(
     msg: Value,
 ) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
-    // Snapshots are computed on demand (no background cache to refresh), so the
-    // refresh is acknowledged (session.ts:3895-3906).
+    // Drop the cached discovery so the next snapshot/RPC re-probes the live
+    // agent, then acknowledge (session.ts:3895-3906).
+    DISCOVERY_CACHE.lock().await.clear();
     Ok(json!({
         "type": "refresh_providers_snapshot_response",
         "payload": { "acknowledged": true, "requestId": req_id }
@@ -445,6 +558,7 @@ async fn handle_list_available_providers(
 ) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
     let providers: Vec<Value> = provider_snapshot(ctx, None)
+        .await
         .iter()
         .map(|e| {
             let available = e.get("status").and_then(Value::as_str) == Some("ready");
@@ -460,6 +574,134 @@ async fn handle_list_available_providers(
         "payload": {
             "providers": providers,
             "error": Value::Null,
+            "fetchedAt": now_rfc3339(),
+            "requestId": req_id,
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Per-provider discovery RPCs (models / modes / features)
+// ---------------------------------------------------------------------------
+
+/// Resolve the discovery `cwd` for a `list_provider_*` request: the request's
+/// `cwd` when present, else the daemon repo root.
+fn discovery_cwd<'a>(ctx: &'a DaemonReadContext, msg: &'a Value) -> &'a str {
+    msg.get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&ctx.repo_root)
+}
+
+/// Echo the requested `provider` back in the response. The daemon hosts a
+/// single provider; the WebUI may send a composite id (e.g.
+/// `amaze/anthropic/claude-...`), so discovery always runs against
+/// `ctx.provider` regardless. The echoed value mirrors what the client sent
+/// (falling back to the provider id) for response correlation.
+fn echo_provider(ctx: &DaemonReadContext, msg: &Value) -> String {
+    msg.get("provider")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ctx.provider.id())
+        .to_string()
+}
+
+/// `list_provider_models_request` -> `list_provider_models_response`
+/// (messages.ts:3477-3485). On probe failure: empty `models` + non-null
+/// `error` (never `rpc_error`, never fabricated data).
+async fn handle_list_provider_models(
+    ctx: &DaemonReadContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let provider = echo_provider(ctx, &msg);
+    let cwd = discovery_cwd(ctx, &msg);
+    let (models, error) = match discover(ctx, cwd).await {
+        Ok(disc) => (
+            disc.models
+                .iter()
+                .map(|m| {
+                    // Map AgentModelDef -> AgentModelDefinition, omitting the
+                    // optional fields we do not own (isDefault, metadata,
+                    // thinkingOptions, ...) rather than fabricating them.
+                    let mut v = json!({
+                        "provider": m.provider,
+                        "id": m.id,
+                        "label": m.label,
+                    });
+                    if let Some(desc) = &m.description {
+                        v.as_object_mut()
+                            .expect("model is an object")
+                            .insert("description".to_string(), Value::String(desc.clone()));
+                    }
+                    v
+                })
+                .collect::<Vec<_>>(),
+            Value::Null,
+        ),
+        Err(e) => (Vec::new(), Value::String(e)),
+    };
+    Ok(json!({
+        "type": "list_provider_models_response",
+        "payload": {
+            "provider": provider,
+            "models": models,
+            "error": error,
+            "fetchedAt": now_rfc3339(),
+            "requestId": req_id,
+        }
+    }))
+}
+
+/// `list_provider_modes_request` -> `list_provider_modes_response`
+/// (messages.ts:3487-3496). `AgentMode` (domain type) serializes directly to
+/// the wire `AgentMode` (`{id, label, description?}`).
+async fn handle_list_provider_modes(
+    ctx: &DaemonReadContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let provider = echo_provider(ctx, &msg);
+    let cwd = discovery_cwd(ctx, &msg);
+    let (modes, error) = match discover(ctx, cwd).await {
+        Ok(disc) => (
+            serde_json::to_value(&disc.modes).unwrap_or_else(|_| json!([])),
+            Value::Null,
+        ),
+        Err(e) => (json!([]), Value::String(e)),
+    };
+    Ok(json!({
+        "type": "list_provider_modes_response",
+        "payload": {
+            "provider": provider,
+            "modes": modes,
+            "error": error,
+            "fetchedAt": now_rfc3339(),
+            "requestId": req_id,
+        }
+    }))
+}
+
+/// `list_provider_features_request` -> `list_provider_features_response`
+/// (messages.ts:3498-3507). amaze exposes no discrete features over ACP, so
+/// `features` is empty; a probe error still surfaces in `error`.
+async fn handle_list_provider_features(
+    ctx: &DaemonReadContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let req_id = request_id(&msg);
+    let provider = echo_provider(ctx, &msg);
+    let cwd = discovery_cwd(ctx, &msg);
+    let (features, error) = match ctx.provider.list_features(cwd).await {
+        Ok(features) => (Value::Array(features), Value::Null),
+        Err(e) => (json!([]), Value::String(e.to_string())),
+    };
+    Ok(json!({
+        "type": "list_provider_features_response",
+        "payload": {
+            "provider": provider,
+            "features": features,
+            "error": error,
             "fetchedAt": now_rfc3339(),
             "requestId": req_id,
         }
