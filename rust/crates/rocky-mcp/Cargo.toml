@@ -9,6 +9,10 @@ publish.workspace = true
 rocky-agent-domain = { path = "../rocky-agent-domain" }
 rocky-agents = { path = "../rocky-agents" }
 rocky-mission-control = { path = "../rocky-mission-control" }
+rocky-scheduling = { path = "../rocky-scheduling" }
+rocky-store = { path = "../rocky-store" }
+rocky-terminal = { path = "../rocky-terminal" }
+rocky-workspaces = { path = "../rocky-workspaces" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

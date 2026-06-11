@@ -37,11 +37,15 @@ use crate::protocol::{tool_result, ToolDescriptor, ToolError, ToolRegistry};
 pub fn register_all(registry: &mut ToolRegistry) {
     register_mission_tools(registry);
     register_agent_tools(registry);
+    crate::agent_lifecycle_tools::register(registry);
+    crate::terminal_tools::register(registry);
+    crate::schedule_tools::register(registry);
+    crate::worktree_provider_tools::register(registry);
 }
 
 // --- argument helpers -------------------------------------------------------
 
-fn as_object(args: &Value) -> Result<&Map<String, Value>, ToolError> {
+pub(crate) fn as_object(args: &Value) -> Result<&Map<String, Value>, ToolError> {
     match args {
         Value::Object(map) => Ok(map),
         Value::Null => Err(ToolError::invalid_params("missing arguments object")),
@@ -50,7 +54,7 @@ fn as_object(args: &Value) -> Result<&Map<String, Value>, ToolError> {
 }
 
 /// Required, non-empty (after trim) string field.
-fn req_str(args: &Map<String, Value>, key: &str) -> Result<String, ToolError> {
+pub(crate) fn req_str(args: &Map<String, Value>, key: &str) -> Result<String, ToolError> {
     let raw = args
         .get(key)
         .and_then(Value::as_str)
@@ -64,7 +68,7 @@ fn req_str(args: &Map<String, Value>, key: &str) -> Result<String, ToolError> {
 
 /// Optional string field. Returns `None` when absent or JSON null; errors when
 /// present but not a string.
-fn opt_str(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolError> {
+pub(crate) fn opt_str(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
@@ -74,7 +78,7 @@ fn opt_str(args: &Map<String, Value>, key: &str) -> Result<Option<String>, ToolE
 
 /// Optional `Option<Option<String>>` patch field: absent -> `None`; JSON null
 /// -> `Some(None)` (clear); string -> `Some(Some(..))`.
-fn opt_nullable_str(
+pub(crate) fn opt_nullable_str(
     args: &Map<String, Value>,
     key: &str,
 ) -> Result<Option<Option<String>>, ToolError> {
@@ -88,7 +92,7 @@ fn opt_nullable_str(
     }
 }
 
-fn opt_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, ToolError> {
+pub(crate) fn opt_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
@@ -96,7 +100,7 @@ fn opt_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, ToolEr
     }
 }
 
-fn opt_str_array(args: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, ToolError> {
+pub(crate) fn opt_str_array(args: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(items)) => {
@@ -113,7 +117,7 @@ fn opt_str_array(args: &Map<String, Value>, key: &str) -> Result<Option<Vec<Stri
     }
 }
 
-fn opt_labels(args: &Map<String, Value>, key: &str) -> Result<BTreeMap<String, String>, ToolError> {
+pub(crate) fn opt_labels(args: &Map<String, Value>, key: &str) -> Result<BTreeMap<String, String>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => {
@@ -133,7 +137,7 @@ fn opt_labels(args: &Map<String, Value>, key: &str) -> Result<BTreeMap<String, S
 }
 
 /// Deserialize an optional serde enum from a JSON string field.
-fn opt_enum<T: serde::de::DeserializeOwned>(
+pub(crate) fn opt_enum<T: serde::de::DeserializeOwned>(
     args: &Map<String, Value>,
     key: &str,
 ) -> Result<Option<T>, ToolError> {
@@ -157,7 +161,7 @@ fn mission_err(e: MissionControlError) -> ToolError {
     }
 }
 
-fn agent_err(e: AgentError) -> ToolError {
+pub(crate) fn agent_err(e: AgentError) -> ToolError {
     let code = match &e {
         AgentError::NotFound(_) => "agent_not_found",
         AgentError::IllegalTransition { .. } => "illegal_transition",
@@ -345,7 +349,7 @@ fn register_mission_tools(registry: &mut ToolRegistry) {
 
 /// Compact metadata projection of a live agent (mirrors the
 /// `AgentListItemPayload` subset the Rust slice owns).
-fn agent_payload(agent: &ManagedAgent) -> Value {
+pub(crate) fn agent_payload(agent: &ManagedAgent) -> Value {
     json!({
         "agentId": agent.id,
         "id": agent.id,
@@ -693,7 +697,7 @@ fn register_create_agent(registry: &mut ToolRegistry) {
 
 /// Split a `provider/model` pair into `(provider, Some(model))`, or
 /// `(provider, None)` when no slash is present.
-fn split_provider_model(pair: &str) -> (String, Option<String>) {
+pub(crate) fn split_provider_model(pair: &str) -> (String, Option<String>) {
     match pair.split_once('/') {
         Some((provider, model)) if !model.is_empty() => {
             (provider.to_string(), Some(model.to_string()))
@@ -800,7 +804,7 @@ fn wait_result_payload(agent_id: &str, result: &rocky_agents::WaitForAgentResult
 
 /// Build a JSON Schema object with the given required + optional fields. `kind`
 /// is a coarse JSON Schema type (`string`/`boolean`/`number`/`array`/`object`).
-fn object_schema(required: &[(&str, &str)], optional: &[(&str, &str)]) -> Value {
+pub(crate) fn object_schema(required: &[(&str, &str)], optional: &[(&str, &str)]) -> Value {
     let mut props = Map::new();
     for (name, kind) in required.iter().chain(optional.iter()) {
         props.insert((*name).to_string(), json!({ "type": type_for(kind) }));
@@ -814,7 +818,7 @@ fn object_schema(required: &[(&str, &str)], optional: &[(&str, &str)]) -> Value 
     })
 }
 
-fn type_for(kind: &str) -> &'static str {
+pub(crate) fn type_for(kind: &str) -> &'static str {
     match kind {
         "boolean" => "boolean",
         "number" => "number",
@@ -827,7 +831,7 @@ fn type_for(kind: &str) -> &'static str {
 // --- handler boxing ---------------------------------------------------------
 
 /// Box an async handler closure into the registry's `ToolHandler` type.
-fn boxed<F, Fut>(f: F) -> crate::protocol::ToolHandler
+pub(crate) fn boxed<F, Fut>(f: F) -> crate::protocol::ToolHandler
 where
     F: Fn(Value, CallCtx) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Value, ToolError>> + Send + 'static,

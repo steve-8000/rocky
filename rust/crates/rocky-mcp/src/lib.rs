@@ -11,12 +11,16 @@
 //! - [`context`] bundles the [`rocky_agents::AgentManager`] and
 //!   [`rocky_mission_control::FileBackedMissionControlService`] dependencies.
 
+mod agent_lifecycle_tools;
 mod context;
 mod protocol;
+mod schedule_tools;
 mod server;
+mod terminal_tools;
 mod tools;
+mod worktree_provider_tools;
 
-pub use context::{CallCtx, McpContext};
+pub use context::{CallCtx, McpContext, McpServices};
 pub use protocol::{
     error_codes, JsonRpcError, JsonRpcRequest, ToolDescriptor, ToolError, ToolRegistry,
     PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,

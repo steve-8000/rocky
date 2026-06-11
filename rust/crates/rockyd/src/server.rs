@@ -20,7 +20,7 @@ use crate::lifecycle;
 use crate::webui::resolve_web_ui_dir;
 use rocky_acp_provider::AmazeAcpProvider;
 use rocky_agents::{AgentManager, AgentProvider};
-use rocky_mcp::McpContext;
+use rocky_mcp::{McpContext, McpServices};
 use rocky_mission_control::FileBackedMissionControlService;
 use rocky_scheduling::{LoopService, ScheduleService, ScheduleStore};
 use rocky_terminal::TerminalManager;
@@ -246,11 +246,23 @@ async fn serve(
         repo_root,
         provider: provider.clone(),
     };
+    // Shared backing services hoisted here so the WS session dispatcher and the
+    // MCP tool surface observe the same live state (the MCP terminal/schedule/
+    // worktree tools must act on the same terminals/schedules/registry the UI
+    // does). `AgentManager` is already shared the same way.
+    let terminal_manager = Arc::new(TerminalManager::new());
+    let schedule_service = Arc::new(Mutex::new(ScheduleService::new(ScheduleStore::new(
+        rocky_home.join("schedules"),
+    ))));
+    let workspace_registry = Arc::new(Mutex::new(WorkspaceRegistry::load(rocky_home)));
     let session_dispatcher = Some(Arc::new(build_session_dispatcher(
         rocky_home,
         agent_manager.clone(),
         provider.clone(),
         daemon_read_ctx,
+        terminal_manager.clone(),
+        schedule_service.clone(),
+        workspace_registry.clone(),
     )));
 
     let ctx = Arc::new(ServerContext {
@@ -269,8 +281,16 @@ async fn serve(
         internal_mcp_token: Some(internal_mcp_token.clone()),
     });
 
-    // Build the agent + mission MCP surface and mount it under `/mcp/agents`.
-    let mcp_router = build_mcp_router(rocky_home, agent_manager, provider);
+    // Build the agent + mission MCP surface and mount it under `/mcp/agents`,
+    // sharing the live terminal/schedule/workspace services with the WS layer.
+    let mcp_services = McpServices {
+        terminal_manager: Some(terminal_manager),
+        schedule_service: Some(schedule_service),
+        workspace_registry: Some(workspace_registry),
+        rocky_home: Some(rocky_home.to_path_buf()),
+        worktrees_root: None,
+    };
+    let mcp_router = build_mcp_router(rocky_home, agent_manager, provider, mcp_services);
     let app = build_router_with_mcp(ctx, mcp_router);
 
     match listener {
@@ -301,12 +321,13 @@ fn build_mcp_router(
     rocky_home: &std::path::Path,
     manager: AgentManager,
     provider: Arc<dyn AgentProvider>,
+    services: McpServices,
 ) -> Router {
     let mission = FileBackedMissionControlService::new(rocky_home);
     if let Err(err) = mission.initialize() {
         warn!(error = %err, "failed to initialize mission control store");
     }
-    let ctx = McpContext::with_provider(manager, mission, provider);
+    let ctx = McpContext::with_services(manager, mission, provider, services);
     rocky_mcp::mcp_router(ctx)
 }
 
@@ -327,6 +348,9 @@ fn build_session_dispatcher(
     agent_manager: AgentManager,
     provider: Arc<dyn AgentProvider>,
     daemon_read_ctx: DaemonReadContext,
+    terminal_manager: Arc<TerminalManager>,
+    schedule_service: Arc<Mutex<ScheduleService>>,
+    workspace_registry: Arc<Mutex<WorkspaceRegistry>>,
 ) -> SessionDispatcher {
     let mut dispatcher = SessionDispatcher::new();
 
@@ -341,22 +365,24 @@ fn build_session_dispatcher(
     // Agent lifecycle over the shared manager + live provider.
     agent::register(&mut dispatcher, Arc::new(agent_manager), provider);
 
-    // Workspace / git / worktree / terminal.
+    // Workspace / git / worktree / terminal. The workspace registry and
+    // terminal manager are the shared handles also wired into the MCP context,
+    // so MCP worktree/terminal tools and the WS handlers observe one state.
     let workspace_ctx = WorkspaceHandlerContext {
-        workspace_registry: Arc::new(Mutex::new(WorkspaceRegistry::load(rocky_home))),
+        workspace_registry: workspace_registry.clone(),
         project_registry: Arc::new(Mutex::new(ProjectRegistry::load(rocky_home))),
-        terminal_manager: Arc::new(TerminalManager::new()),
+        terminal_manager,
         rocky_home: rocky_home.to_path_buf(),
         worktrees_root: None,
     };
     workspace::register(&mut dispatcher, workspace_ctx);
 
-    // Chat / schedule / loop.
-    let schedule_service = ScheduleService::new(ScheduleStore::new(rocky_home.join("schedules")));
+    // Chat / schedule / loop. The schedule service is the shared handle also
+    // wired into the MCP context.
     let loop_service = LoopService::new(rocky_home);
     let chat_schedule_loop_ctx = ChatScheduleLoopContext {
         chat: ChatFileStore::new(rocky_home),
-        schedule: Arc::new(Mutex::new(schedule_service)),
+        schedule: schedule_service,
         loops: Arc::new(Mutex::new(loop_service)),
     };
     chat_schedule_loop::register(&mut dispatcher, chat_schedule_loop_ctx);

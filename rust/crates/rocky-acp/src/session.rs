@@ -236,6 +236,8 @@ impl AcpSession {
             autonomous: autonomous.clone(),
             current_mode_id: current_mode_id.clone(),
             tool_calls: HashMap::new(),
+            cwd: config.process.cwd.clone(),
+            terminals: HashMap::new(),
         };
         tokio::spawn(translator.run(inbound_rx));
 
@@ -539,6 +541,13 @@ struct Translator {
     autonomous: Arc<AtomicBool>,
     current_mode_id: Arc<std::sync::Mutex<Option<String>>>,
     tool_calls: HashMap<String, AcpToolSnapshot>,
+    /// Session cwd, used as the default working directory for client-served
+    /// `terminal/create` requests (matches `acp-agent.ts` `params.cwd ?? cwd`).
+    cwd: String,
+    /// Live client-served terminals keyed by terminal id. Populated by
+    /// `terminal/create` and consulted by `terminal/output` /
+    /// `terminal/wait_for_exit` / `terminal/kill` / `terminal/release`.
+    terminals: HashMap<String, AcpClientTerminal>,
 }
 
 impl Translator {
@@ -552,10 +561,20 @@ impl Translator {
                     // Other notifications (ext/*) are ignored, matching
                     // extNotification's log-only behavior.
                 }
-                Inbound::Request { id, method, params } => {
-                    if method == "session/request_permission" {
+                Inbound::Request { id, method, params } => match method.as_str() {
+                    "session/request_permission" => {
                         self.handle_permission_request(id, params).await;
-                    } else {
+                    }
+                    "fs/read_text_file" => self.handle_read_text_file(id, params).await,
+                    "fs/write_text_file" => self.handle_write_text_file(id, params).await,
+                    "terminal/create" => self.handle_terminal_create(id, params).await,
+                    "terminal/output" => self.handle_terminal_output(id, params).await,
+                    "terminal/wait_for_exit" => {
+                        self.handle_terminal_wait_for_exit(id, params).await;
+                    }
+                    "terminal/kill" => self.handle_terminal_kill(id, params).await,
+                    "terminal/release" => self.handle_terminal_release(id, params).await,
+                    _ => {
                         // Unknown agent->client request: reply with an error so
                         // the agent is not left waiting.
                         let _ = self
@@ -563,13 +582,308 @@ impl Translator {
                             .respond_error(id, -32601, "method not found")
                             .await;
                     }
-                }
+                },
             }
         }
     }
 
     fn emit(&self, event: AgentStreamEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    /// `fs/read_text_file` (acp-agent.ts:1752-1761). Reads `path` from disk;
+    /// when `line`/`limit` are given, returns the 1-based line slice joined by
+    /// `\n`. Errors map to a JSON-RPC error so the agent's disk fallback runs.
+    async fn handle_read_text_file(&self, id: Value, params: Value) {
+        let path = match params.get("path").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => {
+                let _ = self
+                    .transport
+                    .respond_error(id, -32602, "fs/read_text_file requires `path`")
+                    .await;
+                return;
+            }
+        };
+        let line = params.get("line").and_then(Value::as_u64);
+        let limit = params.get("limit").and_then(Value::as_u64);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(raw) => {
+                let content = if line.is_none() && limit.is_none() {
+                    raw
+                } else {
+                    let lines: Vec<&str> = raw.split('\n').collect();
+                    let start = line.unwrap_or(1).saturating_sub(1) as usize;
+                    let end = limit.map(|l| start + l as usize);
+                    let slice = match end {
+                        Some(end) => lines.get(start..end.min(lines.len())),
+                        None => lines.get(start..),
+                    }
+                    .unwrap_or(&[]);
+                    slice.join("\n")
+                };
+                let _ = self
+                    .transport
+                    .respond(id, json!({ "content": content }))
+                    .await;
+            }
+            Err(err) => {
+                let _ = self
+                    .transport
+                    .respond_error(id, -32000, &format!("fs/read_text_file failed: {err}"))
+                    .await;
+            }
+        }
+    }
+
+    /// `fs/write_text_file` (acp-agent.ts:1763-1767). Creates parent dirs and
+    /// writes `content` to `path`. Errors map to a JSON-RPC error (the agent's
+    /// write tool surfaces the message; there is no disk fallback on the agent
+    /// side, so this must genuinely succeed).
+    async fn handle_write_text_file(&self, id: Value, params: Value) {
+        let path = params.get("path").and_then(Value::as_str);
+        let content = params.get("content").and_then(Value::as_str);
+        let (Some(path), Some(content)) = (path, content) else {
+            let _ = self
+                .transport
+                .respond_error(id, -32602, "fs/write_text_file requires `path` and `content`")
+                .await;
+            return;
+        };
+        let result = async {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(path, content).await
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                let _ = self.transport.respond(id, json!({})).await;
+            }
+            Err(err) => {
+                let _ = self
+                    .transport
+                    .respond_error(id, -32000, &format!("fs/write_text_file failed: {err}"))
+                    .await;
+            }
+        }
+    }
+
+    /// `terminal/create` (acp-agent.ts:1769-1823). Spawns the command (wrapping
+    /// a shell when the command contains whitespace and no explicit args), pumps
+    /// stdout+stderr into a shared output buffer with byte-limit truncation, and
+    /// registers the live terminal for later output/wait/kill/release calls.
+    async fn handle_terminal_create(&mut self, id: Value, params: Value) {
+        let command = match params.get("command").and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None => {
+                let _ = self
+                    .transport
+                    .respond_error(id, -32602, "terminal/create requires `command`")
+                    .await;
+                return;
+            }
+        };
+        let args: Vec<String> = params
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.cwd.clone());
+        let output_byte_limit = params.get("outputByteLimit").and_then(Value::as_u64);
+
+        let mut env: HashMap<String, String> = HashMap::new();
+        if let Some(entries) = params.get("env").and_then(Value::as_array) {
+            for entry in entries {
+                if let (Some(name), Some(value)) = (
+                    entry.get("name").and_then(Value::as_str),
+                    entry.get("value").and_then(Value::as_str),
+                ) {
+                    env.insert(name.to_string(), value.to_string());
+                }
+            }
+        }
+
+        let (program, exec_args) = resolve_terminal_command(&command, &args);
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&exec_args)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = self
+                    .transport
+                    .respond_error(id, -32000, &format!("terminal/create failed to spawn: {err}"))
+                    .await;
+                return;
+            }
+        };
+
+        let terminal_id = format!(
+            "{}{}",
+            uuid_like_segment(),
+            uuid_like_segment()
+        );
+        let state = Arc::new(std::sync::Mutex::new(TerminalOutputState {
+            output: String::new(),
+            truncated: false,
+            output_byte_limit,
+            exit: None,
+        }));
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        if let Some(stdout) = stdout {
+            spawn_output_pump(stdout, state.clone());
+        }
+        if let Some(stderr) = stderr {
+            spawn_output_pump(stderr, state.clone());
+        }
+
+        // Wait task: records the exit status into the shared state and notifies
+        // any `terminal/wait_for_exit` waiters.
+        let (exit_tx, exit_rx) = tokio::sync::watch::channel(false);
+        let wait_state = state.clone();
+        let wait_handle = tokio::spawn(async move {
+            let status = child.wait().await;
+            let exit = match status {
+                Ok(status) => TerminalExitInfo {
+                    exit_code: status.code(),
+                    signal: terminal_exit_signal(&status),
+                },
+                Err(_) => TerminalExitInfo {
+                    exit_code: None,
+                    signal: None,
+                },
+            };
+            wait_state
+                .lock()
+                .expect("terminal output state poisoned")
+                .exit = Some(exit);
+            let _ = exit_tx.send(true);
+        });
+
+        self.terminals.insert(
+            terminal_id.clone(),
+            AcpClientTerminal {
+                state,
+                pid,
+                exit_rx,
+                wait_handle,
+            },
+        );
+
+        let _ = self
+            .transport
+            .respond(id, json!({ "terminalId": terminal_id }))
+            .await;
+    }
+
+    /// `terminal/output` (acp-agent.ts:1825-1832). Returns the buffered output,
+    /// truncation flag, and exit status (when the command has completed).
+    async fn handle_terminal_output(&self, id: Value, params: Value) {
+        let terminal_id = params.get("terminalId").and_then(Value::as_str);
+        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+            let _ = self
+                .transport
+                .respond_error(id, -32000, "Unknown terminal")
+                .await;
+            return;
+        };
+        let payload = {
+            let snapshot = terminal
+                .state
+                .lock()
+                .expect("terminal output state poisoned");
+            let mut payload = json!({
+                "output": snapshot.output,
+                "truncated": snapshot.truncated,
+            });
+            if let Some(exit) = &snapshot.exit {
+                payload["exitStatus"] = exit.to_value();
+            }
+            payload
+        };
+        let _ = self.transport.respond(id, payload).await;
+    }
+
+    /// `terminal/wait_for_exit` (acp-agent.ts:1834-1837). Blocks until the
+    /// child exits, then returns its exit status.
+    async fn handle_terminal_wait_for_exit(&self, id: Value, params: Value) {
+        let terminal_id = params.get("terminalId").and_then(Value::as_str);
+        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+            let _ = self
+                .transport
+                .respond_error(id, -32000, "Unknown terminal")
+                .await;
+            return;
+        };
+        let mut exit_rx = terminal.exit_rx.clone();
+        // Wait until the watch channel reports the exit has been recorded.
+        while !*exit_rx.borrow() {
+            if exit_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        let exit = terminal
+            .state
+            .lock()
+            .expect("terminal output state poisoned")
+            .exit
+            .clone();
+        let payload = exit
+            .map(|e| e.to_value())
+            .unwrap_or_else(|| json!({ "exitCode": null, "signal": null }));
+        let _ = self.transport.respond(id, payload).await;
+    }
+
+    /// `terminal/kill` (acp-agent.ts:1847-1853). Sends SIGTERM to the child if
+    /// it is still running; the terminal stays registered so the agent can read
+    /// final output and exit status afterward.
+    async fn handle_terminal_kill(&self, id: Value, params: Value) {
+        let terminal_id = params.get("terminalId").and_then(Value::as_str);
+        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+            let _ = self
+                .transport
+                .respond_error(id, -32000, "Unknown terminal")
+                .await;
+            return;
+        };
+        terminal.kill();
+        let _ = self.transport.respond(id, json!({})).await;
+    }
+
+    /// `terminal/release` (acp-agent.ts:1839-1845). Kills the child if running
+    /// and removes the terminal from the registry, freeing its resources.
+    async fn handle_terminal_release(&mut self, id: Value, params: Value) {
+        let terminal_id = params
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(terminal_id) = terminal_id {
+            if let Some(terminal) = self.terminals.remove(&terminal_id) {
+                terminal.kill();
+                terminal.wait_handle.abort();
+            }
+        }
+        let _ = self.transport.respond(id, json!({})).await;
     }
 
     fn wrap_timeline(&self, item: AgentTimelineItem) -> AgentStreamEvent {
@@ -1055,6 +1369,155 @@ fn chunk_text(update: &Value) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+// --- client-served terminal support -----------------------------------------
+
+/// Exit status of a client-served terminal child (`TerminalExitStatus`).
+#[derive(Debug, Clone)]
+struct TerminalExitInfo {
+    exit_code: Option<i32>,
+    signal: Option<String>,
+}
+
+impl TerminalExitInfo {
+    fn to_value(&self) -> Value {
+        json!({
+            "exitCode": self.exit_code,
+            "signal": self.signal,
+        })
+    }
+}
+
+/// Shared output buffer + exit slot for one client-served terminal. Mirrors the
+/// mutable `TerminalEntry` fields the TS ACP agent maintains (acp-agent.ts).
+struct TerminalOutputState {
+    output: String,
+    truncated: bool,
+    output_byte_limit: Option<u64>,
+    exit: Option<TerminalExitInfo>,
+}
+
+impl TerminalOutputState {
+    /// Append a chunk, truncating from the front when the byte limit is
+    /// exceeded (mirrors `appendTerminalOutput`, acp-agent.ts:2775-2785).
+    fn append(&mut self, chunk: &str) {
+        self.output.push_str(chunk);
+        let Some(limit) = self.output_byte_limit else {
+            return;
+        };
+        while self.output.len() as u64 > limit && !self.output.is_empty() {
+            // Drop the leading char, keeping a valid UTF-8 boundary.
+            let mut chars = self.output.chars();
+            chars.next();
+            self.output = chars.as_str().to_string();
+            self.truncated = true;
+        }
+    }
+}
+
+/// A live client-served terminal registered after `terminal/create`.
+struct AcpClientTerminal {
+    state: Arc<std::sync::Mutex<TerminalOutputState>>,
+    pid: Option<u32>,
+    /// Flips to `true` once the wait task records the exit status.
+    exit_rx: tokio::sync::watch::Receiver<bool>,
+    wait_handle: tokio::task::JoinHandle<()>,
+}
+
+impl AcpClientTerminal {
+    /// SIGTERM the child if it has not exited yet (best-effort, matching the TS
+    /// `child.kill("SIGTERM")` guarded by `!entry.exit`).
+    fn kill(&self) {
+        let already_exited = self
+            .state
+            .lock()
+            .expect("terminal output state poisoned")
+            .exit
+            .is_some();
+        if already_exited {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            #[cfg(unix)]
+            // SAFETY: kill(2) with a valid pid and SIGTERM has no memory effects.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            let _ = pid;
+        }
+    }
+}
+
+/// Spawn a task that pumps a child stdout/stderr pipe into the shared terminal
+/// output buffer.
+fn spawn_output_pump<R>(reader: R, state: Arc<std::sync::Mutex<TerminalOutputState>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    state
+                        .lock()
+                        .expect("terminal output state poisoned")
+                        .append(&chunk);
+                }
+            }
+        }
+    });
+}
+
+/// Extract the terminating signal name from an exit status, if any (unix only).
+#[cfg(unix)]
+fn terminal_exit_signal(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|s| s.to_string())
+}
+
+#[cfg(not(unix))]
+fn terminal_exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
+    None
+}
+
+/// Resolve a terminal command into `(program, args)`, mirroring
+/// `resolveTerminalCommand` (acp-agent.ts:138-152): explicit args win; a bare
+/// command with no whitespace runs directly; otherwise wrap in a shell.
+fn resolve_terminal_command(command: &str, args: &[String]) -> (String, Vec<String>) {
+    if !args.is_empty() {
+        return (command.to_string(), args.to_vec());
+    }
+    if !command.trim().contains(char::is_whitespace) {
+        return (command.to_string(), Vec::new());
+    }
+    #[cfg(windows)]
+    {
+        ("cmd.exe".to_string(), vec!["/c".to_string(), command.to_string()])
+    }
+    #[cfg(not(windows))]
+    {
+        ("/bin/sh".to_string(), vec!["-c".to_string(), command.to_string()])
+    }
+}
+
+/// Generate a short random-ish hex segment for terminal ids without pulling in a
+/// uuid dependency. Combines time and an atomic counter.
+fn uuid_like_segment() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}", nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 #[cfg(test)]

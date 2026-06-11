@@ -538,6 +538,233 @@ async fn router_post_handles_initialize() {
     assert_eq!(value["result"]["serverInfo"]["name"], rocky_mcp::SERVER_NAME);
 }
 
+// --- ported tool surface (terminal/schedule/worktree/provider/lifecycle) ----
+
+/// Build a harness whose MCP context carries live terminal + schedule +
+/// workspace services, mirroring the full daemon wiring (`with_services`).
+fn build_harness_with_services(
+    provider: Option<Arc<dyn AgentProvider>>,
+) -> (Harness, std::path::PathBuf) {
+    use rocky_mcp::McpServices;
+    use rocky_scheduling::{ScheduleService, ScheduleStore};
+    use rocky_terminal::TerminalManager;
+    use rocky_workspaces::WorkspaceRegistry;
+
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().to_path_buf();
+    let manager = AgentManager::new(home.path());
+    let mission = FileBackedMissionControlService::new(home.path());
+    mission.initialize().unwrap();
+    let services = McpServices {
+        terminal_manager: Some(Arc::new(TerminalManager::new())),
+        schedule_service: Some(Arc::new(Mutex::new(ScheduleService::new(ScheduleStore::new(
+            home.path().join("schedules"),
+        ))))),
+        workspace_registry: Some(Arc::new(Mutex::new(WorkspaceRegistry::load(home.path())))),
+        rocky_home: Some(home.path().to_path_buf()),
+        worktrees_root: None,
+    };
+    let provider = provider.unwrap_or_else(|| Arc::new(RecordingProvider::default()));
+    let ctx = McpContext::with_services(manager.clone(), mission, provider, services);
+    let server = McpServer::new(ctx);
+    (
+        Harness {
+            _home: home,
+            manager,
+            server,
+        },
+        home_path,
+    )
+}
+
+#[tokio::test]
+async fn tools_list_exposes_full_ported_surface() {
+    let (h, _home) = build_harness_with_services(None);
+    let body = json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" });
+    let response = h.server.handle_jsonrpc(body, None).await;
+    let tools = response["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    // Every tool the TS mcp-server registers (minus voice-only `speak`) must be
+    // present so the amaze coding-agent never hits `-32601 method not found`.
+    for expected in [
+        "kill_agent",
+        "update_agent",
+        "set_agent_mode",
+        "get_agent_activity",
+        "list_terminals",
+        "create_terminal",
+        "kill_terminal",
+        "capture_terminal",
+        "send_terminal_keys",
+        "create_schedule",
+        "create_heartbeat",
+        "list_schedules",
+        "inspect_schedule",
+        "pause_schedule",
+        "resume_schedule",
+        "delete_schedule",
+        "update_schedule",
+        "schedule_logs",
+        "list_providers",
+        "list_models",
+        "inspect_provider",
+        "list_worktrees",
+        "create_worktree",
+        "archive_worktree",
+    ] {
+        assert!(names.contains(&expected), "missing ported tool {expected}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_tools_not_wired_without_services() {
+    // The default `with_provider` harness has no terminal manager.
+    let h = build_harness(Some(Arc::new(RecordingProvider::default())));
+    let response = call(&h.server, "create_terminal", json!({ "cwd": "/tmp" }), None).await;
+    let error = error_of(&response);
+    assert_eq!(error["code"], rocky_mcp::error_codes::NOT_WIRED);
+}
+
+#[tokio::test]
+async fn terminal_create_capture_kill_cycle_when_wired() {
+    let (h, _home) = build_harness_with_services(None);
+    // Run a command that emits known output so capture is assertable.
+    let created = call(
+        &h.server,
+        "create_terminal",
+        json!({ "cwd": "/tmp", "name": "echo terminal" }),
+        None,
+    )
+    .await;
+    let created = result_of(&created);
+    let terminal_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["name"], "echo terminal");
+
+    // Drive a command through the pty and let it produce output.
+    let _ = call(
+        &h.server,
+        "send_terminal_keys",
+        json!({ "terminalId": terminal_id, "keys": "echo rocky-mcp-ok", "literal": true }),
+        None,
+    )
+    .await;
+    let _ = call(
+        &h.server,
+        "send_terminal_keys",
+        json!({ "terminalId": terminal_id, "keys": "Enter" }),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let captured = call(
+        &h.server,
+        "capture_terminal",
+        json!({ "terminalId": terminal_id }),
+        None,
+    )
+    .await;
+    let captured = result_of(&captured);
+    let joined = captured["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("rocky-mcp-ok"),
+        "expected echoed output in capture, got: {joined}"
+    );
+
+    // list_terminals sees the live terminal.
+    let listed = call(&h.server, "list_terminals", json!({ "all": true }), None).await;
+    let listed = result_of(&listed);
+    let ids: Vec<&str> = listed["terminals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .collect();
+    assert!(ids.contains(&terminal_id.as_str()));
+
+    // kill removes it.
+    let killed = call(
+        &h.server,
+        "kill_terminal",
+        json!({ "terminalId": terminal_id }),
+        None,
+    )
+    .await;
+    assert_eq!(result_of(&killed)["success"], true);
+}
+
+#[tokio::test]
+async fn schedule_create_list_inspect_delete_roundtrip() {
+    let (h, _home) = build_harness_with_services(None);
+    let created = call(
+        &h.server,
+        "create_schedule",
+        json!({
+            "prompt": "nightly sweep",
+            "cron": "0 0 * * *",
+            "provider": "amaze/some-model",
+            "cwd": "/tmp",
+            "name": "nightly",
+        }),
+        None,
+    )
+    .await;
+    let created = result_of(&created);
+    let schedule_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["name"], "nightly");
+    // Summary tools strip the run history.
+    assert!(created.get("runs").is_none());
+
+    let listed = call(&h.server, "list_schedules", json!({}), None).await;
+    let listed = result_of(&listed);
+    let ids: Vec<&str> = listed["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(ids.contains(&schedule_id.as_str()));
+
+    // inspect keeps the full record (runs present, even if empty).
+    let inspected = call(
+        &h.server,
+        "inspect_schedule",
+        json!({ "id": schedule_id }),
+        None,
+    )
+    .await;
+    assert!(result_of(&inspected).get("runs").is_some());
+
+    let deleted = call(&h.server, "delete_schedule", json!({ "id": schedule_id }), None).await;
+    assert_eq!(result_of(&deleted)["success"], true);
+}
+
+#[tokio::test]
+async fn create_schedule_rejects_invalid_duration() {
+    let (h, _home) = build_harness_with_services(None);
+    let response = call(
+        &h.server,
+        "create_schedule",
+        json!({
+            "prompt": "p",
+            "cron": "0 0 * * *",
+            "provider": "amaze",
+            "cwd": "/tmp",
+            "expiresIn": "not-a-duration",
+        }),
+        None,
+    )
+    .await;
+    let error = error_of(&response);
+    assert_eq!(error["code"], rocky_mcp::error_codes::INVALID_PARAMS);
+}
+
 // Keep AgentStatus import used (status enum serde shape relied on above).
 #[allow(dead_code)]
 fn _assert_status(_s: AgentStatus) {}
