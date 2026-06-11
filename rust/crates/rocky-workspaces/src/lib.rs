@@ -18,9 +18,9 @@ pub use git::{
 };
 pub use registry::{ProjectRegistry, RegistryError, WorkspaceRegistry};
 pub use worktree::{
-    archive_worktree, create_worktree, list_worktrees, normalize_workspace_id,
-    resolve_worktree_root, upsert_workspace_for_worktree, validate_branch_slug,
-    BranchSlugValidation, CreatedWorktree, WorktreeError, WorktreeInfo,
+    archive_worktree, create_worktree, derive_worktree_repo_root, list_worktrees,
+    normalize_workspace_id, resolve_worktree_root, upsert_workspace_for_worktree,
+    validate_branch_slug, BranchSlugValidation, CreatedWorktree, WorktreeError, WorktreeInfo,
 };
 
 // Re-export the record types so consumers construct registry inputs without a

@@ -66,10 +66,11 @@ use std::time::SystemTime;
 
 use rocky_terminal::{CreateTerminalOptions, TerminalManager};
 use rocky_workspaces::{
-    archive_worktree, create_worktree, current_branch, git_status_porcelain, is_inside_work_tree,
-    list_worktrees, normalize_workspace_id, resolve_worktree_root, run_git,
-    upsert_workspace_for_worktree, validate_branch_slug, PersistedProjectRecord,
-    PersistedWorkspaceRecord, ProjectKind, ProjectRegistry, WorkspaceRegistry,
+    archive_worktree, create_worktree, current_branch, derive_worktree_repo_root,
+    git_status_porcelain, is_inside_work_tree, list_worktrees, normalize_workspace_id,
+    resolve_worktree_root, run_git, upsert_workspace_for_worktree, validate_branch_slug,
+    PersistedProjectRecord, PersistedWorkspaceRecord, ProjectKind, ProjectRegistry,
+    WorkspaceRegistry,
 };
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -283,14 +284,33 @@ async fn handle_archive_workspace(
     let req_id = request_id(&msg);
     let workspace_id = opt_str(&msg, "workspaceId").unwrap_or_default();
 
-    let mut registry = ctx.workspace_registry.lock().map_err(poisoned)?;
-    let result: Result<String, String> = match registry.get(&workspace_id).cloned() {
+    // Snapshot the record, then release the lock before any async git/FS work.
+    let existing = {
+        let registry = ctx.workspace_registry.lock().map_err(poisoned)?;
+        registry.get(&workspace_id).cloned()
+    };
+
+    let result: Result<String, String> = match existing {
         None => Err(format!("Workspace not found: {workspace_id}")),
-        Some(existing) if existing.kind == "worktree" => {
-            Err("Use worktree archive for Rocky worktrees".to_string())
-        }
-        Some(_) => {
+        Some(existing) => {
+            // Worktree-kind workspaces need the git/FS teardown, not just a
+            // record flag. The UI "Remove project" path bulk-archives every
+            // workspace (worktrees included) via `archive_workspace_request`, so
+            // rejecting worktrees here surfaced as "Failed to remove some
+            // workspaces". Run the idempotent teardown (deriving the repo root
+            // from git, since this request carries no repoRoot) and then archive
+            // the record.
+            if existing.kind == "worktree" {
+                let worktree_path = PathBuf::from(&existing.cwd);
+                let repo_root = derive_worktree_repo_root(&worktree_path).await;
+                if let Err(err) =
+                    archive_worktree(repo_root.as_deref(), &worktree_path).await
+                {
+                    tracing::warn!(error = %err, workspace_id, "worktree teardown failed during archive_workspace; archiving record anyway");
+                }
+            }
             let archived_at = now_iso8601();
+            let mut registry = ctx.workspace_registry.lock().map_err(poisoned)?;
             registry
                 .archive(&workspace_id, &archived_at)
                 .map(|()| archived_at)
@@ -678,12 +698,22 @@ async fn handle_worktree_archive(
     let worktree_path = opt_str(&msg, "worktreePath");
     let repo_root = opt_str(&msg, "repoRoot");
 
-    let result: Result<(), Value> = match (worktree_path.as_deref(), repo_root.as_deref()) {
-        (Some(path), Some(root)) => archive_worktree(Path::new(root), Path::new(path))
-            .await
-            .map_err(|e| checkout_error("UNKNOWN", e.to_string())),
-        (None, _) => Err(checkout_error("UNKNOWN", "worktreePath is required")),
-        (_, None) => Err(checkout_error("UNKNOWN", "repoRoot is required")),
+    // The UI archives a worktree with only `worktreePath` (no `repoRoot`), so
+    // derive the repo root from git when the caller omits it. When neither the
+    // caller nor git can supply one (the worktree dir is already gone), the
+    // teardown still proceeds — the directory removal is a no-op and the
+    // registry record is archived below so the workspace leaves the sidebar.
+    let result: Result<(), Value> = match worktree_path.as_deref() {
+        Some(path) => {
+            let resolved_root = match repo_root.as_deref() {
+                Some(root) => Some(PathBuf::from(root)),
+                None => derive_worktree_repo_root(Path::new(path)).await,
+            };
+            archive_worktree(resolved_root.as_deref(), Path::new(path))
+                .await
+                .map_err(|e| checkout_error("UNKNOWN", e.to_string()))
+        }
+        None => Err(checkout_error("UNKNOWN", "worktreePath is required")),
     };
 
     // Whether or not the git/FS teardown succeeded, archive the workspace

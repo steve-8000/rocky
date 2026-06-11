@@ -467,12 +467,14 @@ async fn worktree_archive_removes_workspace_from_fetch_and_marks_record() {
         .iter()
         .any(|e| e["id"] == workspace_id.as_str()));
 
+    // The UI archives a worktree with ONLY worktreePath (no repoRoot); the
+    // handler must derive the repo root from git rather than failing with
+    // "repoRoot is required".
     let archived = dispatch(
         &dispatcher,
         json!({
             "type": "rocky_worktree_archive_request",
             "worktreePath": worktree_path,
-            "repoRoot": repo.path().to_string_lossy(),
             "requestId": "r-a",
         }),
     )
@@ -561,6 +563,84 @@ async fn worktree_archive_succeeds_when_admin_entry_already_gone() {
         .cloned()
         .expect("record still present");
     assert!(record.archived_at.is_some(), "archived_at must be set");
+}
+
+/// Regression: the UI "Remove project" path bulk-archives every workspace via
+/// `archive_workspace_request` (worktrees included, no repoRoot). The handler
+/// must tear the worktree down and archive its record instead of rejecting it
+/// with "Use worktree archive for Rocky worktrees" (which surfaced as "Failed
+/// to remove some workspaces").
+#[tokio::test]
+async fn archive_workspace_request_tears_down_worktree_kind() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (dispatcher, _term, registry) = build_dispatcher_with_registry(home.path());
+
+    let created = dispatch(
+        &dispatcher,
+        json!({
+            "type": "create_rocky_worktree_request",
+            "cwd": repo.path().to_string_lossy(),
+            "projectId": "proj-bulk",
+            "worktreeSlug": "feature/bulk",
+            "requestId": "r-c",
+        }),
+    )
+    .await;
+    assert_eq!(created["payload"]["error"], Value::Null);
+    let workspace_id = created["payload"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worktree_path = created["payload"]["workspace"]["workspaceDirectory"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(Path::new(&worktree_path).exists());
+
+    // The "Remove project" bulk path: archive_workspace_request for a worktree.
+    let archived = dispatch(
+        &dispatcher,
+        json!({
+            "type": "archive_workspace_request",
+            "workspaceId": workspace_id,
+            "requestId": "r-a",
+        }),
+    )
+    .await;
+    assert_eq!(archived["type"], "archive_workspace_response");
+    assert_eq!(
+        archived["payload"]["error"],
+        Value::Null,
+        "worktree-kind archive_workspace must not be rejected"
+    );
+    assert!(archived["payload"]["archivedAt"].is_string());
+
+    // The worktree directory is torn down and the record is archived.
+    assert!(
+        !Path::new(&worktree_path).exists(),
+        "worktree dir should be removed"
+    );
+    let record = registry
+        .lock()
+        .unwrap()
+        .get(&workspace_id)
+        .cloned()
+        .expect("record still present");
+    assert!(record.archived_at.is_some(), "archived_at must be set");
+
+    // Gone from fetch.
+    let after = dispatch(
+        &dispatcher,
+        json!({ "type": "fetch_workspaces_request", "requestId": "r-f" }),
+    )
+    .await;
+    assert!(after["payload"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["id"] != workspace_id.as_str()));
 }
 
 /// `workspace_setup_status_request` -> `workspace_setup_status_response` with a

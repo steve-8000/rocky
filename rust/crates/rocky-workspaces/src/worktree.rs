@@ -259,19 +259,63 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
 /// failure is intentionally swallowed so we fall through to removing the
 /// directory ourselves and pruning lazily. The only hard error is when the
 /// working-tree directory still exists on disk and cannot be deleted.
-pub async fn archive_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
+///
+/// `repo_root` is the directory the `git worktree` commands run in. When
+/// `None` (the caller could not determine it — e.g. the worktree directory is
+/// already gone) the git admin steps are skipped entirely and we just remove
+/// the directory, keeping the operation a no-op success.
+pub async fn archive_worktree(repo_root: Option<&Path>, path: &Path) -> Result<(), WorktreeError> {
     let path_str = path.to_string_lossy().into_owned();
 
-    // Best-effort `git worktree remove --force`; ignore failures (e.g. the
-    // admin entry is already gone, "is not a working tree").
-    let _ = git::run_git(repo_root, ["worktree", "remove", "--force", &path_str]).await;
+    if let Some(root) = repo_root {
+        // Best-effort `git worktree remove --force`; ignore failures (e.g. the
+        // admin entry is already gone, "is not a working tree").
+        let _ = git::run_git(root, ["worktree", "remove", "--force", &path_str]).await;
+    }
 
     // Ensure the working-tree directory is gone, retrying transient FS errors.
     remove_dir_with_retries(path).await?;
 
-    // Lazily prune stale admin entries; not critical if it fails.
-    let _ = git::run_git(repo_root, ["worktree", "prune"]).await;
+    if let Some(root) = repo_root {
+        // Lazily prune stale admin entries; not critical if it fails.
+        let _ = git::run_git(root, ["worktree", "prune"]).await;
+    }
     Ok(())
+}
+
+/// Derive the main repository root for a worktree by asking git for its
+/// common dir, mirroring TS `getGitCommonDir` + `resolveRepoRootFromGitCommonDir`
+/// (worktree.ts:742-823). Returns `None` when `path` is not in a git work tree
+/// (e.g. the directory is already gone).
+///
+/// `git rev-parse --git-common-dir` yields the shared `.git` directory; for a
+/// normal repo/worktree that is `<repoRoot>/.git`, so the repo root is its
+/// parent. For a bare repo the common dir is the repo dir itself.
+pub async fn derive_worktree_repo_root(path: &Path) -> Option<PathBuf> {
+    let out = git::run_git(path, ["rev-parse", "--git-common-dir"])
+        .await
+        .ok()?;
+    if !out.success() {
+        return None;
+    }
+    let raw = out.stdout.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // git may return a relative path (resolve against the worktree dir).
+    let common_dir = {
+        let candidate = Path::new(raw);
+        if candidate.is_absolute() {
+            normalize_path(candidate)
+        } else {
+            normalize_path(&path.join(candidate))
+        }
+    };
+    if common_dir.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        common_dir.parent().map(Path::to_path_buf)
+    } else {
+        Some(common_dir)
+    }
 }
 
 /// Remove `path` and its contents, retrying transient failures, mirroring the
@@ -511,7 +555,7 @@ mod tests {
         assert!(found.path.ends_with("feature-x"));
 
         // Archive removes it.
-        archive_worktree(&repo, &found.path).await.unwrap();
+        archive_worktree(Some(&repo), &found.path).await.unwrap();
         let after = list_worktrees(&repo).await.unwrap();
         assert!(after.iter().all(|w| w.branch.as_deref() != Some("feature-x")));
         assert!(!wt_path.exists());
@@ -537,11 +581,38 @@ mod tests {
         std::fs::remove_dir_all(repo.join(".git").join("worktrees")).ok();
 
         // Archive must still succeed (idempotent) and remove the directory.
-        archive_worktree(&repo, &wt_path).await.unwrap();
+        archive_worktree(Some(&repo), &wt_path).await.unwrap();
         assert!(!wt_path.exists());
 
-        // A second archive of an already-gone path is a no-op success.
-        archive_worktree(&repo, &wt_path).await.unwrap();
+        // A second archive of an already-gone path is a no-op success, even
+        // with no repo root (the worktree dir is already gone).
+        archive_worktree(None, &wt_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derive_worktree_repo_root_finds_main_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let wt_path = dir.path().join("worktrees").join("derive-x");
+        create_worktree(&repo, &wt_path, "derive-x", None)
+            .await
+            .unwrap();
+
+        // From inside the worktree, git's common dir resolves back to the main
+        // repo root (compare canonicalized to absorb /private symlinks on macOS).
+        let derived = derive_worktree_repo_root(&wt_path).await.unwrap();
+        assert_eq!(
+            derived.canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
+        );
+
+        // A path that is not a git work tree yields None.
+        let outside = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(derive_worktree_repo_root(&outside).await.is_none());
     }
 
     #[tokio::test]
