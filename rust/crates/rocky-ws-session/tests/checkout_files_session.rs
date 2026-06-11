@@ -331,10 +331,128 @@ async fn directory_suggestions_returns_subdirs() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert!(dirs.iter().any(|d| d.ends_with("/alpha")), "dirs: {dirs:?}");
-    assert!(dirs.iter().any(|d| d.ends_with("/beta")), "dirs: {dirs:?}");
+    // Workspace (cwd) suggestions are root-relative, matching TS relativePath.
+    assert!(dirs.iter().any(|d| d == "alpha"), "dirs: {dirs:?}");
+    assert!(dirs.iter().any(|d| d == "beta"), "dirs: {dirs:?}");
     // Files excluded by default (includeFiles defaults false).
-    assert!(!dirs.iter().any(|d| d.ends_with("/file.txt")));
+    assert!(!dirs.iter().any(|d| d == "file.txt"));
+}
+
+/// Serializes tests that mutate the process-global `HOME` env var so they do
+/// not clobber each other under the parallel test runner.
+static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn directory_suggestions_without_cwd_searches_home_recursively() {
+    // Regression: creating a new workspace searches local folders via
+    // directory_suggestions WITHOUT a cwd (project picker). The old Rust port
+    // only substring-filtered $HOME's immediate children, so nested folders
+    // (and ~/ path queries) returned nothing -> "local folders not found".
+    let _home_guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    // home/projects/rocky-app  and  home/top-rocky
+    std::fs::create_dir_all(home.path().join("projects/rocky-app")).unwrap();
+    std::fs::create_dir_all(home.path().join("top-rocky")).unwrap();
+    std::fs::create_dir_all(home.path().join("projects/other")).unwrap();
+    let dispatcher = build_dispatcher(home.path());
+    // The handler reads $HOME; point it at the temp dir for this test.
+    std::env::set_var("HOME", home.path());
+
+    let dirs_for = |resp: &serde_json::Value| -> Vec<String> {
+        resp["payload"]["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        // Bare term: recursive BFS finds the nested directory.
+        let resp = dispatch(
+            &dispatcher,
+            json!({ "type": "directory_suggestions_request", "query": "rocky-app", "requestId": "r1" }),
+        )
+        .await;
+        let dirs = dirs_for(&resp);
+        assert!(
+            dirs.iter().any(|d| d.ends_with("/projects/rocky-app")),
+            "bare-term recursive search missed nested dir: {dirs:?}"
+        );
+
+        // Substring term matches at multiple depths.
+        let resp = dispatch(
+            &dispatcher,
+            json!({ "type": "directory_suggestions_request", "query": "rocky", "requestId": "r2" }),
+        )
+        .await;
+        let dirs = dirs_for(&resp);
+        assert!(dirs.iter().any(|d| d.ends_with("/top-rocky")), "dirs: {dirs:?}");
+        assert!(dirs.iter().any(|d| d.ends_with("/projects/rocky-app")), "dirs: {dirs:?}");
+
+        // Rooted path query browses within the parent directory.
+        let resp = dispatch(
+            &dispatcher,
+            json!({ "type": "directory_suggestions_request", "query": "~/projects/ro", "requestId": "r3" }),
+        )
+        .await;
+        let dirs = dirs_for(&resp);
+        assert!(dirs.iter().any(|d| d.ends_with("/projects/rocky-app")), "dirs: {dirs:?}");
+        assert!(!dirs.iter().any(|d| d.ends_with("/projects/other")), "dirs: {dirs:?}");
+
+        // Empty query returns nothing (no full home listing).
+        let resp = dispatch(
+            &dispatcher,
+            json!({ "type": "directory_suggestions_request", "query": "", "requestId": "r4" }),
+        )
+        .await;
+        assert!(dirs_for(&resp).is_empty(), "empty query should yield no suggestions");
+    });
+}
+
+#[test]
+fn directory_suggestions_skips_tcc_protected_home_dirs() {
+    // Regression: a launchd-spawned daemon without Full Disk Access blocks
+    // indefinitely (0% CPU) when the home-tree scan touches TCC-protected dirs
+    // (Desktop/Documents/Downloads). The home-root scan must skip them (and
+    // heavy system trees) so the project-picker search never descends there.
+    let _home_guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("Documents/secret-rocky")).unwrap();
+    std::fs::create_dir_all(home.path().join("Library/rocky-cache")).unwrap();
+    std::fs::create_dir_all(home.path().join("projects/rocky-app")).unwrap();
+    let dispatcher = build_dispatcher(home.path());
+    std::env::set_var("HOME", home.path());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let resp = rt.block_on(dispatch(
+        &dispatcher,
+        json!({ "type": "directory_suggestions_request", "query": "rocky", "requestId": "r1" }),
+    ));
+    let dirs: Vec<String> = resp["payload"]["directories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    // The allowed project is found...
+    assert!(dirs.iter().any(|d| d.ends_with("/projects/rocky-app")), "dirs: {dirs:?}");
+    // ...but nothing under Documents/ or Library/ is ever surfaced.
+    assert!(
+        !dirs.iter().any(|d| d.contains("/Documents/")),
+        "TCC-protected Documents must be skipped: {dirs:?}"
+    );
+    assert!(
+        !dirs.iter().any(|d| d.contains("/Library/")),
+        "heavy Library tree must be skipped: {dirs:?}"
+    );
 }
 
 #[tokio::test]

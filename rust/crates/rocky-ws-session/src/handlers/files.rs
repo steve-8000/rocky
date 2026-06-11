@@ -561,19 +561,36 @@ async fn handle_directory_suggestions(
         .get("includeDirectories")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    // `normalizeLimit`: default 30, clamped to [1, 100].
     let limit = msg
         .get("limit")
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(30);
+        .unwrap_or(30)
+        .clamp(1, 100);
+    // `matchMode`: "fuzzy" (default) | "suffix"; only meaningful with a cwd.
+    let match_mode = match opt_str(&msg, "matchMode").as_deref() {
+        Some("suffix") => MatchMode::Suffix,
+        _ => MatchMode::Fuzzy,
+    };
 
-    match suggest_entries(
-        cwd.as_deref(),
-        &query,
-        include_files,
-        include_directories,
-        limit,
-    ) {
+    // The home-tree BFS does heavy synchronous filesystem I/O (up to 20k dirs),
+    // so run it on a blocking thread to avoid stalling the async executor.
+    let query = query.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        suggest_entries(
+            cwd.as_deref(),
+            &query,
+            include_files,
+            include_directories,
+            limit,
+            match_mode,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("directory suggestion task failed: {e}")));
+
+    match result {
         Ok(entries) => {
             let directories: Vec<Value> = entries
                 .iter()
@@ -590,50 +607,683 @@ async fn handle_directory_suggestions(
     }
 }
 
+/// Directory-suggestion match mode (`WorkspaceMatchMode`, directory-suggestions.ts:31).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    Fuzzy,
+    Suffix,
+}
+
+const SUGGEST_MAX_DEPTH: usize = 12;
+const SUGGEST_MAX_SCANNED: usize = 20_000;
+const NO_SEGMENT_INDEX: usize = usize::MAX;
+const NO_MATCH_OFFSET: usize = usize::MAX;
+const NO_FUZZY_SCORE: i64 = i64::MAX;
+const NO_WORKSPACE_MATCH_TIER: u8 = 5;
+/// Directory names skipped by the workspace search (directory-suggestions.ts:81-90).
+const WORKSPACE_IGNORED_DIRECTORY_NAMES: &[&str] = &[
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "out",
+    "coverage",
+    "vendor",
+    "__pycache__",
+];
+
+/// A directory/file suggestion ranked for sort order. Lower tuple sorts first
+/// (matches `compareRanked*` in directory-suggestions.ts).
+struct RankedEntry {
+    path: String,
+    kind: &'static str,
+    match_tier: u8,
+    segment_index: usize,
+    match_offset: usize,
+    fuzzy_score: i64,
+    depth: usize,
+}
+
+/// Parsed query split into a parent path component and a trailing search term
+/// (`QueryParts`, directory-suggestions.ts:40-44).
+struct QueryParts {
+    is_path_query: bool,
+    parent_part: String,
+    search_term: String,
+}
+
+/// `directory_suggestions` search. With a workspace `cwd` this scans inside that
+/// root (file-explorer suggestions); without one it scans under `$HOME` (the
+/// project-picker "new workspace" folder search). Mirrors session.ts:4728-4743.
 fn suggest_entries(
     cwd: Option<&str>,
     query: &str,
     include_files: bool,
     include_directories: bool,
     limit: usize,
+    match_mode: MatchMode,
 ) -> Result<Vec<Value>, String> {
-    // No cwd => suggest under $HOME (searchHomeDirectories fallback).
-    let base = match cwd {
-        Some(c) if !c.is_empty() => expand_user_path(c),
-        _ => std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?,
+    match cwd {
+        Some(c) if !c.is_empty() => {
+            search_workspace_entries(c, query, include_files, include_directories, limit, match_mode)
+        }
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+            let dirs = search_home_directories(&home, query, limit);
+            Ok(dirs
+                .into_iter()
+                .map(|p| json!({ "path": p, "kind": "directory" }))
+                .collect())
+        }
+    }
+}
+
+/// `searchHomeDirectories` (directory-suggestions.ts:92-127). Returns absolute
+/// directory paths under `$HOME`. Empty/invalid query => empty (NOT a full
+/// listing). Path-style queries (rooted with `~`, `/`, or `./`) browse within
+/// the parent directory; bare terms search recursively across the home tree.
+fn search_home_directories(home_dir: &str, query: &str, limit: usize) -> Vec<String> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let Some(home_root) = resolve_directory(Path::new(home_dir)) else {
+        return Vec::new();
     };
-    let base_path = PathBuf::from(&base);
-    let read_dir = std::fs::read_dir(&base_path).map_err(|e| e.to_string())?;
-    let needle = query.to_lowercase();
-    let mut entries: Vec<Value> = Vec::new();
-    for dirent in read_dir.flatten() {
-        let name = dirent.file_name().to_string_lossy().into_owned();
+    let Some(parts) = normalize_query_parts(query, &home_root, true) else {
+        return Vec::new();
+    };
+
+    let ranked = if parts.is_path_query {
+        let parent_path = lexical_join(&home_root, if parts.parent_part.is_empty() { "." } else { &parts.parent_part });
+        let Some(parent_root) = resolve_directory(&parent_path) else {
+            return Vec::new();
+        };
+        if !is_path_inside_root(&home_root, &parent_root) {
+            return Vec::new();
+        }
+        let needle = parts.search_term.to_lowercase();
+        list_child_directories(&parent_root, &home_root)
+            .into_iter()
+            .filter(|abs| {
+                needle.is_empty()
+                    || file_name_lower(abs).contains(&needle)
+            })
+            .map(|abs| rank_entry(&abs, &home_root, "directory", &needle, false))
+            .collect::<Vec<_>>()
+    } else {
+        search_across_tree(
+            &home_root,
+            &parts.search_term,
+            true,
+            false,
+            MatchMode::Fuzzy,
+            false,
+        )
+    };
+
+    dedupe_and_sort(ranked)
+        .into_iter()
+        .map(|e| e.path)
+        .take(limit)
+        .collect()
+}
+
+/// `searchWorkspaceEntries` (directory-suggestions.ts:139-185). Scans within a
+/// workspace root, honoring include flags and match mode.
+fn search_workspace_entries(
+    cwd: &str,
+    query: &str,
+    include_files: bool,
+    include_directories: bool,
+    limit: usize,
+    match_mode: MatchMode,
+) -> Result<Vec<Value>, String> {
+    if !include_directories && !include_files {
+        return Ok(Vec::new());
+    }
+    let expanded = expand_user_path(cwd);
+    let Some(ws_root) = resolve_directory(Path::new(&expanded)) else {
+        return Ok(Vec::new());
+    };
+    let Some(parts) = normalize_query_parts(query, &ws_root, false) else {
+        return Ok(Vec::new());
+    };
+
+    let ranked = if parts.is_path_query && match_mode != MatchMode::Suffix {
+        let parent_path = lexical_join(&ws_root, if parts.parent_part.is_empty() { "." } else { &parts.parent_part });
+        let Some(parent_root) = resolve_directory(&parent_path) else {
+            return Ok(Vec::new());
+        };
+        if !is_path_inside_root(&ws_root, &parent_root) {
+            return Ok(Vec::new());
+        }
+        let needle = parts.search_term.to_lowercase();
+        list_workspace_child_entries(&parent_root, &ws_root)
+            .into_iter()
+            .filter(|(_, kind)| {
+                (*kind == "directory" && include_directories) || (*kind == "file" && include_files)
+            })
+            .filter_map(|(abs, kind)| {
+                let entry = rank_entry(&abs, &ws_root, kind, &needle, true);
+                if !needle.is_empty() && entry.match_tier == NO_WORKSPACE_MATCH_TIER {
+                    None
+                } else {
+                    Some(entry)
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let search_term = if match_mode == MatchMode::Suffix {
+            [parts.parent_part.as_str(), parts.search_term.as_str()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/")
+        } else {
+            parts.search_term.clone()
+        };
+        search_across_tree(
+            &ws_root,
+            &search_term,
+            include_directories,
+            include_files,
+            match_mode,
+            true,
+        )
+    };
+
+    Ok(dedupe_and_sort(ranked)
+        .into_iter()
+        .take(limit)
+        .map(|e| json!({ "path": e.path, "kind": e.kind }))
+        .collect())
+}
+
+/// BFS across a root tree (`searchAcrossHomeTree` / `searchWorkspaceAcrossTree`,
+/// directory-suggestions.ts:232-288 / 334-418). `workspace` selects ignored-dir
+/// filtering, file inclusion, and relative-vs-absolute output paths.
+fn search_across_tree(
+    root: &Path,
+    search_term: &str,
+    include_directories: bool,
+    include_files: bool,
+    match_mode: MatchMode,
+    workspace: bool,
+) -> Vec<RankedEntry> {
+    let needle = search_term.to_lowercase();
+    let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::from([root.to_path_buf()]);
+    let mut ranked: Vec<RankedEntry> = Vec::new();
+    let mut scanned = 0usize;
+    let mut qi = 0usize;
+
+    while qi < queue.len() && scanned < SUGGEST_MAX_SCANNED {
+        let (dir, depth) = queue[qi].clone();
+        qi += 1;
+        let entries: Vec<(PathBuf, &'static str)> = if workspace {
+            list_workspace_child_entries(&dir, root)
+        } else {
+            list_child_directories(&dir, root)
+                .into_iter()
+                .map(|p| (p, "directory"))
+                .collect()
+        };
+
+        for (abs, kind) in entries {
+            scanned += 1;
+            if kind == "directory"
+                && !visited.contains(&abs)
+                && depth < SUGGEST_MAX_DEPTH
+                && scanned < SUGGEST_MAX_SCANNED
+            {
+                visited.insert(abs.clone());
+                queue.push((abs.clone(), depth + 1));
+            }
+            if kind == "directory" && !include_directories {
+                continue;
+            }
+            if kind == "file" && !include_files {
+                continue;
+            }
+            if match_mode == MatchMode::Suffix
+                && !workspace_entry_matches_suffix(&abs, root, search_term)
+            {
+                continue;
+            }
+            let relative_lower = normalize_relative_path(root, &abs).to_lowercase();
+            // Non-suffix home BFS only keeps entries whose relative path or name
+            // contains the needle (directory-suggestions.ts:268-271).
+            if match_mode != MatchMode::Suffix
+                && !needle.is_empty()
+                && !relative_lower.contains(&needle)
+                && !file_name_lower(&abs).contains(&needle)
+            {
+                continue;
+            }
+            let entry = rank_entry(&abs, root, kind, &needle, workspace);
+            if match_mode != MatchMode::Suffix
+                && !needle.is_empty()
+                && workspace
+                && entry.match_tier == NO_WORKSPACE_MATCH_TIER
+            {
+                continue;
+            }
+            ranked.push(entry);
+        }
+    }
+    ranked
+}
+
+/// `workspaceEntryMatchesSuffixQuery` (directory-suggestions.ts:420-446).
+fn workspace_entry_matches_suffix(abs: &Path, root: &Path, query: &str) -> bool {
+    let query_segments: Vec<String> = query
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if query_segments.is_empty() {
+        return false;
+    }
+    let path_segments: Vec<String> = normalize_relative_path(root, abs)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    if query_segments.len() > path_segments.len() {
+        return false;
+    }
+    let offset = path_segments.len() - query_segments.len();
+    query_segments
+        .iter()
+        .enumerate()
+        .all(|(i, seg)| path_segments[offset + i] == *seg)
+}
+
+/// `rankDirectory` / `rankWorkspaceEntry` (directory-suggestions.ts:523-635).
+/// Output `path` is the relative path for workspace entries, absolute for home.
+fn rank_entry(
+    abs: &Path,
+    root: &Path,
+    kind: &'static str,
+    search_lower: &str,
+    workspace: bool,
+) -> RankedEntry {
+    let relative = normalize_relative_path(root, abs);
+    let relative_lower = relative.to_lowercase();
+    let depth = if relative == "." {
+        0
+    } else {
+        relative.split('/').count()
+    };
+    let path = if workspace {
+        relative.clone()
+    } else {
+        abs.to_string_lossy().into_owned()
+    };
+    let no_match_tier = if workspace { NO_WORKSPACE_MATCH_TIER } else { 4 };
+    if search_lower.is_empty() {
+        return RankedEntry {
+            path,
+            kind,
+            match_tier: 3,
+            segment_index: NO_SEGMENT_INDEX,
+            match_offset: 0,
+            fuzzy_score: NO_FUZZY_SCORE,
+            depth,
+        };
+    }
+    let segments: Vec<&str> = if relative_lower == "." {
+        Vec::new()
+    } else {
+        relative_lower.split('/').collect()
+    };
+    let exact = segment_match_index(&segments, |s| s == search_lower);
+    let prefix = segment_match_index(&segments, |s| s.starts_with(search_lower));
+    let partial = segment_match_index(&segments, |s| s.contains(search_lower));
+    let match_offset = relative_lower.find(search_lower);
+    let basename = segments.last().copied().unwrap_or("");
+    let fuzzy = score_fuzzy_subsequence(search_lower, basename);
+
+    let mut match_tier = no_match_tier;
+    let mut segment_index = NO_SEGMENT_INDEX;
+    if let Some(i) = exact {
+        match_tier = 0;
+        segment_index = i;
+    } else if let Some(i) = prefix {
+        match_tier = 1;
+        segment_index = i;
+    } else if let Some(i) = partial {
+        match_tier = 2;
+        segment_index = i;
+    } else if relative_lower.starts_with(search_lower) {
+        match_tier = 3;
+    } else if workspace && fuzzy.is_some() {
+        match_tier = 4;
+    }
+
+    RankedEntry {
+        path,
+        kind,
+        match_tier,
+        segment_index,
+        match_offset: match_offset.unwrap_or(NO_MATCH_OFFSET),
+        fuzzy_score: fuzzy.unwrap_or(NO_FUZZY_SCORE),
+        depth,
+    }
+}
+
+/// `scoreFuzzySubsequence` (directory-suggestions.ts:637-671). `None` when the
+/// query is not a subsequence of the candidate.
+fn score_fuzzy_subsequence(query: &str, candidate: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.chars().collect();
+    let c: Vec<char> = candidate.chars().collect();
+    let mut qi = 0usize;
+    let mut first_match: i64 = -1;
+    let mut prev_match: i64 = -1;
+    let mut gap_score: i64 = 0;
+    let mut ci = 0usize;
+    while ci < c.len() && qi < q.len() {
+        if c[ci] == q[qi] {
+            if first_match == -1 {
+                first_match = ci as i64;
+            }
+            if prev_match >= 0 {
+                gap_score += ci as i64 - prev_match - 1;
+            }
+            prev_match = ci as i64;
+            qi += 1;
+        }
+        ci += 1;
+    }
+    if qi != q.len() || first_match == -1 {
+        return None;
+    }
+    Some(first_match + gap_score)
+}
+
+fn segment_match_index(segments: &[&str], predicate: impl Fn(&str) -> bool) -> Option<usize> {
+    segments
+        .iter()
+        .position(|s| !s.is_empty() && predicate(s))
+}
+
+/// `dedupeAndSort*` (directory-suggestions.ts:448-521). Keeps the best-ranked
+/// entry per (kind,path) and sorts by the tuple ordering.
+fn dedupe_and_sort(ranked: Vec<RankedEntry>) -> Vec<RankedEntry> {
+    use std::collections::HashMap;
+    let mut best: HashMap<String, RankedEntry> = HashMap::new();
+    for entry in ranked {
+        let key = format!("{}:{}", entry.kind, entry.path);
+        match best.get(&key) {
+            Some(existing) if compare_ranked(&entry, existing) >= 0 => {}
+            _ => {
+                best.insert(key, entry);
+            }
+        }
+    }
+    let mut out: Vec<RankedEntry> = best.into_values().collect();
+    out.sort_by(|a, b| match compare_ranked(a, b) {
+        n if n < 0 => std::cmp::Ordering::Less,
+        n if n > 0 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
+    out
+}
+
+/// Tuple comparison shared by both ranking variants
+/// (`compareRankedDirectories` / `compareRankedWorkspaceEntries`).
+fn compare_ranked(left: &RankedEntry, right: &RankedEntry) -> i32 {
+    if left.match_tier != right.match_tier {
+        return left.match_tier as i32 - right.match_tier as i32;
+    }
+    if left.segment_index != right.segment_index {
+        return if left.segment_index < right.segment_index { -1 } else { 1 };
+    }
+    if left.match_offset != right.match_offset {
+        return if left.match_offset < right.match_offset { -1 } else { 1 };
+    }
+    if left.fuzzy_score != right.fuzzy_score {
+        return if left.fuzzy_score < right.fuzzy_score { -1 } else { 1 };
+    }
+    if left.depth != right.depth {
+        return if left.depth < right.depth { -1 } else { 1 };
+    }
+    if left.kind != right.kind {
+        return if left.kind == "directory" { -1 } else { 1 };
+    }
+    left.path.cmp(&right.path) as i32
+}
+
+/// Directories directly under `$HOME` that the home-tree folder search skips.
+/// These are macOS TCC-protected (`Desktop`/`Documents`/`Downloads`) — a
+/// launchd-spawned daemon without Full Disk Access blocks indefinitely (at 0%
+/// CPU) on `read_dir`/`canonicalize` of them — plus large system trees that are
+/// never project roots. Skipping them keeps the project-picker search fast and
+/// deadlock-free regardless of the daemon's TCC grants.
+const HOME_ROOT_IGNORED_DIRECTORY_NAMES: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Library",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Applications",
+];
+
+/// List immediate child directories (and dir symlinks) of `dir`, skipping
+/// hidden names; absolute paths kept inside `root` (`listChildDirectories`).
+fn list_child_directories(dir: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    // Only the home root itself carries the TCC/heavy-dir skip list; nested
+    // directories with these names (e.g. a project's own `Documents/`) are fine.
+    let at_home_root = dir == root;
+    for d in rd.flatten() {
+        let name = d.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        let meta = match dirent.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let is_dir = meta.is_dir();
-        if is_dir && !include_directories {
+        if at_home_root && HOME_ROOT_IGNORED_DIRECTORY_NAMES.contains(&name.as_str()) {
             continue;
         }
-        if !is_dir && !include_files {
-            continue;
+        let Ok(ft) = d.file_type() else { continue };
+        let candidate = dir.join(&name);
+        if ft.is_dir() {
+            let resolved = lexical_normalize(&candidate);
+            if is_path_inside_root(root, &resolved) {
+                out.push(resolved);
+            }
+        } else if ft.is_symlink() {
+            if let Some(resolved) = resolve_directory(&candidate) {
+                if is_path_inside_root(root, &resolved) {
+                    out.push(resolved);
+                }
+            }
         }
-        if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-            continue;
-        }
-        let abs = base_path.join(&name);
-        entries.push(json!({
-            "path": abs.to_string_lossy(),
-            "kind": if is_dir { "directory" } else { "file" },
-        }));
     }
-    entries.sort_by(|a, b| a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
-    entries.truncate(limit);
-    Ok(entries)
+    out
+}
+
+/// List immediate child dirs/files of `dir`, skipping hidden + ignored names
+/// (`listWorkspaceChildEntries`).
+fn list_workspace_child_entries(dir: &Path, root: &Path) -> Vec<(PathBuf, &'static str)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for d in rd.flatten() {
+        let name = d.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || WORKSPACE_IGNORED_DIRECTORY_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(ft) = d.file_type() else { continue };
+        let candidate = dir.join(&name);
+        if ft.is_dir() {
+            let resolved = lexical_normalize(&candidate);
+            if is_path_inside_root(root, &resolved) {
+                out.push((resolved, "directory"));
+            }
+        } else if ft.is_file() {
+            let resolved = lexical_normalize(&candidate);
+            if is_path_inside_root(root, &resolved) {
+                out.push((resolved, "file"));
+            }
+        } else if ft.is_symlink() {
+            if let Ok(resolved) = std::fs::canonicalize(&candidate) {
+                if is_path_inside_root(root, &resolved) {
+                    if resolved.is_dir() {
+                        out.push((resolved, "directory"));
+                    } else if resolved.is_file() {
+                        out.push((resolved, "file"));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `normalizeQueryParts` / `normalizeWorkspaceQueryParts`
+/// (directory-suggestions.ts:702-797). `require_root` distinguishes the home
+/// variant (only `~`/`/`/`./`-rooted queries are treated as paths) from the
+/// workspace variant (any slash makes it a path query).
+fn normalize_query_parts(query: &str, root: &Path, require_root: bool) -> Option<QueryParts> {
+    let typed = query.trim().replace('\\', "/");
+    let mut normalized = typed.clone();
+    if normalized.is_empty() {
+        // Home variant: empty query is already filtered upstream; treat as None.
+        // Workspace variant: empty query browses the root (parent="", term="").
+        if require_root {
+            return None;
+        }
+        return Some(QueryParts {
+            is_path_query: true,
+            parent_part: String::new(),
+            search_term: String::new(),
+        });
+    }
+    let mut is_rooted = false;
+    if let Some(rest) = normalized.strip_prefix('~') {
+        is_rooted = true;
+        normalized = rest.strip_prefix('/').unwrap_or(rest).to_string();
+    }
+    if Path::new(&normalized).is_absolute() {
+        is_rooted = true;
+        let absolute = lexical_normalize(Path::new(&normalized));
+        if !is_path_inside_root(root, &absolute) {
+            return None;
+        }
+        normalized = normalize_relative_path(root, &absolute);
+    }
+    if normalized.starts_with("./") {
+        is_rooted = true;
+    }
+    normalized = collapse_slashes(normalized.trim_start_matches("./"));
+    if normalized.is_empty() {
+        if require_root {
+            if typed == "~" || typed == "~/" {
+                return Some(QueryParts {
+                    is_path_query: true,
+                    parent_part: String::new(),
+                    search_term: String::new(),
+                });
+            }
+            return None;
+        }
+        return Some(QueryParts {
+            is_path_query: true,
+            parent_part: String::new(),
+            search_term: String::new(),
+        });
+    }
+
+    let is_path_query = if require_root {
+        is_rooted && normalized.contains('/')
+    } else {
+        normalized.contains('/')
+    };
+    if !is_path_query {
+        return Some(QueryParts {
+            is_path_query: false,
+            parent_part: String::new(),
+            search_term: normalized,
+        });
+    }
+    let slash = normalized.rfind('/').unwrap();
+    Some(QueryParts {
+        is_path_query: true,
+        parent_part: normalized[..slash].to_string(),
+        search_term: normalized[slash + 1..].to_string(),
+    })
+}
+
+/// Collapse runs of `/` into a single separator (matches `replace(/\/{2,}/g, "/")`).
+fn collapse_slashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    for ch in s.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+/// Lexically join `rel` onto `base` and normalize.
+fn lexical_join(base: &Path, rel: &str) -> PathBuf {
+    lexical_normalize(&base.join(rel))
+}
+
+/// `resolveDirectory` (directory-suggestions.ts:799-810): realpath + must be dir.
+fn resolve_directory(p: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(p).ok()?;
+    if resolved.is_dir() {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+/// `isPathInsideRoot` (directory-suggestions.ts:697-700).
+fn is_path_inside_root(root: &Path, target: &Path) -> bool {
+    target == root || target.starts_with(root)
+}
+
+/// `normalizeRelativePath` (directory-suggestions.ts:689-695): `/`-joined
+/// relative path, or `.` when equal to root.
+fn normalize_relative_path(root: &Path, abs: &Path) -> String {
+    match abs.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => abs.to_string_lossy().into_owned(),
+    }
+}
+
+fn file_name_lower(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
