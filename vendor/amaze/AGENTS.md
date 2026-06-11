@@ -18,7 +18,7 @@ authority — guidance only.
 ## Mission Control routing
 
 - Default MUST delegate actively using the minimal roster. For non-trivial repository work, spawn **Builder** before implementation unless the entire change is a small single-file edit under ~30 lines or a direct answer/explanation. For independent areas, spawn multiple Builder tasks in parallel.
-- When the Default agent receives an unfamiliar task, a task that requires external/web/X research, or a task where repository facts are insufficient, dispatch **Resercher** first before planning implementation.
+- Default MUST dispatch **Resercher** before planning whenever a task touches anything outside settled in-repo facts. Default to research when in doubt — bias toward dispatching, not skipping. Mandatory triggers: any external library/framework/API/tool/SDK is involved; versions, release notes, changelogs, deprecations, or migration steps could matter; the request mentions "latest"/"current"/"recent" or otherwise depends on knowledge that may be stale; an error/symptom is unfamiliar; best-practice, comparison, or "how does X work" questions; or repository facts are insufficient or unconfirmed. Only skip research for changes fully determined by code already in this repo (local refactors, renames, in-repo bug fixes, config edits). When unsure whether a trigger applies, dispatch Resercher first.
 - Use **SRE** for runtime/ops/deployment validation instead of doing those checks inline.
 - Keep ownership boundaries simple: Default plans, decomposes, integrates, and verifies; Builder implements and investigates repository code; Resercher searches web/X/read and uses browser only when search/read are blocked or insufficient; SRE handles operations and deployments.
 
