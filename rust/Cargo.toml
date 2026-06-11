@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rockyd",
+    "crates/rocky-config",
+    "crates/rocky-store",
+    "crates/rocky-agent-domain",
+    "crates/rocky-acp",
+    "crates/rocky-acp-provider",
+    "crates/rocky-agents",
+    "crates/rocky-mission-control",
+    "crates/rocky-mcp",
+    "crates/rocky-workspaces",
+    "crates/rocky-terminal",
+    "crates/rocky-proxy",
+    "crates/rocky-scheduling",
+    "crates/rocky-relay",
+    "crates/rocky-notify",
+    "crates/rocky-ws-session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process"] }
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+libc = "0.2"
+bcrypt = "0.15"
+rand = "0.8"
+base64 = "0.22"
+futures-util = "0.3"
+http = "1"
+tempfile = "3"
+tower = "0.5"
+tokio-tungstenite = "0.24"

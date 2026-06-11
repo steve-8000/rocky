@@ -38,6 +38,14 @@ interface SupervisorOptions {
   } | null;
   onWorkerReady?: (message: { listen: string }) => Promise<void> | void;
   restartOnCrash?: boolean;
+  /**
+   * Max consecutive crash restarts allowed while the worker has never reported
+   * `rocky:ready` since its last spawn. Prevents infinite tight crash loops when
+   * the worker can never start (e.g. EADDRINUSE from an orphaned daemon).
+   */
+  maxPreReadyCrashRestarts?: number;
+  /** Delay before respawning after a pre-ready crash. */
+  preReadyCrashRestartDelayMs?: number;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
 }
@@ -98,6 +106,8 @@ function createSupervisorLogStream(options: SupervisorLogFileOptions | undefined
 
 export function runSupervisor(options: SupervisorOptions): void {
   const restartOnCrash = options.restartOnCrash ?? false;
+  const maxPreReadyCrashRestarts = options.maxPreReadyCrashRestarts ?? 5;
+  const preReadyCrashRestartDelayMs = options.preReadyCrashRestartDelayMs ?? 1000;
   const workerArgs = options.workerArgs ?? process.argv.slice(2);
   const workerEnv = options.workerEnv ?? process.env;
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
@@ -107,6 +117,9 @@ export function runSupervisor(options: SupervisorOptions): void {
   let restarting = false;
   let shuttingDown = false;
   let exiting = false;
+  let workerBecameReady = false;
+  let preReadyCrashCount = 0;
+  let pendingSpawnTimer: NodeJS.Timeout | null = null;
   const logStream = createSupervisorLogStream(options.logFile);
 
   const writeDurableChunk = (chunk: string | Buffer): void => {
@@ -157,6 +170,8 @@ export function runSupervisor(options: SupervisorOptions): void {
   };
 
   const spawnWorker = () => {
+    pendingSpawnTimer = null;
+    workerBecameReady = false;
     let workerEntry: string;
     try {
       // Resolve at spawn time so restarts pick up current filesystem state.
@@ -200,6 +215,8 @@ export function runSupervisor(options: SupervisorOptions): void {
       }
 
       if (lifecycleMessage.type === "rocky:ready") {
+        workerBecameReady = true;
+        preReadyCrashCount = 0;
         writeLifecycleLog("Worker ready", { listen: lifecycleMessage.listen });
         Promise.resolve(options.onWorkerReady?.({ listen: lifecycleMessage.listen })).catch(
           (error) => {
@@ -224,6 +241,7 @@ export function runSupervisor(options: SupervisorOptions): void {
     });
 
     child.on("close", (code, signal) => {
+      child = null;
       const exitDescriptor = describeExit(code, signal);
       writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
 
@@ -236,6 +254,22 @@ export function runSupervisor(options: SupervisorOptions): void {
       const crashed =
         restartOnCrash &&
         ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
+
+      if (crashed && !workerBecameReady) {
+        preReadyCrashCount += 1;
+        if (preReadyCrashCount > maxPreReadyCrashRestarts) {
+          log(
+            `Worker crashed ${preReadyCrashCount} times without ever becoming ready (${exitDescriptor}). Giving up.`,
+          );
+          exitSupervisor(typeof code === "number" ? code : 1);
+          return;
+        }
+        log(
+          `Worker crashed before becoming ready (${exitDescriptor}). Restarting in ${preReadyCrashRestartDelayMs}ms (attempt ${preReadyCrashCount}/${maxPreReadyCrashRestarts})...`,
+        );
+        pendingSpawnTimer = setTimeout(spawnWorker, preReadyCrashRestartDelayMs);
+        return;
+      }
 
       if (restarting || crashed) {
         restarting = false;
@@ -271,6 +305,10 @@ export function runSupervisor(options: SupervisorOptions): void {
     restarting = false;
     writeLifecycleLog("Supervisor shutdown requested", { reason });
     log(`${reason}. Stopping worker...`);
+    if (pendingSpawnTimer) {
+      clearTimeout(pendingSpawnTimer);
+      pendingSpawnTimer = null;
+    }
     if (!child) {
       exitSupervisor(0);
       return;

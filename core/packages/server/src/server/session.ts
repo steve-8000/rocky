@@ -218,6 +218,7 @@ import {
   parseMentionAgentIds,
 } from "./chat/chat-service.js";
 import { notifyChatMentions, prepareChatMentionFanout } from "./chat/chat-mentions.js";
+import { FileBackedMissionControlService, MissionControlError } from "./mission-control/service.js";
 import { LoopService } from "./loop-service.js";
 import { ScheduleService } from "./schedule/service.js";
 import { execCommand } from "../utils/spawn.js";
@@ -542,6 +543,7 @@ export interface SessionOptions {
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   chatService: FileBackedChatService;
+  missionControlService?: FileBackedMissionControlService;
   scheduleService: ScheduleService;
   loopService: LoopService;
   checkoutDiffManager: CheckoutDiffManager;
@@ -748,6 +750,7 @@ export class Session {
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly chatService: FileBackedChatService;
+  private readonly missionControlService: FileBackedMissionControlService | null;
   private readonly scheduleService: ScheduleService;
   private readonly loopService: LoopService;
   private readonly checkoutDiffManager: CheckoutDiffManager;
@@ -821,6 +824,7 @@ export class Session {
       projectRegistry,
       workspaceRegistry,
       chatService,
+      missionControlService,
       scheduleService,
       loopService,
       checkoutDiffManager,
@@ -869,6 +873,7 @@ export class Session {
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
     this.chatService = chatService;
+    this.missionControlService = missionControlService ?? null;
     this.scheduleService = scheduleService;
     this.loopService = loopService;
     this.checkoutDiffManager = checkoutDiffManager;
@@ -2135,6 +2140,18 @@ export class Session {
         return this.handleChatReadRequest(msg);
       case "chat/wait":
         return this.handleChatWaitRequest(msg);
+      case "mission.create.request":
+        return this.handleMissionCreateRequest(msg);
+      case "mission.list.request":
+        return this.handleMissionListRequest(msg);
+      case "mission.inspect.request":
+        return this.handleMissionInspectRequest(msg);
+      case "mission.update.request":
+        return this.handleMissionUpdateRequest(msg);
+      case "mission.task.create.request":
+        return this.handleMissionTaskCreateRequest(msg);
+      case "mission.task.update.request":
+        return this.handleMissionTaskUpdateRequest(msg);
       case "loop/run":
         return this.handleLoopRunRequest(msg);
       case "loop/list":
@@ -8836,6 +8853,191 @@ export class Session {
       });
     } catch (error) {
       this.emitChatRpcError(request, error);
+    }
+  }
+
+  private requireMissionControlService(): FileBackedMissionControlService {
+    if (!this.missionControlService) {
+      throw new MissionControlError(
+        "mission_control_unavailable",
+        "Mission Control service is not available",
+      );
+    }
+    return this.missionControlService;
+  }
+
+  private emitMissionRpcError(request: { requestId: string; type: string }, error: unknown): void {
+    const message = error instanceof Error ? error.message : "Mission Control request failed";
+    const code =
+      error instanceof MissionControlError ? error.code : "mission_control_request_failed";
+    this.sessionLogger.error(
+      { err: error, requestType: request.type },
+      "Mission Control request failed",
+    );
+    this.emit({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: request.type,
+        error: message,
+        code,
+      },
+    });
+  }
+
+  private async handleMissionCreateRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.create.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const mission = await missionControlService.createMission({
+        goal: request.goal,
+        status: request.status,
+        projectId: request.projectId,
+        workspaceId: request.workspaceId,
+        leaderAgentId: request.leaderAgentId,
+        chatRoomId: request.chatRoomId,
+        boardPath: request.boardPath,
+      });
+      this.emit({
+        type: "mission.create.response",
+        payload: {
+          requestId: request.requestId,
+          mission,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
+    }
+  }
+
+  private async handleMissionListRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.list.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const missions = await missionControlService.listMissions({
+        includeArchived: request.includeArchived,
+      });
+      this.emit({
+        type: "mission.list.response",
+        payload: {
+          requestId: request.requestId,
+          missions,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
+    }
+  }
+
+  private async handleMissionInspectRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.inspect.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const mission = await missionControlService.inspectMission(request.missionId);
+      this.emit({
+        type: "mission.inspect.response",
+        payload: {
+          requestId: request.requestId,
+          mission,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
+    }
+  }
+
+  private async handleMissionUpdateRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.update.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const mission = await missionControlService.updateMission({
+        missionId: request.missionId,
+        goal: request.goal,
+        status: request.status,
+        leaderAgentId: request.leaderAgentId,
+        chatRoomId: request.chatRoomId,
+        boardPath: request.boardPath,
+      });
+      this.emit({
+        type: "mission.update.response",
+        payload: {
+          requestId: request.requestId,
+          mission,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
+    }
+  }
+
+  private async handleMissionTaskCreateRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.task.create.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const { mission, task } = await missionControlService.createTask({
+        missionId: request.missionId,
+        title: request.title,
+        description: request.description,
+        acceptanceCriteria: request.acceptanceCriteria,
+        ownerAgentId: request.ownerAgentId,
+        rosterAgentId: request.rosterAgentId,
+        worktreePath: request.worktreePath,
+        isolation: request.isolation,
+        status: request.status,
+      });
+      this.emit({
+        type: "mission.task.create.response",
+        payload: {
+          requestId: request.requestId,
+          mission,
+          task,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
+    }
+  }
+
+  private async handleMissionTaskUpdateRequest(
+    request: Extract<SessionInboundMessage, { type: "mission.task.update.request" }>,
+  ): Promise<void> {
+    try {
+      const missionControlService = this.requireMissionControlService();
+      const { mission, task } = await missionControlService.updateTask({
+        missionId: request.missionId,
+        taskId: request.taskId,
+        title: request.title,
+        description: request.description,
+        acceptanceCriteria: request.acceptanceCriteria,
+        status: request.status,
+        ownerAgentId: request.ownerAgentId,
+        rosterAgentId: request.rosterAgentId,
+        worktreePath: request.worktreePath,
+        isolation: request.isolation,
+        result: request.result,
+        verification: request.verification,
+      });
+      this.emit({
+        type: "mission.task.update.response",
+        payload: {
+          requestId: request.requestId,
+          mission,
+          task,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.emitMissionRpcError(request, error);
     }
   }
 

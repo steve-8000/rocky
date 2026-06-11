@@ -13,6 +13,8 @@ const supervisorPath = fileURLToPath(new URL("./supervisor.ts", import.meta.url)
 async function runSupervisorFixture(options: {
   workerSource: string;
   restartOnCrash?: boolean;
+  maxPreReadyCrashRestarts?: number;
+  preReadyCrashRestartDelayMs?: number;
 }): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -39,6 +41,8 @@ async function runSupervisorFixture(options: {
         workerEnv: process.env,
         workerExecArgv: [],
         restartOnCrash: ${JSON.stringify(options.restartOnCrash ?? false)},
+        maxPreReadyCrashRestarts: ${JSON.stringify(options.maxPreReadyCrashRestarts ?? 5)},
+        preReadyCrashRestartDelayMs: ${JSON.stringify(options.preReadyCrashRestartDelayMs ?? 1000)},
         logFile: {
           path: ${JSON.stringify(logPath)},
           rotate: { maxSize: "1m", maxFiles: 2 },
@@ -186,4 +190,38 @@ describe("supervisor durable logging", () => {
       expect(result.log).toContain("Supervisor exiting");
     },
   );
+
+  test("gives up after repeated pre-ready crashes instead of looping forever", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: `
+        // Simulate a worker that can never start (e.g. EADDRINUSE).
+        process.exit(1);
+      `,
+      restartOnCrash: true,
+      maxPreReadyCrashRestarts: 2,
+      preReadyCrashRestartDelayMs: 10,
+    });
+
+    expect(result.code).toBe(1);
+    const restartLogs = result.log.match(/Worker crashed before becoming ready/g) ?? [];
+    expect(restartLogs.length).toBe(2);
+    expect(result.log).toContain("times without ever becoming ready");
+    expect(result.log).not.toContain("Restarting worker...");
+  });
+
+  test("resets the pre-ready crash budget once the worker reports ready", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: `
+        process.send({ type: "rocky:ready", listen: "127.0.0.1:0" });
+        setTimeout(() => process.exit(0), 50);
+      `,
+      restartOnCrash: true,
+      maxPreReadyCrashRestarts: 1,
+      preReadyCrashRestartDelayMs: 10,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.log).toContain('"msg":"Worker ready"');
+    expect(result.log).not.toContain("without ever becoming ready");
+  });
 });

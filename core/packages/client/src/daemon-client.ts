@@ -383,6 +383,30 @@ type ChatDeletePayload = Extract<
 type ChatPostPayload = Extract<SessionOutboundMessage, { type: "chat/post/response" }>["payload"];
 type ChatReadPayload = Extract<SessionOutboundMessage, { type: "chat/read/response" }>["payload"];
 type ChatWaitPayload = Extract<SessionOutboundMessage, { type: "chat/wait/response" }>["payload"];
+type MissionCreatePayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.create.response" }
+>["payload"];
+type MissionListPayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.list.response" }
+>["payload"];
+type MissionInspectPayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.inspect.response" }
+>["payload"];
+type MissionUpdatePayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.update.response" }
+>["payload"];
+type MissionTaskCreatePayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.task.create.response" }
+>["payload"];
+type MissionTaskUpdatePayload = Extract<
+  SessionOutboundMessage,
+  { type: "mission.task.update.response" }
+>["payload"];
 type LoopRunPayload = Extract<SessionOutboundMessage, { type: "loop/run/response" }>["payload"];
 type LoopListPayload = Extract<SessionOutboundMessage, { type: "loop/list/response" }>["payload"];
 type LoopInspectPayload = Extract<
@@ -524,6 +548,42 @@ export interface WaitForChatMessagesOptions {
   timeoutMs?: number;
   requestId?: string;
 }
+export type CreateMissionOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.create.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
+export type ListMissionsOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.list.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
+export type InspectMissionOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.inspect.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
+export type UpdateMissionOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.update.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
+export type CreateMissionTaskOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.task.create.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
+export type UpdateMissionTaskOptions = Omit<
+  Extract<SessionInboundMessage, { type: "mission.task.update.request" }>,
+  "type" | "requestId"
+> & {
+  requestId?: string;
+};
 export interface RunLoopOptions {
   prompt: string;
   cwd: string;
@@ -4011,6 +4071,104 @@ export class DaemonClient {
       },
       responseType: "chat/wait/response",
       timeout: (options.timeoutMs ?? 0) + 10000,
+    });
+  }
+
+  async createMission(options: CreateMissionOptions): Promise<MissionCreatePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.create.request",
+        goal: options.goal,
+        ...(options.projectId ? { projectId: options.projectId } : {}),
+        ...(options.workspaceId ? { workspaceId: options.workspaceId } : {}),
+        ...(options.leaderAgentId ? { leaderAgentId: options.leaderAgentId } : {}),
+        ...(options.chatRoomId ? { chatRoomId: options.chatRoomId } : {}),
+        ...(options.boardPath ? { boardPath: options.boardPath } : {}),
+        ...(options.status ? { status: options.status } : {}),
+      },
+      timeout: 10000,
+    });
+  }
+
+  async listMissions(options: ListMissionsOptions = {}): Promise<MissionListPayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.list.request",
+        ...(typeof options.includeArchived === "boolean"
+          ? { includeArchived: options.includeArchived }
+          : {}),
+      },
+      timeout: 10000,
+    });
+  }
+
+  async inspectMission(options: InspectMissionOptions): Promise<MissionInspectPayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.inspect.request",
+        missionId: options.missionId,
+      },
+      timeout: 10000,
+    });
+  }
+
+  async updateMission(options: UpdateMissionOptions): Promise<MissionUpdatePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.update.request",
+        missionId: options.missionId,
+        ...(options.goal ? { goal: options.goal } : {}),
+        ...(options.status ? { status: options.status } : {}),
+        ...(options.leaderAgentId !== undefined ? { leaderAgentId: options.leaderAgentId } : {}),
+        ...(options.chatRoomId !== undefined ? { chatRoomId: options.chatRoomId } : {}),
+        ...(options.boardPath !== undefined ? { boardPath: options.boardPath } : {}),
+      },
+      timeout: 10000,
+    });
+  }
+
+  async createMissionTask(options: CreateMissionTaskOptions): Promise<MissionTaskCreatePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.task.create.request",
+        missionId: options.missionId,
+        title: options.title,
+        ...(options.description ? { description: options.description } : {}),
+        ...(options.acceptanceCriteria ? { acceptanceCriteria: options.acceptanceCriteria } : {}),
+        ...(options.ownerAgentId ? { ownerAgentId: options.ownerAgentId } : {}),
+        ...(options.rosterAgentId ? { rosterAgentId: options.rosterAgentId } : {}),
+        ...(options.worktreePath ? { worktreePath: options.worktreePath } : {}),
+        ...(options.isolation ? { isolation: options.isolation } : {}),
+        ...(options.status ? { status: options.status } : {}),
+      },
+      timeout: 10000,
+    });
+  }
+
+  async updateMissionTask(options: UpdateMissionTaskOptions): Promise<MissionTaskUpdatePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "mission.task.update.request",
+        missionId: options.missionId,
+        taskId: options.taskId,
+        ...(options.title ? { title: options.title } : {}),
+        ...(options.description !== undefined ? { description: options.description } : {}),
+        ...(options.acceptanceCriteria ? { acceptanceCriteria: options.acceptanceCriteria } : {}),
+        ...(options.status ? { status: options.status } : {}),
+        ...(options.ownerAgentId !== undefined ? { ownerAgentId: options.ownerAgentId } : {}),
+        ...(options.rosterAgentId !== undefined ? { rosterAgentId: options.rosterAgentId } : {}),
+        ...(options.worktreePath !== undefined ? { worktreePath: options.worktreePath } : {}),
+        ...(options.isolation ? { isolation: options.isolation } : {}),
+        ...(options.result !== undefined ? { result: options.result } : {}),
+        ...(options.verification ? { verification: options.verification } : {}),
+      },
+      timeout: 10000,
     });
   }
 

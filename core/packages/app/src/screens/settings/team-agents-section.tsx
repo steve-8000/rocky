@@ -66,13 +66,7 @@ export function draftToAgent(draft: TeamAgentDraft): TeamAgent {
   };
 }
 
-function FormField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function FormField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <View style={styles.field}>
       <Text style={styles.fieldLabel}>{label}</Text>
@@ -80,7 +74,6 @@ function FormField({
     </View>
   );
 }
-
 
 function SelectField({
   label,
@@ -166,7 +159,9 @@ function TeamAgentEditorSheet({
   );
 
   const providerOptions = useMemo<ComboboxOption[]>(() => {
-    const ready = (entries ?? []).filter((entry) => entry.enabled && entry.status !== "unavailable");
+    const ready = (entries ?? []).filter(
+      (entry) => entry.enabled && entry.status !== "unavailable",
+    );
     return ready.map((entry) => ({
       id: entry.provider,
       label: entry.label ?? entry.provider,
@@ -221,7 +216,13 @@ function TeamAgentEditorSheet({
     modeOptions.find((option) => option.id === draft.approvalPolicy)?.label ?? draft.approvalPolicy;
 
   const handleSelectProvider = useCallback((id: string) => {
-    setDraft((prev) => ({ ...prev, provider: id, model: "", thinkingOptionId: "", approvalPolicy: "" }));
+    setDraft((prev) => ({
+      ...prev,
+      provider: id,
+      model: "",
+      thinkingOptionId: "",
+      approvalPolicy: "",
+    }));
   }, []);
   const handleSelectModel = useCallback((id: string) => {
     setDraft((prev) => ({ ...prev, model: id, thinkingOptionId: "" }));
@@ -242,10 +243,7 @@ function TeamAgentEditorSheet({
 
   const canSave = draft.name.trim().length > 0 && draft.provider.trim().length > 0;
   const inputStyle = useMemo(
-    () => [
-      styles.input,
-      { color: theme.colors.foreground, borderColor: theme.colors.border },
-    ],
+    () => [styles.input, { color: theme.colors.foreground, borderColor: theme.colors.border }],
     [theme.colors.border, theme.colors.foreground],
   );
   const textAreaStyle = useMemo(() => [...inputStyle, styles.textArea], [inputStyle]);
@@ -342,8 +340,62 @@ function TeamAgentEditorSheet({
   );
 }
 
-export function TeamAgentsSection({ serverId }: { serverId: string }) {
+interface TeamAgentRowProps {
+  agent: TeamAgent;
+  onToggleEnabled: (agent: TeamAgent, enabled: boolean) => void;
+  onEdit: (agent: TeamAgent) => void;
+  onRemove: (agent: TeamAgent) => void;
+}
+
+function TeamAgentRow({ agent, onToggleEnabled, onEdit, onRemove }: TeamAgentRowProps) {
   const { theme } = useUnistyles();
+  const handleToggleEnabled = useCallback(
+    (enabled: boolean) => {
+      onToggleEnabled(agent, enabled);
+    },
+    [agent, onToggleEnabled],
+  );
+  const handleEdit = useCallback(() => {
+    onEdit(agent);
+  }, [agent, onEdit]);
+  const handleRemove = useCallback(() => {
+    onRemove(agent);
+  }, [agent, onRemove]);
+
+  return (
+    <View key={agent.id} style={styles.agentRow} testID={`team-agent-row-${agent.id}`}>
+      <Bot size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+      <View style={styles.agentInfo}>
+        <Text style={styles.agentName} numberOfLines={1}>
+          {agent.name}
+        </Text>
+        <Text style={styles.agentMeta} numberOfLines={1}>
+          {[agent.role, agent.provider, agent.model, agent.approvalPolicy]
+            .filter(Boolean)
+            .join(" · ")}
+        </Text>
+      </View>
+      <Switch
+        value={agent.enabled !== false}
+        onValueChange={handleToggleEnabled}
+        accessibilityLabel={`Enable ${agent.name}`}
+      />
+      <Button variant="ghost" size="xs" onPress={handleEdit} testID={`team-agent-edit-${agent.id}`}>
+        <Pencil size={14} color={theme.colors.foregroundMuted} />
+      </Button>
+      <Button
+        variant="ghost"
+        size="xs"
+        onPress={handleRemove}
+        testID={`team-agent-remove-${agent.id}`}
+      >
+        <Trash2 size={14} color={theme.colors.foregroundMuted} />
+      </Button>
+    </View>
+  );
+}
+
+export function TeamAgentsSection({ serverId }: { serverId: string }) {
   const isConnected = useHostRuntimeIsConnected(serverId);
   const { config, patchConfig } = useDaemonConfig(serverId);
   const [editorDraft, setEditorDraft] = useState<TeamAgentDraft | null>(null);
@@ -391,9 +443,7 @@ export function TeamAgentsSection({ serverId }: { serverId: string }) {
   const handleToggleEnabled = useCallback(
     (agent: TeamAgent, enabled: boolean) => {
       void persistAgents(
-        agents.map((existing) =>
-          existing.id === agent.id ? { ...existing, enabled } : existing,
-        ),
+        agents.map((existing) => (existing.id === agent.id ? { ...existing, enabled } : existing)),
       );
     },
     [agents, persistAgents],
@@ -415,8 +465,8 @@ export function TeamAgentsSection({ serverId }: { serverId: string }) {
           <View style={settingsStyles.rowContent}>
             <Text style={settingsStyles.rowTitle}>Team agents</Text>
             <Text style={settingsStyles.rowHint}>
-              Named agent presets — role, provider, model, and system prompt — used by Team
-              missions and quick launches
+              Named agent presets — role, provider, model, and system prompt — used by Team missions
+              and quick launches
             </Text>
           </View>
           <Button
@@ -437,45 +487,13 @@ export function TeamAgentsSection({ serverId }: { serverId: string }) {
           </View>
         ) : (
           agents.map((agent) => (
-            <View key={agent.id} style={styles.agentRow} testID={`team-agent-row-${agent.id}`}>
-              <Bot size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
-              <View style={styles.agentInfo}>
-                <Text style={styles.agentName} numberOfLines={1}>
-                  {agent.name}
-                </Text>
-                <Text style={styles.agentMeta} numberOfLines={1}>
-                  {[
-                    agent.role,
-                    agent.provider,
-                    agent.model,
-                    agent.approvalPolicy,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </Text>
-              </View>
-              <Switch
-                value={agent.enabled !== false}
-                onValueChange={(enabled) => handleToggleEnabled(agent, enabled)}
-                accessibilityLabel={`Enable ${agent.name}`}
-              />
-              <Button
-                variant="ghost"
-                size="xs"
-                onPress={() => handleEdit(agent)}
-                testID={`team-agent-edit-${agent.id}`}
-              >
-                <Pencil size={14} color={theme.colors.foregroundMuted} />
-              </Button>
-              <Button
-                variant="ghost"
-                size="xs"
-                onPress={() => handleRemove(agent)}
-                testID={`team-agent-remove-${agent.id}`}
-              >
-                <Trash2 size={14} color={theme.colors.foregroundMuted} />
-              </Button>
-            </View>
+            <TeamAgentRow
+              key={agent.id}
+              agent={agent}
+              onToggleEnabled={handleToggleEnabled}
+              onEdit={handleEdit}
+              onRemove={handleRemove}
+            />
           ))
         )}
       </View>

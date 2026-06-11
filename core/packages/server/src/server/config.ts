@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveRockyNodeEnv } from "./rocky-env.js";
 import { z } from "zod";
 import { expandTilde } from "../utils/path.js";
@@ -17,6 +19,7 @@ import type {
 } from "./agent/provider-launch-config.js";
 import { ProviderOverrideSchema } from "./agent/provider-launch-config.js";
 import { AgentProviderSchema } from "@getrocky/protocol/provider-manifest";
+import type { TeamAgent } from "@getrocky/protocol/messages";
 import { hashDaemonPassword } from "./auth.js";
 import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
@@ -24,6 +27,7 @@ import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostn
 const DEFAULT_PORT = 7767;
 const DEFAULT_RELAY_ENDPOINT = "relay.invalid:443";
 const DEFAULT_APP_BASE_URL = "https://rocky.clab.one";
+const WEB_UI_ENV_KEYS = ["ROCKY_WEB_UI_DIR", "WEB_UI_DIST"] as const;
 
 function parseBooleanEnv(value: string | undefined): boolean | undefined {
   if (value === undefined) {
@@ -317,15 +321,62 @@ function resolveAppendSystemPrompt(persisted: ReturnType<typeof loadPersistedCon
   return persisted.daemon?.appendSystemPrompt ?? "";
 }
 
-function resolveTeamAgents(
-  persisted: ReturnType<typeof loadPersistedConfig>,
-): import("@getrocky/protocol/messages").TeamAgent[] {
-  return (persisted.daemon?.teamAgents ?? []).map((agent) => ({
-    ...agent,
-    role: agent.role ?? "",
-    approvalPolicy: agent.approvalPolicy?.trim() || undefined,
-    enabled: agent.enabled ?? true,
-  }));
+function resolveTeamAgents(persisted: ReturnType<typeof loadPersistedConfig>): TeamAgent[] {
+  const agents: TeamAgent[] = [];
+
+  for (const agent of persisted.daemon?.teamAgents ?? []) {
+    agents.push({
+      ...agent,
+      role: agent.role ?? "",
+      approvalPolicy: agent.approvalPolicy?.trim() || undefined,
+      enabled: agent.enabled ?? true,
+    });
+  }
+
+  return agents;
+}
+
+function resolveStaticDir(rockyHome: string, env: NodeJS.ProcessEnv): string {
+  const configuredStaticDir = env.ROCKY_STATIC_DIR?.trim();
+  if (!configuredStaticDir) {
+    return path.join(rockyHome, "public");
+  }
+  const expanded = expandTilde(configuredStaticDir);
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(rockyHome, expanded);
+}
+
+function normalizeDirectoryPath(value: string): string {
+  const expanded = expandTilde(value.trim());
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(expanded);
+}
+
+function resolveExplicitWebUiDir(env: NodeJS.ProcessEnv): string | null {
+  for (const key of WEB_UI_ENV_KEYS) {
+    const configured = env[key]?.trim();
+    if (!configured) {
+      continue;
+    }
+    const webUiDir = normalizeDirectoryPath(configured);
+    const indexPath = path.join(webUiDir, "index.html");
+    if (!existsSync(indexPath)) {
+      throw new Error(`Rocky WebUI bundle missing at ${webUiDir}. Run: npm run build:webui`);
+    }
+    return webUiDir;
+  }
+  return null;
+}
+
+function resolveBundledWebUiDir(): string | undefined {
+  const currentDir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(currentDir, "../../../app/dist"),
+    path.resolve(currentDir, "../../../../app/dist"),
+  ];
+  return candidates.find((candidate) => existsSync(path.join(candidate, "index.html")));
+}
+
+function resolveWebUiDir(env: NodeJS.ProcessEnv): string | undefined {
+  return resolveExplicitWebUiDir(env) ?? resolveBundledWebUiDir();
 }
 
 function resolveStaticLoadConfigSettings(
@@ -403,7 +454,8 @@ export function loadConfig(
     mcpDebug: env.MCP_DEBUG === "1",
     isDev: resolveRockyNodeEnv(env) === "development",
     agentStoragePath: path.join(rockyHome, "agents"),
-    staticDir: "public",
+    staticDir: resolveStaticDir(rockyHome, env),
+    webUiDir: resolveWebUiDir(env),
     agentClients: {},
     relayEnabled: relay.enabled,
     relayEndpoint: relay.endpoint,

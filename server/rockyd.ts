@@ -1,85 +1,54 @@
+#!/usr/bin/env node
 /**
- * rockyd — the single Rocky server runtime.
+ * Compatibility wrapper for the canonical supervised Rocky daemon.
  *
- * ONE Node process, ONE port (:7767), ONE UI:
- *   - Rocky daemon core (in-process library call) — agents, workspaces,
- *     worktrees, models, attachments, terminals, schedules, MCP, relay.
- *   - Rocky WebUI (Expo SPA) served at the daemon root, so http://host:7767
- *     is the UI and ws://host:7767 is the protocol — same origin, no extra
- *     server, no CORS hop.
- *
- * Orchestrator mode is native: the bundled
- * `rocky-orchestrate` skill drives Leader/Teammate orchestration over the
- * daemon's own MCP tools (chat room = mailbox, TEAM_BOARD.md = task board,
- * worktrees = teammate isolation, permission queue = per-agent dialogs).
- *
- * The vendored amaze runtime is the primary agent provider, registered as an
- * ACP provider in ~/.rocky/config.json (written by setup.sh). It runs as a
- * short-lived CLI per agent session — by design, not a server.
- *
- * Run via scripts/rockyd.sh.
+ * scripts/rockyd.sh is the production launch path. This file remains only so
+ * older launchd plists or manual `node server/rockyd.ts` invocations still route
+ * through the same supervisor/worker path instead of starting a second direct
+ * daemon implementation.
  */
-
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import {
-  createRockyDaemon,
-  loadConfig,
-  resolveRockyHome,
-} from "../core/packages/server/dist/server/server/exports.js";
-import { createRootLogger } from "../core/packages/server/dist/server/server/logger.js";
-
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const WEB_UI_DIST = path.join(ROOT, "core", "packages", "app", "dist");
+const CORE = path.join(ROOT, "core");
+const WEB_UI_DIST = path.join(CORE, "packages", "app", "dist");
+const DIST_ENTRY = path.join(
+  CORE,
+  "packages",
+  "server",
+  "dist",
+  "scripts",
+  "supervisor-entrypoint.js",
+);
+const SRC_ENTRY = path.join(CORE, "packages", "server", "scripts", "supervisor-entrypoint.ts");
 
 process.title = "rockyd";
+process.env.ROCKY_HOME ??= path.join(process.env.HOME ?? "~", ".rocky");
+process.env.ROCKY_STATIC_DIR ??= path.join(process.env.ROCKY_HOME, "public");
+process.env.ROCKY_WEB_UI_DIR ??= WEB_UI_DIST;
 
-async function main() {
-  process.env.ROCKY_HOME ??= path.join(process.env.HOME ?? "~", ".rocky");
-
-  const rockyHome = resolveRockyHome(process.env);
-  const config = loadConfig(rockyHome);
-
-  const staticDir = path.join(rockyHome, "public");
-  mkdirSync(staticDir, { recursive: true });
-  config.staticDir = staticDir;
-
-  if (!existsSync(path.join(WEB_UI_DIST, "index.html"))) {
-    throw new Error(`Rocky WebUI bundle missing at ${WEB_UI_DIST}. Run: npm run build:webui`);
-  }
-  config.webUiDir = WEB_UI_DIST;
-
-  const logger = createRootLogger({ log: config.log }, { rockyHome, file: true });
-  const daemon = await createRockyDaemon(config, logger);
-  await daemon.start();
-
-  const listen = daemon.getListenTarget();
-  const listenLabel =
-    listen?.type === "tcp" ? `${listen.host}:${listen.port}` : (listen?.path ?? "?");
-  console.log(`[rockyd] up — UI + API + WS on http://${listenLabel} (home ${rockyHome})`);
-
-  let shuttingDown = false;
-  const shutdown = async (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`[rockyd] ${signal} — shutting down`);
-    const force = setTimeout(() => process.exit(1), 10_000);
-    try {
-      await daemon.stop();
-      clearTimeout(force);
-      process.exit(0);
-    } catch {
-      clearTimeout(force);
-      process.exit(1);
-    }
-  };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+if (!existsSync(path.join(process.env.ROCKY_WEB_UI_DIR, "index.html"))) {
+  throw new Error(
+    `Rocky WebUI bundle missing at ${process.env.ROCKY_WEB_UI_DIR}. Run: npm run build:webui`,
+  );
 }
 
-main().catch((err) => {
-  console.error("[rockyd] fatal:", err);
-  process.exit(1);
+const entry = existsSync(DIST_ENTRY) ? DIST_ENTRY : SRC_ENTRY;
+const args = entry.endsWith(".ts")
+  ? ["--import", "tsx", entry, ...process.argv.slice(2)]
+  : [entry, ...process.argv.slice(2)];
+
+const result = spawnSync(process.execPath, args, {
+  cwd: CORE,
+  env: process.env,
+  stdio: "inherit",
 });
+
+if (result.error) {
+  throw result.error;
+}
+
+process.exit(result.status ?? 1);

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Rocky regression contract — deterministic acceptance checks.
-# Boots rockyd (ONE process, ONE port) against a throwaway home, asserts the
-# single-origin UI+API+WS surface and the amaze integration, then tears down.
+# Boots rockyd (one supervised runtime owner, one port) against a throwaway home,
+# asserts the single-origin UI+API+WS surface and the amaze integration, then tears down.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -34,7 +34,7 @@ lsof -ti ":$PORT" >/dev/null 2>&1 && fail "port $PORT already in use"
   | grep -q "amaze/" || fail "vendored amaze CLI does not run"
 echo "ok: vendored amaze CLI"
 
-# ── boot single-process single-port stack ──────────────────────────────────
+# ── boot single-owner single-port stack ─────────────────────────────────────
 mkdir -p "$HOME_DIR"; chmod 700 "$HOME_DIR"
 sed "s|__ROCKY_ROOT__|$ROOT|g; s|0\.0\.0\.0:7767|127.0.0.1:$PORT|" \
   "$ROOT/config/rocky.config.json" > "$HOME_DIR/config.json"
@@ -42,12 +42,12 @@ ROCKY_HOME="$HOME_DIR" sh "$ROOT/scripts/rockyd.sh" > "$LOG" 2>&1 &
 PID=$!
 
 i=0
-until grep -aq "rockyd\] up" "$LOG" 2>/dev/null; do
+until [ "$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/health?direct=1" 2>/dev/null || true)" = 200 ]; do
   i=$((i + 1)); [ "$i" -gt 60 ] && fail "rockyd did not become ready in 60s"
   kill -0 "$PID" 2>/dev/null || fail "rockyd exited during startup"
   sleep 1
 done
-echo "ok: rockyd single process up"
+echo "ok: rockyd runtime owner up"
 
 # ── checks 2-4: one origin serves UI, SPA routes, and API ──────────────────
 [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/")" = 200 ] \

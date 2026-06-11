@@ -693,6 +693,37 @@ describe("stream reducer canonical tool calls", () => {
     assert.strictEqual(todos.items[1]?.completed, true);
   });
 
+  it("does not create a todo_list card for an empty todo update", () => {
+    const state = hydrateStreamState([
+      {
+        event: todoTimeline([]),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+    ]);
+
+    const todos = state.filter((item) => item.kind === "todo_list");
+    assert.strictEqual(todos.length, 0);
+  });
+
+  it("clears an existing todo_list card when a later empty update arrives", () => {
+    const state = hydrateStreamState([
+      {
+        event: todoTimeline([
+          { text: "Outline", completed: false },
+          { text: "Ship", completed: true },
+        ]),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: todoTimeline([]),
+        timestamp: new Date("2025-01-01T10:50:05Z"),
+      },
+    ]);
+
+    const todos = state.filter((item) => item.kind === "todo_list");
+    assert.strictEqual(todos.length, 0);
+  });
+
   it("renders Claude TodoWrite as todo_list and suppresses tool call badge", () => {
     const state = hydrateStreamState([
       {

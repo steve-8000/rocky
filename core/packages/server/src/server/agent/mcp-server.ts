@@ -40,6 +40,14 @@ import { expandUserPath, isSameOrDescendantPath, resolvePathFromBase } from "../
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import type { CreateRockyWorktreeWorkflowFn } from "../worktree-session.js";
 import type { ScheduleService } from "../schedule/service.js";
+import type { FileBackedMissionControlService } from "../mission-control/service.js";
+import {
+  MissionRecordSchema,
+  MissionTaskIsolationSchema,
+  MissionTaskSchema,
+  MissionTaskStatusSchema,
+  MissionStatusSchema,
+} from "@getrocky/protocol/mission/types";
 import {
   ScheduleRunSchema,
   ScheduleSummarySchema,
@@ -87,6 +95,7 @@ export interface AgentMcpServerOptions {
   terminalManager?: TerminalManager | null;
   getDaemonTcpPort?: () => number | null;
   scheduleService?: ScheduleService | null;
+  missionControlService?: FileBackedMissionControlService | null;
   providerSnapshotManager: ProviderSnapshotManager;
   github?: GitHubService;
   workspaceGitService?: Pick<
@@ -496,6 +505,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     agentStorage,
     terminalManager,
     scheduleService,
+    missionControlService,
     providerSnapshotManager,
     callerAgentId,
     resolveSpeakHandler,
@@ -1330,6 +1340,162 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       };
     },
   );
+
+  if (missionControlService) {
+    registerTool(
+      "create_mission",
+      {
+        title: "Create mission",
+        description:
+          "Create a durable Mission Control mission. Use this before coordinating Leader/Teammate work.",
+        inputSchema: {
+          goal: z.string().trim().min(1),
+          boardPath: z.string().optional(),
+          chatRoomId: z.string().optional(),
+          leaderAgentId: z.string().optional(),
+          status: MissionStatusSchema.optional(),
+        },
+        outputSchema: {
+          mission: MissionRecordSchema,
+        },
+      },
+      async ({ goal, boardPath, chatRoomId, leaderAgentId, status }) => {
+        const mission = await missionControlService.createMission({
+          goal,
+          boardPath,
+          chatRoomId,
+          leaderAgentId: leaderAgentId ?? callerAgentId,
+          status,
+        });
+        return {
+          content: [],
+          structuredContent: ensureValidJson({ mission }),
+        };
+      },
+    );
+
+    registerTool(
+      "list_missions",
+      {
+        title: "List missions",
+        description: "List durable Mission Control missions.",
+        inputSchema: {
+          includeArchived: z.boolean().optional().default(false),
+        },
+        outputSchema: {
+          missions: z.array(MissionRecordSchema),
+        },
+      },
+      async ({ includeArchived = false }) => {
+        const missions = await missionControlService.listMissions({ includeArchived });
+        return {
+          content: [],
+          structuredContent: ensureValidJson({ missions }),
+        };
+      },
+    );
+
+    registerTool(
+      "inspect_mission",
+      {
+        title: "Inspect mission",
+        description: "Inspect one Mission Control mission by ID.",
+        inputSchema: {
+          missionId: z.string().trim().min(1),
+        },
+        outputSchema: {
+          mission: MissionRecordSchema,
+        },
+      },
+      async ({ missionId }) => {
+        const mission = await missionControlService.inspectMission(missionId);
+        return {
+          content: [],
+          structuredContent: ensureValidJson({ mission }),
+        };
+      },
+    );
+
+    registerTool(
+      "create_mission_task",
+      {
+        title: "Create mission task",
+        description: "Create a task on a Mission Control mission board.",
+        inputSchema: {
+          missionId: z.string().trim().min(1),
+          title: z.string().trim().min(1),
+          description: z.string().optional(),
+          acceptanceCriteria: z.array(z.string()).optional(),
+          ownerAgentId: z.string().optional(),
+          isolation: MissionTaskIsolationSchema.optional(),
+          status: MissionTaskStatusSchema.optional(),
+        },
+        outputSchema: {
+          mission: MissionRecordSchema,
+          task: MissionTaskSchema,
+        },
+      },
+      async ({
+        missionId,
+        title,
+        description,
+        acceptanceCriteria,
+        ownerAgentId,
+        isolation,
+        status,
+      }) => {
+        const { mission, task } = await missionControlService.createTask({
+          missionId,
+          title,
+          description,
+          acceptanceCriteria,
+          ownerAgentId,
+          isolation,
+          status,
+        });
+        return {
+          content: [],
+          structuredContent: ensureValidJson({ mission, task }),
+        };
+      },
+    );
+
+    registerTool(
+      "update_mission_task",
+      {
+        title: "Update mission task",
+        description: "Update a task on a Mission Control mission board.",
+        inputSchema: {
+          missionId: z.string().trim().min(1),
+          taskId: z.string().trim().min(1),
+          title: z.string().optional(),
+          status: MissionTaskStatusSchema.optional(),
+          ownerAgentId: z.string().nullable().optional(),
+          result: z.string().nullable().optional(),
+          isolation: MissionTaskIsolationSchema.optional(),
+        },
+        outputSchema: {
+          mission: MissionRecordSchema,
+          task: MissionTaskSchema,
+        },
+      },
+      async ({ missionId, taskId, title, status, ownerAgentId, result, isolation }) => {
+        const { mission, task } = await missionControlService.updateTask({
+          missionId,
+          taskId,
+          title,
+          status,
+          ownerAgentId,
+          result,
+          isolation,
+        });
+        return {
+          content: [],
+          structuredContent: ensureValidJson({ mission, task }),
+        };
+      },
+    );
+  }
 
   registerTool(
     "cancel_agent",

@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import { createRequire } from "node:module";
 import { getOrCreateServerId, findExecutable, execCommand } from "@getrocky/server";
-import { tryConnectToDaemon } from "../../utils/client.js";
+import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema } from "../../output/index.js";
 import { resolveLocalDaemonState, resolveTcpHostFromListen } from "./local-daemon.js";
 import { resolveNodePathFromPid } from "./runtime-toolchain.js";
@@ -210,6 +210,11 @@ function resolveOwnerLabel(uid: number | undefined, hostname: string | undefined
   return `${uidPart}@${hostPart}`;
 }
 
+export function isDaemonAuthProbeError(error: unknown): boolean {
+  const message = normalizeError(error);
+  return message.includes("Password required") || message.includes("Incorrect password");
+}
+
 interface DaemonProbeResult {
   connectedDaemon: DaemonStatus["connectedDaemon"];
   localDaemonOverride?: DaemonStatus["localDaemon"];
@@ -221,13 +226,21 @@ interface DaemonProbeResult {
   note?: string;
 }
 
-async function probeDaemonOverWebsocket(args: {
+export async function probeDaemonOverWebsocket(args: {
   host: string;
   state: ReturnType<typeof resolveLocalDaemonState>;
 }): Promise<DaemonProbeResult> {
   const { host, state } = args;
-  const client = await tryConnectToDaemon({ host, timeout: 1500 });
-  if (!client) {
+  let client: Awaited<ReturnType<typeof connectToDaemon>>;
+  try {
+    client = await connectToDaemon({ host, timeout: 1500 });
+  } catch (error) {
+    if (state.running && isDaemonAuthProbeError(error)) {
+      return {
+        connectedDaemon: "reachable",
+        note: `Local daemon PID is running; websocket at ${host} requires daemon password for detailed status`,
+      };
+    }
     if (state.running) {
       return {
         connectedDaemon: "unreachable",

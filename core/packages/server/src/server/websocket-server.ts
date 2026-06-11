@@ -9,6 +9,7 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type pino from "pino";
 import type { ProjectRegistry, WorkspaceRegistry } from "./workspace-registry.js";
 import type { FileBackedChatService } from "./chat/chat-service.js";
+import type { FileBackedMissionControlService } from "./mission-control/service.js";
 import type { LoopService } from "./loop-service.js";
 import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-manager.js";
@@ -288,6 +289,7 @@ export class MissingDaemonVersionError extends Error {
 
 interface RequiredWebSocketServices {
   chatService: FileBackedChatService;
+  missionControlService: FileBackedMissionControlService | null;
   loopService: LoopService;
   scheduleService: ScheduleService;
   checkoutDiffManager: CheckoutDiffManager;
@@ -295,11 +297,13 @@ interface RequiredWebSocketServices {
 
 function requireWebSocketServices(params: {
   chatService?: FileBackedChatService;
+  missionControlService?: FileBackedMissionControlService;
   loopService?: LoopService;
   scheduleService?: ScheduleService;
   checkoutDiffManager?: CheckoutDiffManager;
 }): RequiredWebSocketServices {
-  const { chatService, loopService, scheduleService, checkoutDiffManager } = params;
+  const { chatService, missionControlService, loopService, scheduleService, checkoutDiffManager } =
+    params;
   if (!chatService) {
     throw new Error("VoiceAssistantWebSocketServer requires a chat service.");
   }
@@ -312,7 +316,13 @@ function requireWebSocketServices(params: {
   if (!checkoutDiffManager) {
     throw new Error("VoiceAssistantWebSocketServer requires a checkout diff manager.");
   }
-  return { chatService, loopService, scheduleService, checkoutDiffManager };
+  return {
+    chatService,
+    missionControlService: missionControlService ?? null,
+    loopService,
+    scheduleService,
+    checkoutDiffManager,
+  };
 }
 
 /**
@@ -343,6 +353,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly chatService: FileBackedChatService;
+  private readonly missionControlService: FileBackedMissionControlService | null;
   private readonly loopService: LoopService;
   private readonly scheduleService: ScheduleService;
   private readonly checkoutDiffManager: CheckoutDiffManager;
@@ -402,6 +413,7 @@ export class VoiceAssistantWebSocketServer {
     projectRegistry?: ProjectRegistry,
     workspaceRegistry?: WorkspaceRegistry,
     chatService?: FileBackedChatService,
+    missionControlService?: FileBackedMissionControlService,
     loopService?: LoopService,
     scheduleService?: ScheduleService,
     checkoutDiffManager?: CheckoutDiffManager,
@@ -445,11 +457,13 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
     const requiredServices = requireWebSocketServices({
       chatService,
+      missionControlService,
       loopService,
       scheduleService,
       checkoutDiffManager,
     });
     this.chatService = requiredServices.chatService;
+    this.missionControlService = requiredServices.missionControlService;
     this.loopService = requiredServices.loopService;
     this.scheduleService = requiredServices.scheduleService;
     this.checkoutDiffManager = requiredServices.checkoutDiffManager;
@@ -872,6 +886,7 @@ export class VoiceAssistantWebSocketServer {
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
+      missionControlService: this.missionControlService ?? undefined,
       loopService: this.loopService,
       scheduleService: this.scheduleService,
       checkoutDiffManager: this.checkoutDiffManager,

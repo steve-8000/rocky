@@ -628,6 +628,18 @@ function appendTodoList(
   }));
 
   const lastItem = state[state.length - 1];
+
+  // An empty plan/todo update (amaze emits these on `todo_auto_clear`, or when a
+  // `todo_write` resolves to zero tasks) must not surface a permanent "No tasks
+  // yet." card. If the trailing card is an existing todo list, this is a clear —
+  // drop it; otherwise there is nothing to show, so leave the timeline untouched.
+  if (normalizedItems.length === 0) {
+    if (lastItem && lastItem.kind === "todo_list" && lastItem.provider === provider) {
+      return state.slice(0, -1);
+    }
+    return state;
+  }
+
   if (lastItem && lastItem.kind === "todo_list" && lastItem.provider === provider) {
     const next = [...state];
     const updated: TodoListItem = {

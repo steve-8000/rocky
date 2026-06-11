@@ -1,0 +1,961 @@
+//! Agent lifecycle manager — the source of truth for agent state.
+//!
+//! Mirrors `core/packages/server/src/server/agent/agent-manager.ts`. The
+//! manager owns live `ManagedAgent` state, enforces the lifecycle state machine
+//! via `AgentStatus::can_transition_to`, owns the timeline pipeline (persist
+//! before broadcast, agent-manager.ts `recordTimeline` -> `dispatchStream`,
+//! lines 3274-3282 / 3199-3217), owns the permission queue, and broadcasts
+//! `AgentStreamEvent`s to subscribers via a tokio broadcast channel.
+//!
+//! State-machine reference: `04-agent-runtime-and-providers.md` lines 122-144.
+//! Creation flow: lines 146-168 / `create-agent/create.ts`.
+//! Timeline pipeline: lines 186-213. Permissions: lines 241-262.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use rocky_agent_domain::{
+    AgentPermissionRequest, AgentPermissionResponse, AgentRuntimeInfo, AgentStatus,
+    AgentStreamEvent, AgentTimelineItem,
+};
+use rocky_store::{
+    project_dir_name_from_cwd, write_json_atomic, AttentionReason, PersistenceHandle, RuntimeInfo,
+    SerializableAgentConfig, StoredAgentRecord,
+};
+use tokio::sync::{broadcast, Mutex};
+
+use crate::clock::now_iso8601;
+use crate::error::AgentError;
+use crate::paths::{expand_user_path, resolve_child_agent_cwd};
+use crate::permissions::{FollowUp, PendingPermission, PermissionQueue, Resolution};
+use crate::provider::{AgentProvider, AgentSession, PromptInput, ProviderSessionConfig};
+use crate::timeline::{Timeline, TimelineRow};
+
+/// `rocky.parent-agent-id` label key (mirrors
+/// `core/packages/protocol/src/agent-labels.ts`).
+pub const PARENT_AGENT_ID_LABEL: &str = "rocky.parent-agent-id";
+
+const BROADCAST_CAPACITY: usize = 1024;
+
+/// A broadcast envelope carrying a stream event plus the daemon-owned timeline
+/// metadata (seq/epoch/timestamp), matching the TS `dispatchStream` metadata
+/// (agent-manager.ts lines 3433-3437).
+#[derive(Debug, Clone)]
+pub struct AgentStreamBroadcast {
+    pub agent_id: String,
+    pub event: AgentStreamEvent,
+    pub seq: Option<u64>,
+    pub epoch: Option<String>,
+    pub timestamp: Option<String>,
+}
+
+/// In-memory live state for a single agent. Superset of the persisted
+/// `StoredAgentRecord` fields the manager mutates at runtime.
+#[derive(Clone)]
+pub struct ManagedAgent {
+    pub id: String,
+    pub provider: String,
+    pub cwd: String,
+    pub status: AgentStatus,
+    pub runtime_info: Option<AgentRuntimeInfo>,
+    pub labels: BTreeMap<String, String>,
+    pub requires_attention: bool,
+    pub attention_reason: Option<AttentionReason>,
+    pub attention_timestamp: Option<String>,
+    pub last_error: Option<String>,
+    pub current_turn_id: Option<String>,
+    pub title: Option<String>,
+    pub config: Option<SerializableAgentConfig>,
+    pub persistence: Option<PersistenceHandle>,
+    pub internal: bool,
+    pub archived_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for ManagedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedAgent")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("cwd", &self.cwd)
+            .field("status", &self.status)
+            .field("requires_attention", &self.requires_attention)
+            .field("current_turn_id", &self.current_turn_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedAgent {
+    /// Project the live agent onto the persisted `StoredAgentRecord` shape.
+    fn to_record(&self) -> StoredAgentRecord {
+        StoredAgentRecord {
+            id: self.id.clone(),
+            provider: self.provider.clone(),
+            cwd: self.cwd.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            last_activity_at: None,
+            last_user_message_at: None,
+            title: self.title.clone(),
+            labels: self.labels.clone(),
+            last_status: to_store_status(self.status),
+            last_mode_id: self
+                .runtime_info
+                .as_ref()
+                .and_then(|r| r.mode_id.clone()),
+            config: self.config.clone(),
+            runtime_info: self.runtime_info.as_ref().map(runtime_info_to_store),
+            features: None,
+            persistence: self.persistence.clone(),
+            last_error: self.last_error.clone(),
+            requires_attention: Some(self.requires_attention),
+            attention_reason: self.attention_reason,
+            attention_timestamp: self.attention_timestamp.clone(),
+            internal: Some(self.internal),
+            archived_at: self.archived_at.clone(),
+        }
+    }
+}
+
+fn to_store_status(status: AgentStatus) -> rocky_store::AgentStatus {
+    match status {
+        AgentStatus::Initializing => rocky_store::AgentStatus::Initializing,
+        AgentStatus::Idle => rocky_store::AgentStatus::Idle,
+        AgentStatus::Running => rocky_store::AgentStatus::Running,
+        AgentStatus::Error => rocky_store::AgentStatus::Error,
+        AgentStatus::Closed => rocky_store::AgentStatus::Closed,
+    }
+}
+
+fn runtime_info_to_store(info: &AgentRuntimeInfo) -> RuntimeInfo {
+    RuntimeInfo {
+        provider: info.provider.clone(),
+        session_id: info.session_id.clone(),
+        model: info.model.clone(),
+        thinking_option_id: info.thinking_option_id.clone(),
+        mode_id: info.mode_id.clone(),
+        extra: info
+            .extra
+            .as_ref()
+            .map(|m| serde_json::Value::Object(m.clone())),
+    }
+}
+
+/// Options for creating an agent (mirrors the `createOptions` slice of the TS
+/// create flow that the manager consumes: labels, caller context for child
+/// cwd/parent label).
+#[derive(Debug, Default, Clone)]
+pub struct CreateAgentOptions {
+    /// Provider id (`claude`, `codex`, …).
+    pub provider: String,
+    /// Requested cwd. For top-level agents this is used directly (or process
+    /// cwd when absent). For child agents it is resolved relative to the parent.
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub mode_id: Option<String>,
+    pub thinking_option_id: Option<String>,
+    pub approval_policy: Option<String>,
+    pub title: Option<String>,
+    /// User-supplied labels (merged last).
+    pub labels: BTreeMap<String, String>,
+    /// Caller (parent) agent id, if this is an agent-scoped MCP child.
+    pub caller_agent_id: Option<String>,
+    /// Whether the child is detached (no parent label).
+    pub detached: bool,
+    /// Default labels injected by the caller context.
+    pub child_agent_default_labels: BTreeMap<String, String>,
+    /// Caller context cwd lock.
+    pub locked_cwd: Option<String>,
+    /// Whether the caller allows a custom cwd (default true).
+    pub allow_custom_cwd: bool,
+    /// Internal/system agent (suppressed from global subscribers/attention).
+    pub internal: bool,
+}
+
+impl CreateAgentOptions {
+    /// Convenience constructor for a top-level agent.
+    pub fn new(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            allow_custom_cwd: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// The agent control plane. Cheap to clone (`Arc` inner).
+#[derive(Clone)]
+pub struct AgentManager {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    rocky_home: PathBuf,
+    state: Mutex<ManagerState>,
+    broadcast: broadcast::Sender<AgentStreamBroadcast>,
+}
+
+struct ManagerState {
+    agents: BTreeMap<String, ManagedAgent>,
+    sessions: BTreeMap<String, Box<dyn AgentSession>>,
+    timeline: Timeline,
+    permissions: PermissionQueue,
+}
+
+impl AgentManager {
+    /// Create a manager rooted at `$ROCKY_HOME`.
+    pub fn new(rocky_home: impl Into<PathBuf>) -> Self {
+        let rocky_home = rocky_home.into();
+        let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            inner: Arc::new(Inner {
+                rocky_home: rocky_home.clone(),
+                state: Mutex::new(ManagerState {
+                    agents: BTreeMap::new(),
+                    sessions: BTreeMap::new(),
+                    timeline: Timeline::new(rocky_home),
+                    permissions: PermissionQueue::new(),
+                }),
+                broadcast: tx,
+            }),
+        }
+    }
+
+    /// Subscribe to broadcast stream events (one receiver per session).
+    pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamBroadcast> {
+        self.inner.broadcast.subscribe()
+    }
+
+    /// Build the on-disk agent record path: `$ROCKY_HOME/agents/{project}/{id}.json`.
+    fn record_path(&self, cwd: &str, id: &str) -> PathBuf {
+        let project = project_dir_name_from_cwd(cwd);
+        self.inner
+            .rocky_home
+            .join("agents")
+            .join(project)
+            .join(format!("{id}.json"))
+    }
+
+    /// Persist the agent record JSON atomically (matches TS `persistSnapshot`).
+    fn persist_record(&self, agent: &ManagedAgent) -> Result<(), AgentError> {
+        let path = self.record_path(&agent.cwd, &agent.id);
+        write_json_atomic(&path, &agent.to_record())
+            .map_err(|e| AgentError::Persistence(e.to_string()))
+    }
+
+    /// Create a new agent following the documented create flow
+    /// (`04-agent-runtime-and-providers.md` lines 146-168). The provider
+    /// session is created via the trait; the manager never spawns processes.
+    pub async fn create_agent(
+        &self,
+        provider: &dyn AgentProvider,
+        options: CreateAgentOptions,
+    ) -> Result<ManagedAgent, AgentError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso8601();
+
+        // Step 2: resolve cwd (parent-relative for child agents).
+        let cwd = {
+            let mut guard = self.inner.state.lock().await;
+            self.resolve_cwd(&mut guard, &options)
+        };
+
+        // Step 6: merge labels.
+        let labels = merge_labels(&options);
+
+        // Step 8: create the provider session.
+        let session = provider
+            .create_session(ProviderSessionConfig {
+                provider: options.provider.clone(),
+                cwd: cwd.clone(),
+                model: options.model.clone(),
+                mode_id: options.mode_id.clone(),
+                thinking_option_id: options.thinking_option_id.clone(),
+                approval_policy: options.approval_policy.clone(),
+            })
+            .await?;
+
+        let runtime_info = Some(session.runtime_info());
+        let persistence = session.describe_persistence();
+
+        let config = Some(SerializableAgentConfig {
+            mode_id: options.mode_id.clone(),
+            model: options.model.clone(),
+            thinking_option_id: options.thinking_option_id.clone(),
+            feature_values: None,
+            extra: None,
+            system_prompt: None,
+            mcp_servers: None,
+        });
+
+        // Step 7: create the ManagedAgent record (initializing -> idle once the
+        // session exists).
+        let agent = ManagedAgent {
+            id: id.clone(),
+            provider: options.provider.clone(),
+            cwd: cwd.clone(),
+            status: AgentStatus::Idle,
+            runtime_info,
+            labels,
+            requires_attention: false,
+            attention_reason: None,
+            attention_timestamp: None,
+            last_error: None,
+            current_turn_id: None,
+            title: options.title.clone(),
+            config,
+            persistence,
+            internal: options.internal,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        // Steps 7/10: register live state, timeline, persist. Subscribe to the
+        // session's event stream BEFORE registering so no early events (e.g.
+        // `thread_started`, emitted during session creation) are missed.
+        let session_events = session.subscribe_events();
+        {
+            let mut guard = self.inner.state.lock().await;
+            guard.timeline.register(&id, &cwd)?;
+            guard.agents.insert(id.clone(), agent.clone());
+            guard.sessions.insert(id.clone(), session);
+        }
+        if let Some(rx) = session_events {
+            self.spawn_event_pump(id.clone(), rx);
+        }
+        self.persist_record(&agent)?;
+
+        tracing::info!(agent_id = %id, provider = %options.provider, cwd = %cwd, "agent created");
+        Ok(agent)
+    }
+
+    /// Submit a prompt to a live agent's session, starting a turn. The
+    /// resulting timeline/lifecycle events arrive asynchronously through the
+    /// session's event stream and are ingested by the per-agent pump
+    /// (see [`AgentManager::spawn_event_pump`]). Returns once the prompt has
+    /// been dispatched to the provider.
+    pub async fn prompt(&self, id: &str, input: PromptInput) -> Result<(), AgentError> {
+        let guard = self.inner.state.lock().await;
+        let session = guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+        session.prompt(input).await
+    }
+
+    /// Spawn a background task that ingests a session's stream events through
+    /// the manager's full pipeline (timeline persist-before-broadcast, live
+    /// state transitions, attention). The task ends when the session's sender
+    /// is dropped (session closed). Errors are logged, not propagated, so a
+    /// single bad event never tears down the stream.
+    fn spawn_event_pump(
+        &self,
+        agent_id: String,
+        mut rx: broadcast::Receiver<AgentStreamEvent>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let Err(err) = manager.ingest_stream_event(&agent_id, event).await {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                error = %err,
+                                "failed to ingest session stream event"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            skipped,
+                            "session event pump lagged; dropped events"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    fn resolve_cwd(&self, state: &mut ManagerState, options: &CreateAgentOptions) -> String {
+        if let Some(parent_id) = options
+            .caller_agent_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(parent) = state.agents.get(parent_id) {
+                return resolve_child_agent_cwd(
+                    &parent.cwd,
+                    options.cwd.as_deref(),
+                    options.locked_cwd.as_deref(),
+                    options.allow_custom_cwd,
+                );
+            }
+        }
+        match options.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(cwd) => expand_user_path(cwd),
+            None => std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".to_string()),
+        }
+    }
+
+    /// Get a snapshot of an agent.
+    pub async fn get(&self, id: &str) -> Option<ManagedAgent> {
+        self.inner.state.lock().await.agents.get(id).cloned()
+    }
+
+    /// List all live agents (sorted by id for determinism).
+    pub async fn list(&self) -> Vec<ManagedAgent> {
+        self.inner
+            .state
+            .lock()
+            .await
+            .agents
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Set an agent's status, enforcing the state machine. Illegal transitions
+    /// are rejected (logged + `IllegalTransition`); idempotent stays are
+    /// allowed. On success, persists and emits an `AttentionRequired`-adjacent
+    /// state update is left to callers; this only emits when status changes.
+    pub async fn set_status(&self, id: &str, next: AgentStatus) -> Result<(), AgentError> {
+        let (agent, changed) = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            let from = agent.status;
+            if !from.can_transition_to(next) {
+                tracing::warn!(
+                    agent_id = %id,
+                    ?from,
+                    to = ?next,
+                    "rejected illegal status transition"
+                );
+                return Err(AgentError::IllegalTransition {
+                    agent_id: id.to_string(),
+                    from,
+                    to: next,
+                });
+            }
+            let changed = from != next;
+            agent.status = next;
+            if changed {
+                agent.updated_at = now_iso8601();
+            }
+            (agent.clone(), changed)
+        };
+        if changed {
+            self.persist_record(&agent)?;
+        }
+        Ok(())
+    }
+
+    /// Update an agent's runtime info (provider/model/mode/session id).
+    pub async fn update_runtime_info(
+        &self,
+        id: &str,
+        info: AgentRuntimeInfo,
+    ) -> Result<(), AgentError> {
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            if agent.persistence.is_none() {
+                if let Some(session_id) = info.session_id.clone() {
+                    agent.persistence = Some(PersistenceHandle {
+                        provider: agent.provider.clone(),
+                        session_id,
+                        native_handle: None,
+                        metadata: None,
+                    });
+                }
+            }
+            agent.runtime_info = Some(info);
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        Ok(())
+    }
+
+    /// Mark an agent as requiring attention with a reason.
+    pub async fn mark_attention(
+        &self,
+        id: &str,
+        reason: AttentionReason,
+    ) -> Result<(), AgentError> {
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            let ts = now_iso8601();
+            agent.requires_attention = true;
+            agent.attention_reason = Some(reason);
+            agent.attention_timestamp = Some(ts);
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        // Delegated (child) agents do not raise attention broadcasts
+        // (agent-manager.ts broadcastAgentAttention guard, lines 3418-3425).
+        if !agent.labels.contains_key(PARENT_AGENT_ID_LABEL) && !agent.internal {
+            self.broadcast(AgentStreamBroadcast {
+                agent_id: agent.id.clone(),
+                event: AgentStreamEvent::AttentionRequired {
+                    provider: agent.provider.clone(),
+                    reason: attention_reason_str(reason).to_string(),
+                    timestamp: agent
+                        .attention_timestamp
+                        .clone()
+                        .unwrap_or_else(now_iso8601),
+                },
+                seq: None,
+                epoch: None,
+                timestamp: agent.attention_timestamp.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Clear an agent's attention flag.
+    pub async fn clear_attention(&self, id: &str) -> Result<(), AgentError> {
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            agent.requires_attention = false;
+            agent.attention_reason = None;
+            agent.attention_timestamp = None;
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        Ok(())
+    }
+
+    /// Cancel the in-flight turn. Moves Running -> Idle (if legal).
+    pub async fn cancel(&self, id: &str) -> Result<(), AgentError> {
+        {
+            let guard = self.inner.state.lock().await;
+            if !guard.agents.contains_key(id) {
+                return Err(AgentError::NotFound(id.to_string()));
+            }
+            if let Some(sess) = guard.sessions.get(id) {
+                sess.cancel().await?;
+            }
+        }
+        // Best-effort transition back to idle.
+        let _ = self.set_status(id, AgentStatus::Idle).await;
+        Ok(())
+    }
+
+    /// Archive an agent (sets `archived_at`, keeps the record). Closes first.
+    pub async fn archive(&self, id: &str) -> Result<(), AgentError> {
+        self.close(id).await?;
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            agent.archived_at = Some(now_iso8601());
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        Ok(())
+    }
+
+    /// Close an agent: transition to `closed` (terminal), close the provider
+    /// session, clear pending permissions and live timeline.
+    pub async fn close(&self, id: &str) -> Result<(), AgentError> {
+        let (agent, session) = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            if agent.status.can_transition_to(AgentStatus::Closed) {
+                agent.status = AgentStatus::Closed;
+                agent.updated_at = now_iso8601();
+            }
+            let agent = agent.clone();
+            guard.permissions.clear_agent(id);
+            guard.timeline.forget(id);
+            let session = guard.sessions.remove(id);
+            (agent, session)
+        };
+        if let Some(session) = session {
+            session.close().await?;
+        }
+        self.persist_record(&agent)?;
+        tracing::info!(agent_id = %id, "agent closed");
+        Ok(())
+    }
+
+    // --- Timeline pipeline ---
+
+    /// Append a timeline item for an agent (persist-before-broadcast). Returns
+    /// the durable row. Broadcasts a `Timeline` stream event after the row is
+    /// on disk.
+    pub async fn append_timeline(
+        &self,
+        agent_id: &str,
+        item: AgentTimelineItem,
+        turn_id: Option<String>,
+    ) -> Result<TimelineRow, AgentError> {
+        let (provider, row, epoch) = {
+            let mut guard = self.inner.state.lock().await;
+            let provider = guard
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?
+                .provider
+                .clone();
+            let row = guard
+                .timeline
+                .append(agent_id, item.clone(), turn_id.clone())?;
+            let epoch = guard.timeline.epoch(agent_id).map(str::to_string);
+            (provider, row, epoch)
+        };
+        // Persistence already happened inside `append`; safe to broadcast.
+        self.broadcast(AgentStreamBroadcast {
+            agent_id: agent_id.to_string(),
+            event: AgentStreamEvent::Timeline {
+                item: Box::new(row.item.clone()),
+                provider,
+                turn_id: row.turn_id.clone(),
+                timestamp: Some(row.timestamp.clone()),
+            },
+            seq: Some(row.seq),
+            epoch,
+            timestamp: Some(row.timestamp.clone()),
+        });
+        Ok(row)
+    }
+
+    /// Paged timeline fetch (`seq > after_seq`, up to `limit`; 0 = all).
+    pub async fn fetch_timeline(
+        &self,
+        agent_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Vec<TimelineRow> {
+        self.inner
+            .state
+            .lock()
+            .await
+            .timeline
+            .fetch(agent_id, after_seq, limit)
+    }
+
+    /// Ingest a normalized provider stream event through the full pipeline:
+    /// attach daemon timestamp/turn -> update live state -> append timeline row
+    /// (for `Timeline` events) -> persist -> broadcast -> update attention.
+    ///
+    /// Returns the broadcast envelope that was emitted (the event downstream
+    /// sessions observe). Mirrors `dispatchStreamEventByType`
+    /// (agent-manager.ts lines 2904-2980) for the categories the Rust slice
+    /// owns.
+    pub async fn ingest_stream_event(
+        &self,
+        agent_id: &str,
+        event: AgentStreamEvent,
+    ) -> Result<AgentStreamBroadcast, AgentError> {
+        // Timeline events go through the persist-before-broadcast path.
+        if let AgentStreamEvent::Timeline {
+            item,
+            turn_id,
+            timestamp,
+            ..
+        } = &event
+        {
+            let (provider, row, epoch) = {
+                let mut guard = self.inner.state.lock().await;
+                let agent = guard
+                    .agents
+                    .get_mut(agent_id)
+                    .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+                let provider = agent.provider.clone();
+                if turn_id.is_some() {
+                    agent.current_turn_id = turn_id.clone();
+                }
+                let row = guard.timeline.append_with_timestamp(
+                    agent_id,
+                    (**item).clone(),
+                    turn_id.clone(),
+                    timestamp.clone(),
+                )?;
+                let epoch = guard.timeline.epoch(agent_id).map(str::to_string);
+                (provider, row, epoch)
+            };
+            let envelope = AgentStreamBroadcast {
+                agent_id: agent_id.to_string(),
+                event: AgentStreamEvent::Timeline {
+                    item: Box::new(row.item.clone()),
+                    provider,
+                    turn_id: row.turn_id.clone(),
+                    timestamp: Some(row.timestamp.clone()),
+                },
+                seq: Some(row.seq),
+                epoch,
+                timestamp: Some(row.timestamp.clone()),
+            };
+            self.broadcast(envelope.clone());
+            return Ok(envelope);
+        }
+
+        // Non-timeline events: update live state, then broadcast (no row).
+        let mut attention: Option<AttentionReason> = None;
+        {
+            let mut guard = self.inner.state.lock().await;
+            if !guard.agents.contains_key(agent_id) {
+                return Err(AgentError::NotFound(agent_id.to_string()));
+            }
+            // Permission events touch the queue, not the agent borrow — handle
+            // them first to keep the borrows disjoint.
+            match &event {
+                AgentStreamEvent::PermissionRequested { request, .. } => {
+                    guard.permissions.enqueue(agent_id, (**request).clone());
+                    attention = Some(AttentionReason::Permission);
+                }
+                AgentStreamEvent::PermissionResolved { request_id, .. } => {
+                    let _ = guard.permissions.resolve_silently(request_id);
+                }
+                _ => {}
+            }
+            let agent = guard
+                .agents
+                .get_mut(agent_id)
+                .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+            match &event {
+                AgentStreamEvent::TurnStarted { turn_id, .. } => {
+                    agent.current_turn_id = turn_id.clone();
+                    transition(agent, AgentStatus::Running);
+                }
+                AgentStreamEvent::TurnCompleted { .. } => {
+                    agent.last_error = None;
+                    agent.current_turn_id = None;
+                    transition(agent, AgentStatus::Idle);
+                    attention = Some(AttentionReason::Finished);
+                }
+                AgentStreamEvent::TurnFailed { error, .. } => {
+                    agent.last_error = Some(error.clone());
+                    agent.current_turn_id = None;
+                    transition(agent, AgentStatus::Error);
+                    attention = Some(AttentionReason::Error);
+                }
+                AgentStreamEvent::TurnCanceled { .. } => {
+                    agent.current_turn_id = None;
+                    transition(agent, AgentStatus::Idle);
+                }
+                AgentStreamEvent::ThreadStarted { session_id, .. } => {
+                    if agent.persistence.is_none() {
+                        agent.persistence = Some(PersistenceHandle {
+                            provider: agent.provider.clone(),
+                            session_id: session_id.clone(),
+                            native_handle: None,
+                            metadata: None,
+                        });
+                    }
+                }
+                AgentStreamEvent::ModelChanged { runtime_info, .. } => {
+                    agent.runtime_info = Some(runtime_info.clone());
+                }
+                AgentStreamEvent::ModeChanged { current_mode_id, .. } => {
+                    if let Some(info) = agent.runtime_info.as_mut() {
+                        info.mode_id = current_mode_id.clone();
+                    }
+                }
+                AgentStreamEvent::ThinkingOptionChanged {
+                    thinking_option_id, ..
+                } => {
+                    if let Some(info) = agent.runtime_info.as_mut() {
+                        info.thinking_option_id = thinking_option_id.clone();
+                    }
+                }
+                _ => {}
+            }
+            agent.updated_at = now_iso8601();
+        }
+
+        // Persist updated record before broadcasting state-affecting events.
+        if let Some(agent) = self.get(agent_id).await {
+            self.persist_record(&agent)?;
+        }
+
+        let envelope = AgentStreamBroadcast {
+            agent_id: agent_id.to_string(),
+            event,
+            seq: None,
+            epoch: None,
+            timestamp: None,
+        };
+        self.broadcast(envelope.clone());
+
+        if let Some(reason) = attention {
+            self.mark_attention(agent_id, reason).await?;
+        }
+        Ok(envelope)
+    }
+
+    // --- Permissions ---
+
+    /// Enqueue a permission request and broadcast `PermissionRequested`. Sets
+    /// attention (`permission`) for non-internal, non-delegated agents.
+    pub async fn enqueue_permission(
+        &self,
+        agent_id: &str,
+        request: AgentPermissionRequest,
+    ) -> Result<PendingPermission, AgentError> {
+        let (pending, provider) = {
+            let mut guard = self.inner.state.lock().await;
+            let provider = guard
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?
+                .provider
+                .clone();
+            let pending = guard.permissions.enqueue(agent_id, request.clone());
+            (pending, provider)
+        };
+        self.broadcast(AgentStreamBroadcast {
+            agent_id: agent_id.to_string(),
+            event: AgentStreamEvent::PermissionRequested {
+                provider,
+                request: Box::new(request),
+                turn_id: None,
+            },
+            seq: None,
+            epoch: None,
+            timestamp: None,
+        });
+        self.mark_attention(agent_id, AttentionReason::Permission)
+            .await?;
+        Ok(pending)
+    }
+
+    /// List pending permissions, optionally scoped to one agent. Survives
+    /// reconnect: a new subscriber calls this to recover state.
+    pub async fn list_pending_permissions(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Vec<PendingPermission> {
+        self.inner
+            .state
+            .lock()
+            .await
+            .permissions
+            .list_pending(agent_id)
+    }
+
+    /// Resolve a permission. Broadcasts `PermissionResolved`, clears attention
+    /// when no more pending for the agent, and returns any follow-up.
+    pub async fn respond_to_permission(
+        &self,
+        request_id: &str,
+        response: AgentPermissionResponse,
+        follow_up: Option<FollowUp>,
+    ) -> Result<Resolution, AgentError> {
+        let (resolution, provider, still_pending) = {
+            let mut guard = self.inner.state.lock().await;
+            let resolution = guard
+                .permissions
+                .resolve(request_id, response.clone(), follow_up)?;
+            let provider = guard
+                .agents
+                .get(&resolution.agent_id)
+                .map(|a| a.provider.clone())
+                .unwrap_or_default();
+            let still_pending = guard.permissions.has_pending(&resolution.agent_id);
+            (resolution, provider, still_pending)
+        };
+        self.broadcast(AgentStreamBroadcast {
+            agent_id: resolution.agent_id.clone(),
+            event: AgentStreamEvent::PermissionResolved {
+                provider,
+                request_id: request_id.to_string(),
+                resolution: response,
+                turn_id: None,
+            },
+            seq: None,
+            epoch: None,
+            timestamp: None,
+        });
+        if !still_pending {
+            // Best-effort: clearing attention is fine even if it was already clear.
+            let _ = self.clear_attention(&resolution.agent_id).await;
+        }
+        Ok(resolution)
+    }
+
+    fn broadcast(&self, envelope: AgentStreamBroadcast) {
+        // A send error only means there are no subscribers; that is fine.
+        let _ = self.inner.broadcast.send(envelope);
+    }
+}
+
+/// Apply a status transition iff legal; log + ignore otherwise. Used for
+/// event-driven transitions where rejecting the whole event is wrong.
+fn transition(agent: &mut ManagedAgent, next: AgentStatus) {
+    let from = agent.status;
+    if from.can_transition_to(next) {
+        agent.status = next;
+    } else {
+        tracing::warn!(
+            agent_id = %agent.id,
+            ?from,
+            to = ?next,
+            "ignored illegal event-driven status transition"
+        );
+    }
+}
+
+/// Port of `mergeLabels` (create.ts lines 487-504): parent label (when caller
+/// present and not detached), caller default labels, then user labels.
+fn merge_labels(options: &CreateAgentOptions) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    if !options.detached {
+        if let Some(parent) = options
+            .caller_agent_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            labels.insert(PARENT_AGENT_ID_LABEL.to_string(), parent.to_string());
+        }
+    }
+    for (k, v) in &options.child_agent_default_labels {
+        labels.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &options.labels {
+        labels.insert(k.clone(), v.clone());
+    }
+    if options.detached {
+        labels.remove(PARENT_AGENT_ID_LABEL);
+    }
+    labels
+}
+
+fn attention_reason_str(reason: AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::Finished => "finished",
+        AttentionReason::Error => "error",
+        AttentionReason::Permission => "permission",
+    }
+}

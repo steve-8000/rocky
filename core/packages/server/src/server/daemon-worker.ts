@@ -182,6 +182,13 @@ async function main() {
   process.on("SIGTERM", () => beginShutdown("SIGTERM"));
   process.on("SIGINT", () => beginShutdown("SIGINT"));
 
+  // When supervised (forked with an IPC channel), losing the channel means the
+  // supervisor died. Shut down instead of lingering as an orphan that holds the
+  // listen port and blocks every future daemon start with EADDRINUSE.
+  if (typeof process.send === "function") {
+    process.on("disconnect", () => beginShutdown("supervisor IPC disconnect"));
+  }
+
   process.on("uncaughtException", (err) => {
     logger.fatal({ err }, "Uncaught exception — daemon crashing");
     exitAfterPinoFlush();

@@ -21,6 +21,20 @@ import {
   ChatWaitResponseSchema,
 } from "./chat/rpc-schemas.js";
 import {
+  MissionCreateRequestSchema,
+  MissionListRequestSchema,
+  MissionInspectRequestSchema,
+  MissionUpdateRequestSchema,
+  MissionTaskCreateRequestSchema,
+  MissionTaskUpdateRequestSchema,
+  MissionCreateResponseSchema,
+  MissionListResponseSchema,
+  MissionInspectResponseSchema,
+  MissionUpdateResponseSchema,
+  MissionTaskCreateResponseSchema,
+  MissionTaskUpdateResponseSchema,
+} from "./mission/rpc-schemas.js";
+import {
   ScheduleCreateRequestSchema,
   ScheduleListRequestSchema,
   ScheduleInspectRequestSchema,
@@ -1951,6 +1965,12 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ChatPostRequestSchema,
   ChatReadRequestSchema,
   ChatWaitRequestSchema,
+  MissionCreateRequestSchema,
+  MissionListRequestSchema,
+  MissionInspectRequestSchema,
+  MissionUpdateRequestSchema,
+  MissionTaskCreateRequestSchema,
+  MissionTaskUpdateRequestSchema,
   ScheduleCreateRequestSchema,
   ScheduleListRequestSchema,
   ScheduleInspectRequestSchema,
@@ -3797,6 +3817,12 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ChatPostResponseSchema,
   ChatReadResponseSchema,
   ChatWaitResponseSchema,
+  MissionCreateResponseSchema,
+  MissionListResponseSchema,
+  MissionInspectResponseSchema,
+  MissionUpdateResponseSchema,
+  MissionTaskCreateResponseSchema,
+  MissionTaskUpdateResponseSchema,
   ScheduleCreateResponseSchema,
   ScheduleListResponseSchema,
   ScheduleInspectResponseSchema,
@@ -3910,6 +3936,12 @@ export type ChatDeleteResponse = z.infer<typeof ChatDeleteResponseSchema>;
 export type ChatPostResponse = z.infer<typeof ChatPostResponseSchema>;
 export type ChatReadResponse = z.infer<typeof ChatReadResponseSchema>;
 export type ChatWaitResponse = z.infer<typeof ChatWaitResponseSchema>;
+export type MissionCreateResponse = z.infer<typeof MissionCreateResponseSchema>;
+export type MissionListResponse = z.infer<typeof MissionListResponseSchema>;
+export type MissionInspectResponse = z.infer<typeof MissionInspectResponseSchema>;
+export type MissionUpdateResponse = z.infer<typeof MissionUpdateResponseSchema>;
+export type MissionTaskCreateResponse = z.infer<typeof MissionTaskCreateResponseSchema>;
+export type MissionTaskUpdateResponse = z.infer<typeof MissionTaskUpdateResponseSchema>;
 export type ScheduleCreateResponse = z.infer<typeof ScheduleCreateResponseSchema>;
 export type ScheduleListResponse = z.infer<typeof ScheduleListResponseSchema>;
 export type ScheduleInspectResponse = z.infer<typeof ScheduleInspectResponseSchema>;

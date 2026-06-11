@@ -1,7 +1,7 @@
 import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
-import { open } from "fs/promises";
+import { mkdir, open } from "fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
@@ -104,6 +104,7 @@ import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js"
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
 import { FileBackedProjectRegistry, FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 import { FileBackedChatService } from "./chat/chat-service.js";
+import { FileBackedMissionControlService } from "./mission-control/service.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { LoopService } from "./loop-service.js";
 import { ScheduleService } from "./schedule/service.js";
@@ -326,6 +327,7 @@ export async function createRockyDaemon(
   let relayTransport: RelayTransportController | null = null;
 
   const staticDir = config.staticDir;
+  await mkdir(staticDir, { recursive: true });
   const downloadTokenTtlMs = config.downloadTokenTtlMs ?? 60000;
 
   const downloadTokenStore = new DownloadTokenStore({
@@ -552,6 +554,10 @@ export async function createRockyDaemon(
     rockyHome: config.rockyHome,
     logger,
   });
+  const missionControlService = new FileBackedMissionControlService({
+    rockyHome: config.rockyHome,
+    logger,
+  });
   const terminalManager = createConfiguredTerminalManager();
   const github = createGitHubService();
   const workspaceGitService = new WorkspaceGitServiceImpl({
@@ -618,6 +624,8 @@ export async function createRockyDaemon(
   })();
   await chatService.initialize();
   logger.info({ elapsed: elapsed() }, "Chat service initialized");
+  await missionControlService.initialize();
+  logger.info({ elapsed: elapsed() }, "Mission Control service initialized");
   const checkoutDiffManager = new CheckoutDiffManager({
     logger,
     rockyHome: config.rockyHome,
@@ -726,6 +734,7 @@ export async function createRockyDaemon(
         terminalManager,
         getDaemonTcpPort: () => (boundListenTarget?.type === "tcp" ? boundListenTarget.port : null),
         scheduleService,
+        missionControlService,
         providerSnapshotManager,
         github,
         workspaceGitService,
@@ -1019,6 +1028,7 @@ export async function createRockyDaemon(
               projectRegistry,
               workspaceRegistry,
               chatService,
+              missionControlService,
               loopService,
               scheduleService,
               checkoutDiffManager,
