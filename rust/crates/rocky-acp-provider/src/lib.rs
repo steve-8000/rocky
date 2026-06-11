@@ -29,7 +29,8 @@ use rocky_acp::process::{expand_rocky_root, ProcessSpec};
 use rocky_acp::session::{AcpSession, SessionConfig, SessionInit};
 use rocky_agent_domain::{AgentMode, AgentRuntimeInfo, AgentStreamEvent};
 use rocky_agents::{
-    AgentError, AgentModelDef, AgentProvider, AgentSession, PromptInput, ProviderSessionConfig,
+    AgentError, AgentModelDef, AgentProvider, AgentSelectOption, AgentSession, PromptInput,
+    ProviderSessionConfig,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -168,6 +169,21 @@ impl AgentProvider for AcpProvider {
     async fn list_models(&self, cwd: &str) -> Result<Vec<AgentModelDef>, AgentError> {
         let id = self.id.clone();
         self.probe(cwd, move |session| {
+            // Mirror `deriveModelDefinitionsFromACP` (acp-agent.ts:517-540):
+            // attach the session's `thought_level` options (and their default)
+            // to every advertised model so the WebUI renders the per-model
+            // thinking picker instead of defaulting silently.
+            let thinking: Vec<AgentSelectOption> = session
+                .thinking_options()
+                .iter()
+                .map(|o| AgentSelectOption {
+                    id: o.id.clone(),
+                    label: o.label.clone(),
+                    description: o.description.clone(),
+                    is_default: o.is_default,
+                })
+                .collect();
+            let default_thinking = thinking.iter().find(|o| o.is_default).map(|o| o.id.clone());
             session
                 .available_models()
                 .iter()
@@ -176,6 +192,8 @@ impl AgentProvider for AcpProvider {
                     id: m.id.clone(),
                     label: m.label.clone(),
                     description: m.description.clone(),
+                    thinking_options: thinking.clone(),
+                    default_thinking_option_id: default_thinking.clone(),
                 })
                 .collect()
         })

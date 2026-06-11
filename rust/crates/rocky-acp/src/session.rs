@@ -56,6 +56,23 @@ pub struct AcpModel {
     pub description: Option<String>,
 }
 
+/// A choice within a `select` config option (e.g. the `thought_level`
+/// selector's `off`/`low`/`high`/...). Mirrors the wire `AgentSelectOption`
+/// (`messages.ts:214-220`): `{ id, label, description?, isDefault? }`.
+/// `is_default` is set when the choice equals the option's `currentValue`
+/// (`deriveSelectorOptions`, acp-agent.ts:2339-2345).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpSelectOption {
+    /// Choice value (`value`), used as the option id.
+    pub id: String,
+    /// Human label (`name`).
+    pub label: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// True when this choice is the option's current/default value.
+    pub is_default: bool,
+}
+
 /// How a session is initialized.
 pub enum SessionInit {
     /// Fresh `session/new`.
@@ -106,6 +123,7 @@ pub struct AcpSession {
     autonomous: bool,
     available_modes: Vec<AgentMode>,
     available_models: Vec<AcpModel>,
+    thinking_options: Vec<AcpSelectOption>,
     current_mode_id: Option<String>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentStreamEvent>>>,
     lifecycle_tx: mpsc::UnboundedSender<AgentStreamEvent>,
@@ -157,6 +175,7 @@ impl AcpSession {
 
         let available_modes = extract_modes(&session_state);
         let available_models = extract_models(&session_state);
+        let thinking_options = extract_thinking_options(&session_state);
         let current_mode_id = extract_current_mode_id(&session_state);
         let autonomous = config
             .approval_policy
@@ -192,6 +211,7 @@ impl AcpSession {
             autonomous,
             available_modes: append_rocky_bypass_mode(available_modes),
             available_models,
+            thinking_options,
             current_mode_id,
             events_rx: Mutex::new(Some(events_rx)),
             lifecycle_tx: events_tx,
@@ -217,6 +237,13 @@ impl AcpSession {
     /// Models the agent advertised for this session (from `session/new`).
     pub fn available_models(&self) -> &[AcpModel] {
         &self.available_models
+    }
+
+    /// The `thought_level` (thinking) select options the agent advertised for
+    /// this session, if any. TS attaches these to every model definition
+    /// (`deriveModelDefinitionsFromACP`, acp-agent.ts:517-540).
+    pub fn thinking_options(&self) -> &[AcpSelectOption] {
+        &self.thinking_options
     }
 
     /// The session's current mode id (`modes.currentModeId`), if any.
@@ -762,6 +789,52 @@ fn extract_models(state: &Value) -> Vec<AcpModel> {
         .collect()
 }
 
+/// Extract the `thought_level` (thinking) select options from a
+/// `session/new`/`session/load` state response's `configOptions`.
+///
+/// Mirrors `deriveSelectorOptions(configOptions, "thought_level")`
+/// (acp-agent.ts:2330-2346): find the select config option whose `category`
+/// (or `id`) is `thought_level`, then map each choice's `value`/`name` and mark
+/// the one equal to the option's `currentValue` as default. Live amaze shape:
+/// `{ id: "thinking", category: "thought_level", type: "select",
+///    currentValue: "xhigh", options: [ { value: "off", name: "Off" }, ... ] }`.
+/// Tolerates absence by returning `[]`.
+fn extract_thinking_options(state: &Value) -> Vec<AcpSelectOption> {
+    let Some(options) = state.get("configOptions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(opt) = options.iter().find(|o| {
+        o.get("category").and_then(Value::as_str) == Some("thought_level")
+            || o.get("id").and_then(Value::as_str) == Some("thought_level")
+    }) else {
+        return Vec::new();
+    };
+    let current = opt.get("currentValue").and_then(Value::as_str);
+    opt.get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|choice| {
+                    let value = choice.get("value").and_then(Value::as_str)?;
+                    Some(AcpSelectOption {
+                        id: value.to_string(),
+                        label: choice
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(value)
+                            .to_string(),
+                        description: choice
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        is_default: current == Some(value),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read `modes.currentModeId` from a `session/new`/`session/load` state response.
 ///
 /// Captured live amaze shape (cf. `session.ts`):
@@ -1016,6 +1089,41 @@ mod tests {
         assert!(extract_models(&json!({})).is_empty());
         assert!(extract_models(&json!({ "models": {} })).is_empty());
         assert!(extract_models(&json!({ "models": { "availableModels": [] } })).is_empty());
+    }
+
+    #[test]
+    fn extract_thinking_options_reads_thought_level_selector() {
+        // Live amaze `session/new` configOptions shape.
+        let state = json!({
+            "configOptions": [
+                { "id": "mode", "category": "mode", "type": "select", "currentValue": "default",
+                  "options": [ { "value": "default", "name": "Default" } ] },
+                { "id": "thinking", "category": "thought_level", "type": "select",
+                  "currentValue": "xhigh", "options": [
+                    { "value": "off", "name": "Off" },
+                    { "value": "high", "name": "high" },
+                    { "value": "xhigh", "name": "xhigh" }
+                  ] }
+            ]
+        });
+        let opts = extract_thinking_options(&state);
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].id, "off");
+        assert!(!opts[0].is_default);
+        assert_eq!(opts[2].id, "xhigh");
+        assert!(opts[2].is_default, "currentValue choice must be marked default");
+    }
+
+    #[test]
+    fn extract_thinking_options_tolerates_absence() {
+        assert!(extract_thinking_options(&json!({})).is_empty());
+        assert!(extract_thinking_options(&json!({ "configOptions": [] })).is_empty());
+        // No thought_level option present -> empty.
+        assert!(extract_thinking_options(&json!({
+            "configOptions": [ { "id": "mode", "category": "mode", "type": "select",
+                "currentValue": "default", "options": [] } ]
+        }))
+        .is_empty());
     }
 
     #[test]

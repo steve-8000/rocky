@@ -618,24 +618,13 @@ async fn handle_list_provider_models(
     let cwd = discovery_cwd(ctx, &msg);
     let (models, error) = match discover(ctx, cwd).await {
         Ok(disc) => (
+            // `AgentModelDef` already serializes to the wire `AgentModelDefinition`
+            // shape (camelCase, optional fields skipped), including the per-model
+            // `thinkingOptions` / `defaultThinkingOptionId` the WebUI needs to
+            // render the thinking picker. Serialize it directly.
             disc.models
                 .iter()
-                .map(|m| {
-                    // Map AgentModelDef -> AgentModelDefinition, omitting the
-                    // optional fields we do not own (isDefault, metadata,
-                    // thinkingOptions, ...) rather than fabricating them.
-                    let mut v = json!({
-                        "provider": m.provider,
-                        "id": m.id,
-                        "label": m.label,
-                    });
-                    if let Some(desc) = &m.description {
-                        v.as_object_mut()
-                            .expect("model is an object")
-                            .insert("description".to_string(), Value::String(desc.clone()));
-                    }
-                    v
-                })
+                .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
                 .collect::<Vec<_>>(),
             Value::Null,
         ),

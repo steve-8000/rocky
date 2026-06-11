@@ -310,6 +310,21 @@ impl AgentProvider for MockProvider {
             id: "anthropic/claude-sonnet".to_string(),
             label: "Claude Sonnet".to_string(),
             description: Some("mock".to_string()),
+            thinking_options: vec![
+                rocky_agents::AgentSelectOption {
+                    id: "off".to_string(),
+                    label: "Off".to_string(),
+                    description: None,
+                    is_default: false,
+                },
+                rocky_agents::AgentSelectOption {
+                    id: "high".to_string(),
+                    label: "high".to_string(),
+                    description: None,
+                    is_default: true,
+                },
+            ],
+            default_thinking_option_id: Some("high".to_string()),
         }])
     }
     async fn list_modes(
@@ -373,9 +388,19 @@ async fn list_provider_models_mock_response_shape() {
     assert_eq!(models[0]["id"], "anthropic/claude-sonnet");
     assert_eq!(models[0]["label"], "Claude Sonnet");
     assert_eq!(models[0]["description"], "mock");
-    // Optional fields we do not own must NOT be fabricated.
+    // Top-level model `isDefault` is not owned by the daemon and must NOT be
+    // fabricated.
     assert!(models[0].get("isDefault").is_none());
-    assert!(models[0].get("thinkingOptions").is_none());
+    // Per-model thinking options ARE surfaced (mirrors TS
+    // `deriveModelDefinitionsFromACP`): the WebUI needs them to render the
+    // thinking picker. Verify the camelCase wire shape and the default flag.
+    let thinking = models[0]["thinkingOptions"].as_array().unwrap();
+    assert_eq!(thinking.len(), 2);
+    assert_eq!(thinking[0]["id"], "off");
+    assert!(thinking[0].get("isDefault").is_none());
+    assert_eq!(thinking[1]["id"], "high");
+    assert_eq!(thinking[1]["isDefault"], true);
+    assert_eq!(models[0]["defaultThinkingOptionId"], "high");
 }
 
 #[tokio::test]
@@ -480,6 +505,20 @@ async fn list_provider_models_live_returns_claude_model() {
             .iter()
             .any(|m| m["id"].as_str().is_some_and(|s| s.contains("claude"))),
         "expected an anthropic/claude model id"
+    );
+    // Live amaze advertises a `thought_level` selector (off/minimal/low/medium/
+    // high/xhigh); every model must carry it so the WebUI thinking picker works.
+    let thinking = models[0]["thinkingOptions"]
+        .as_array()
+        .expect("live model should carry thinkingOptions");
+    assert!(
+        thinking.len() > 1,
+        "expected multiple thinking options, got {}",
+        thinking.len()
+    );
+    assert!(
+        models[0].get("defaultThinkingOptionId").is_some(),
+        "expected a defaultThinkingOptionId"
     );
 }
 

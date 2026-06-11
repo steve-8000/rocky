@@ -53,6 +53,35 @@ pub struct AgentModelDef {
     /// Optional description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Per-model "thinking" (thought_level) selector choices. TS attaches the
+    /// session's `thought_level` config options to every model definition
+    /// (`deriveModelDefinitionsFromACP`, acp-agent.ts:517-540); the WebUI shows
+    /// the thinking picker only when a model carries more than one option.
+    /// Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_options: Vec<AgentSelectOption>,
+    /// Default thinking option id (the option whose value equals the agent's
+    /// current `thought_level`). Omitted from the wire when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking_option_id: Option<String>,
+}
+
+/// A choice within a select-style option (e.g. a model's thinking levels).
+/// Mirrors the wire `AgentSelectOption` (`messages.ts:214-220`):
+/// `{ id, label, description?, isDefault? }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSelectOption {
+    /// Stable option id.
+    pub id: String,
+    /// Human-facing label.
+    pub label: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// True when this is the option's current/default choice. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
 }
 
 /// A live provider session. Stream events flow from the provider into the
