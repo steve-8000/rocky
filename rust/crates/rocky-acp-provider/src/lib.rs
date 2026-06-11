@@ -278,6 +278,27 @@ impl AgentSession for AcpAgentSession {
         Ok(())
     }
 
+    async fn set_thinking_option(&self, option_id: &str) -> Result<String, AgentError> {
+        self.inner
+            .set_thinking_option(option_id)
+            .await
+            .map_err(|e| AgentError::Provider(e.to_string()))
+    }
+
+    async fn set_model(&self, model_id: &str) -> Result<String, AgentError> {
+        self.inner
+            .set_model_option(model_id)
+            .await
+            .map_err(|e| AgentError::Provider(e.to_string()))
+    }
+
+    async fn set_mode(&self, mode_id: &str) -> Result<(), AgentError> {
+        self.inner
+            .set_mode(mode_id)
+            .await
+            .map_err(|e| AgentError::Provider(e.to_string()))
+    }
+
     async fn cancel(&self) -> Result<(), AgentError> {
         self.inner
             .cancel()

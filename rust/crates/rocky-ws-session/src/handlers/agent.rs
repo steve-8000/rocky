@@ -320,6 +320,21 @@ fn action_response(
     })
 }
 
+/// Build an `AgentActionResponsePayload` from a `Result`: `accepted:true` with a
+/// null error on `Ok`, `accepted:false` carrying the error string on `Err`
+/// (never a fake ok). Shared by the live `set_agent_*` config mutators.
+fn action_result(
+    type_str: &str,
+    req_id: &str,
+    agent_id: &str,
+    result: Result<(), rocky_agents::AgentError>,
+) -> Value {
+    match result {
+        Ok(()) => action_response(type_str, req_id, agent_id, true, None),
+        Err(err) => action_response(type_str, req_id, agent_id, false, Some(err.to_string())),
+    }
+}
+
 fn rpc_error(req_id: &str, request_type: &str, error: String, code: &str) -> Value {
     json!({
         "type": "rpc_error",
@@ -816,27 +831,59 @@ async fn config_mutation_response(
 }
 
 async fn handle_set_agent_mode(manager: &AgentManager, msg: Value) -> Result<Value, SessionRpcError> {
-    Ok(config_mutation_response(manager, "set_agent_mode_response", "set_agent_mode_request", &msg).await)
+    let req_id = request_id(&msg);
+    let agent_id = opt_str(&msg, "agentId").unwrap_or_default();
+    let mode_id = opt_str(&msg, "modeId").unwrap_or_default();
+    let result = manager.set_agent_mode(&agent_id, &mode_id).await;
+    Ok(action_result(
+        "set_agent_mode_response",
+        &req_id,
+        &agent_id,
+        result.map(|_| ()),
+    ))
 }
 
 async fn handle_set_agent_model(
     manager: &AgentManager,
     msg: Value,
 ) -> Result<Value, SessionRpcError> {
-    Ok(config_mutation_response(manager, "set_agent_model_response", "set_agent_model_request", &msg).await)
+    let req_id = request_id(&msg);
+    let agent_id = opt_str(&msg, "agentId").unwrap_or_default();
+    // `modelId` is nullable on the wire; a null/absent model is a no-op accept
+    // (mirrors the TS no-op when no model id is supplied).
+    let result = match opt_str(&msg, "modelId").filter(|s| !s.is_empty()) {
+        Some(model_id) => manager.set_agent_model(&agent_id, &model_id).await.map(|_| ()),
+        None => Ok(()),
+    };
+    Ok(action_result(
+        "set_agent_model_response",
+        &req_id,
+        &agent_id,
+        result,
+    ))
 }
 
 async fn handle_set_agent_thinking(
     manager: &AgentManager,
     msg: Value,
 ) -> Result<Value, SessionRpcError> {
-    Ok(config_mutation_response(
-        manager,
+    let req_id = request_id(&msg);
+    let agent_id = opt_str(&msg, "agentId").unwrap_or_default();
+    // `thinkingOptionId` is nullable; null clears it (no provider call needed,
+    // mirrors `setThinkingOption(null)`, acp-agent.ts:1469-1472).
+    let result = match opt_str(&msg, "thinkingOptionId").filter(|s| !s.is_empty()) {
+        Some(option_id) => manager
+            .set_agent_thinking(&agent_id, &option_id)
+            .await
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    Ok(action_result(
         "set_agent_thinking_response",
-        "set_agent_thinking_request",
-        &msg,
-    )
-    .await)
+        &req_id,
+        &agent_id,
+        result,
+    ))
 }
 
 async fn handle_set_agent_feature(

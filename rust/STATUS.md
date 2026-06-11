@@ -101,7 +101,12 @@ errors, never fake success):
 - dictation/voice streaming RPCs (capability-gated as unsupported),
 - binary terminal STREAM frame piping (JSON terminal control messages are
   handled; raw output/input frame relay must be wired at the WS transport),
-- config mutation RPCs that require live provider/storage writers.
+- config mutation RPCs that require durable storage writers (`update_agent`
+  name/labels) or provider features (`set_agent_feature`). The live provider
+  config selectors — `set_agent_model` / `set_agent_thinking` / `set_agent_mode`
+  — ARE wired: they drive `session/set_config_option` on the live ACP session
+  and broadcast the matching `*_changed` stream event. A session-less (hydrated
+  or closed) agent returns a precise "no live session; resume it" error.
 
 Because of this partial coverage AND live/idle agents on the production daemon,
 production cutover is **intentionally not executed**. Per the user constraints

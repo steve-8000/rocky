@@ -103,6 +103,31 @@ pub trait AgentSession: Send + Sync {
     /// channel returned from [`AgentSession::subscribe_events`].
     async fn prompt(&self, input: PromptInput) -> Result<(), AgentError>;
 
+    /// Set the thinking (`thought_level`) option, returning the canonical id
+    /// the provider applied. Default: unsupported. ACP-backed sessions override
+    /// this.
+    async fn set_thinking_option(&self, _option_id: &str) -> Result<String, AgentError> {
+        Err(AgentError::Provider(
+            "provider does not support thinking-option selection".into(),
+        ))
+    }
+
+    /// Set the model, returning the canonical model id the provider applied.
+    /// Default: unsupported. ACP-backed sessions override this.
+    async fn set_model(&self, _model_id: &str) -> Result<String, AgentError> {
+        Err(AgentError::Provider(
+            "provider does not support model selection".into(),
+        ))
+    }
+
+    /// Set the session mode. Default: unsupported. ACP-backed sessions override
+    /// this.
+    async fn set_mode(&self, _mode_id: &str) -> Result<(), AgentError> {
+        Err(AgentError::Provider(
+            "provider does not support mode selection".into(),
+        ))
+    }
+
     /// Cancel the in-flight turn, if any.
     async fn cancel(&self) -> Result<(), AgentError>;
 

@@ -272,6 +272,20 @@ struct Inner {
     broadcast: broadcast::Sender<AgentStreamBroadcast>,
 }
 
+/// Error for config-mutation calls that need a live provider session.
+/// Distinguishes a genuinely unknown agent (`NotFound`) from a known but
+/// session-less one (hydrated from disk after a restart, or already closed),
+/// where mutating provider config is impossible until the agent is resumed.
+fn no_live_session_error(state: &ManagerState, id: &str) -> AgentError {
+    if state.agents.contains_key(id) {
+        AgentError::Provider(format!(
+            "agent {id} has no live session (resume it before changing model/thinking/mode)"
+        ))
+    } else {
+        AgentError::NotFound(id.to_string())
+    }
+}
+
 struct ManagerState {
     agents: BTreeMap<String, ManagedAgent>,
     sessions: BTreeMap<String, Box<dyn AgentSession>>,
@@ -555,6 +569,123 @@ impl AgentManager {
             self.persist_record(&agent)?;
         }
         Ok(())
+    }
+
+    /// Set the thinking (`thought_level`) option on a live agent's session and
+    /// reflect the canonical applied value in the agent's runtime info. The
+    /// provider's own `config_option_update` stream (if any) will reconcile the
+    /// same value; this write is the authoritative immediate update.
+    pub async fn set_agent_thinking(
+        &self,
+        id: &str,
+        option_id: &str,
+    ) -> Result<String, AgentError> {
+        let guard = self.inner.state.lock().await;
+        let session = guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| no_live_session_error(&guard, id))?;
+        let applied = session.set_thinking_option(option_id).await?;
+        let provider = session.runtime_info().provider;
+        drop(guard);
+        self.apply_runtime_change(id, |info| {
+            info.thinking_option_id = Some(applied.clone());
+        })
+        .await?;
+        self.broadcast(AgentStreamBroadcast {
+            agent_id: id.to_string(),
+            event: AgentStreamEvent::ThinkingOptionChanged {
+                provider,
+                thinking_option_id: Some(applied.clone()),
+            },
+            seq: None,
+            epoch: None,
+            timestamp: None,
+        });
+        Ok(applied)
+    }
+
+    /// Set the model on a live agent's session, reflecting the canonical applied
+    /// model id in runtime info.
+    pub async fn set_agent_model(&self, id: &str, model_id: &str) -> Result<String, AgentError> {
+        let guard = self.inner.state.lock().await;
+        let session = guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| no_live_session_error(&guard, id))?;
+        let applied = session.set_model(model_id).await?;
+        let provider = session.runtime_info().provider;
+        drop(guard);
+        let agent = self
+            .apply_runtime_change(id, |info| {
+                info.model = Some(applied.clone());
+            })
+            .await?;
+        if let Some(runtime_info) = agent.runtime_info {
+            self.broadcast(AgentStreamBroadcast {
+                agent_id: id.to_string(),
+                event: AgentStreamEvent::ModelChanged {
+                    provider,
+                    runtime_info,
+                },
+                seq: None,
+                epoch: None,
+                timestamp: None,
+            });
+        }
+        Ok(applied)
+    }
+
+    /// Set the session mode on a live agent's session, reflecting it in runtime
+    /// info.
+    pub async fn set_agent_mode(&self, id: &str, mode_id: &str) -> Result<(), AgentError> {
+        let guard = self.inner.state.lock().await;
+        let session = guard
+            .sessions
+            .get(id)
+            .ok_or_else(|| no_live_session_error(&guard, id))?;
+        session.set_mode(mode_id).await?;
+        let provider = session.runtime_info().provider;
+        drop(guard);
+        self.apply_runtime_change(id, |info| {
+            info.mode_id = Some(mode_id.to_string());
+        })
+        .await?;
+        self.broadcast(AgentStreamBroadcast {
+            agent_id: id.to_string(),
+            event: AgentStreamEvent::ModeChanged {
+                provider,
+                current_mode_id: Some(mode_id.to_string()),
+                available_modes: Vec::new(),
+            },
+            seq: None,
+            epoch: None,
+            timestamp: None,
+        });
+        Ok(())
+    }
+
+    /// Apply an in-place mutation to an agent's runtime info and persist. No-op
+    /// (other than persist) if runtime info is absent.
+    async fn apply_runtime_change(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut AgentRuntimeInfo),
+    ) -> Result<ManagedAgent, AgentError> {
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            if let Some(info) = agent.runtime_info.as_mut() {
+                mutate(info);
+            }
+            agent.updated_at = now_iso8601();
+            agent.clone()
+        };
+        self.persist_record(&agent)?;
+        Ok(agent)
     }
 
     /// Update an agent's runtime info (provider/model/mode/session id).

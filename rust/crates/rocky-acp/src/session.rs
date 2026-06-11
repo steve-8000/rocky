@@ -124,6 +124,12 @@ pub struct AcpSession {
     available_modes: Vec<AgentMode>,
     available_models: Vec<AcpModel>,
     thinking_options: Vec<AcpSelectOption>,
+    /// Wire `configId` of the `thought_level` select option, if the agent
+    /// advertised one (amaze: `"thinking"`). Needed to address it in
+    /// `session/set_config_option`.
+    thinking_config_id: Option<String>,
+    /// Wire `configId` of the `model` select option, if any (amaze: `"model"`).
+    model_config_id: Option<String>,
     current_mode_id: Option<String>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentStreamEvent>>>,
     lifecycle_tx: mpsc::UnboundedSender<AgentStreamEvent>,
@@ -176,6 +182,8 @@ impl AcpSession {
         let available_modes = extract_modes(&session_state);
         let available_models = extract_models(&session_state);
         let thinking_options = extract_thinking_options(&session_state);
+        let thinking_config_id = extract_select_config_id(&session_state, "thought_level");
+        let model_config_id = extract_select_config_id(&session_state, "model");
         let current_mode_id = extract_current_mode_id(&session_state);
         let autonomous = config
             .approval_policy
@@ -212,6 +220,8 @@ impl AcpSession {
             available_modes: append_rocky_bypass_mode(available_modes),
             available_models,
             thinking_options,
+            thinking_config_id,
+            model_config_id,
             current_mode_id,
             events_rx: Mutex::new(Some(events_rx)),
             lifecycle_tx: events_tx,
@@ -244,6 +254,39 @@ impl AcpSession {
     /// (`deriveModelDefinitionsFromACP`, acp-agent.ts:517-540).
     pub fn thinking_options(&self) -> &[AcpSelectOption] {
         &self.thinking_options
+    }
+
+    /// Wire `configId` of the `thought_level` select option, if advertised.
+    pub fn thinking_config_id(&self) -> Option<&str> {
+        self.thinking_config_id.as_deref()
+    }
+
+    /// Wire `configId` of the `model` select option, if advertised.
+    pub fn model_config_id(&self) -> Option<&str> {
+        self.model_config_id.as_deref()
+    }
+
+    /// Set the thinking (`thought_level`) option by id, returning the canonical
+    /// value the agent reports. Errors if the agent did not advertise a
+    /// `thought_level` selector (mirrors `setThinkingOption`'s throw,
+    /// acp-agent.ts:1489-1491).
+    pub async fn set_thinking_option(&self, option_id: &str) -> AcpResult<String> {
+        let config_id = self.thinking_config_id.as_deref().ok_or_else(|| {
+            AcpError::Protocol("agent does not expose ACP thought-level selection".into())
+        })?;
+        let canonical = self.set_config_option(config_id, option_id).await?;
+        Ok(canonical.unwrap_or_else(|| option_id.to_string()))
+    }
+
+    /// Set the model (`model` config option) by id, returning the canonical
+    /// value the agent reports. Errors if the agent did not advertise a `model`
+    /// selector (mirrors `setModel`'s throw, acp-agent.ts:1431-1432).
+    pub async fn set_model_option(&self, model_id: &str) -> AcpResult<String> {
+        let config_id = self.model_config_id.as_deref().ok_or_else(|| {
+            AcpError::Protocol("agent does not expose ACP model selection".into())
+        })?;
+        let canonical = self.set_config_option(config_id, model_id).await?;
+        Ok(canonical.unwrap_or_else(|| model_id.to_string()))
     }
 
     /// The session's current mode id (`modes.currentModeId`), if any.
@@ -349,6 +392,40 @@ impl AcpSession {
             )
             .await
             .map(|_| ())
+    }
+
+    /// Set a `select` config option (`session/set_config_option`, the wire
+    /// method amaze registers as `session_set_config_option`). Mirrors the TS
+    /// `connection.setSessionConfigOption({ sessionId, configId, value })`
+    /// (acp-agent.ts:1492). Returns the canonical `currentValue` the agent
+    /// reports back for `config_id` in the response `configOptions`, falling
+    /// back to `None` when the agent omits it (caller then keeps the requested
+    /// value, matching `applyConfigOptionResponse`, acp-agent.ts:1530-1537).
+    pub async fn set_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+    ) -> AcpResult<Option<String>> {
+        let response = self
+            .transport
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": self.session_id,
+                    "configId": config_id,
+                    "value": value,
+                }),
+            )
+            .await?;
+        Ok(response
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| o.get("id").and_then(Value::as_str) == Some(config_id))
+            })
+            .and_then(|o| o.get("currentValue").and_then(Value::as_str))
+            .map(str::to_string))
     }
 
     /// Answer a held permission request. Selects the matching ACP option per
@@ -787,6 +864,22 @@ fn extract_models(state: &Value) -> Vec<AcpModel> {
             })
         })
         .collect()
+}
+
+/// Find the wire `id` of the `select` config option whose `category` (or `id`)
+/// matches `category`. Used to address the option in `session/set_config_option`
+/// (amaze ids: `mode`/`model`/`thinking`). Returns `None` when absent.
+fn extract_select_config_id(state: &Value, category: &str) -> Option<String> {
+    state
+        .get("configOptions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|o| {
+            o.get("category").and_then(Value::as_str) == Some(category)
+                || o.get("id").and_then(Value::as_str) == Some(category)
+        })
+        .and_then(|o| o.get("id").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// Extract the `thought_level` (thinking) select options from a

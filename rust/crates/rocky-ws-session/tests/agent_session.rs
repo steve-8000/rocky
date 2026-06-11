@@ -419,6 +419,10 @@ async fn create_agent_request_uses_live_provider_and_send_is_accepted() {
 struct RecordingSession {
     provider: String,
     prompts: Arc<std::sync::Mutex<Vec<PromptInput>>>,
+    /// Records (kind, value) for each config mutation, e.g. ("thinking","low").
+    config_writes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// When true, config mutators return an error instead of recording.
+    fail_config: bool,
 }
 
 #[async_trait]
@@ -440,6 +444,36 @@ impl AgentSession for RecordingSession {
         self.prompts.lock().unwrap().push(input);
         Ok(())
     }
+    async fn set_thinking_option(&self, option_id: &str) -> Result<String, AgentError> {
+        if self.fail_config {
+            return Err(AgentError::Provider("thinking unsupported".into()));
+        }
+        self.config_writes
+            .lock()
+            .unwrap()
+            .push(("thinking".to_string(), option_id.to_string()));
+        Ok(option_id.to_string())
+    }
+    async fn set_model(&self, model_id: &str) -> Result<String, AgentError> {
+        if self.fail_config {
+            return Err(AgentError::Provider("model unsupported".into()));
+        }
+        self.config_writes
+            .lock()
+            .unwrap()
+            .push(("model".to_string(), model_id.to_string()));
+        Ok(model_id.to_string())
+    }
+    async fn set_mode(&self, mode_id: &str) -> Result<(), AgentError> {
+        if self.fail_config {
+            return Err(AgentError::Provider("mode unsupported".into()));
+        }
+        self.config_writes
+            .lock()
+            .unwrap()
+            .push(("mode".to_string(), mode_id.to_string()));
+        Ok(())
+    }
     async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
@@ -450,6 +484,18 @@ impl AgentSession for RecordingSession {
 
 struct RecordingProvider {
     prompts: Arc<std::sync::Mutex<Vec<PromptInput>>>,
+    config_writes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    fail_config: bool,
+}
+
+impl RecordingProvider {
+    fn new(prompts: Arc<std::sync::Mutex<Vec<PromptInput>>>) -> Self {
+        Self {
+            prompts,
+            config_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_config: false,
+        }
+    }
 }
 
 #[async_trait]
@@ -464,6 +510,8 @@ impl AgentProvider for RecordingProvider {
         Ok(Box::new(RecordingSession {
             provider: config.provider,
             prompts: self.prompts.clone(),
+            config_writes: self.config_writes.clone(),
+            fail_config: self.fail_config,
         }))
     }
 }
@@ -479,9 +527,7 @@ async fn create_agent_request_delivers_initial_prompt_as_first_turn() {
     let manager = Arc::new(AgentManager::new(home.path()));
     let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
     let mut d = SessionDispatcher::new();
-    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider {
-        prompts: prompts.clone(),
-    });
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts.clone()));
     handlers::agent::register(&mut d, manager.clone(), provider);
 
     let env = envelope(json!({
@@ -509,9 +555,7 @@ async fn create_agent_request_without_initial_prompt_does_not_prompt() {
     let manager = Arc::new(AgentManager::new(home.path()));
     let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
     let mut d = SessionDispatcher::new();
-    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider {
-        prompts: prompts.clone(),
-    });
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts.clone()));
     handlers::agent::register(&mut d, manager, provider);
 
     let env = envelope(json!({
@@ -543,4 +587,151 @@ async fn send_agent_message_to_missing_agent_is_rejected() {
     assert_eq!(m["type"], "send_agent_message_response");
     assert_eq!(m["payload"]["accepted"], false);
     assert!(!m["payload"]["error"].is_null());
+}
+
+/// Create an agent through the dispatcher and return its id.
+async fn create_agent_for(d: &SessionDispatcher, cwd: &str) -> String {
+    let env = envelope(json!({
+        "type": "create_agent_request",
+        "requestId": "cr-cfg",
+        "config": { "provider": "claude", "cwd": cwd },
+        "labels": {},
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["status"], "agent_created");
+    out["message"]["payload"]["agentId"]
+        .as_str()
+        .expect("agent_created carries agentId")
+        .to_string()
+}
+
+#[tokio::test]
+async fn set_agent_thinking_delivers_to_session_and_accepts() {
+    // Regression: the composer exposes the thinking selector (off/minimal/.../xhigh).
+    // Applying a level must reach the live session via session/set_config_option
+    // and return accepted:true — not the old "not wired into the session
+    // dispatcher" rejection.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider = Arc::new(RecordingProvider::new(prompts));
+    let writes = provider.config_writes.clone();
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider as Arc<dyn AgentProvider>);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-thinking").await;
+
+    // thinking
+    let env = envelope(json!({
+        "type": "set_agent_thinking_request",
+        "requestId": "st-1",
+        "agentId": agent_id,
+        "thinkingOptionId": "low",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    let m = &out["message"];
+    assert_eq!(m["type"], "set_agent_thinking_response");
+    assert_eq!(m["payload"]["accepted"], true);
+    assert!(m["payload"]["error"].is_null());
+
+    // model
+    let env = envelope(json!({
+        "type": "set_agent_model_request",
+        "requestId": "sm-1",
+        "agentId": agent_id,
+        "modelId": "anthropic/claude-3-5-sonnet",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["type"], "set_agent_model_response");
+    assert_eq!(out["message"]["payload"]["accepted"], true);
+
+    // mode
+    let env = envelope(json!({
+        "type": "set_agent_mode_request",
+        "requestId": "smode-1",
+        "agentId": agent_id,
+        "modeId": "default",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["type"], "set_agent_mode_response");
+    assert_eq!(out["message"]["payload"]["accepted"], true);
+
+    let recorded = writes.lock().unwrap();
+    assert_eq!(
+        *recorded,
+        vec![
+            ("thinking".to_string(), "low".to_string()),
+            ("model".to_string(), "anthropic/claude-3-5-sonnet".to_string()),
+            ("mode".to_string(), "default".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn set_agent_thinking_null_is_accepted_without_session_call() {
+    // A null thinkingOptionId clears the level (TS setThinkingOption(null) early
+    // return); it must accept without hitting the session.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider = Arc::new(RecordingProvider::new(prompts));
+    let writes = provider.config_writes.clone();
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider as Arc<dyn AgentProvider>);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-thinking-null").await;
+    let env = envelope(json!({
+        "type": "set_agent_thinking_request",
+        "requestId": "st-null",
+        "agentId": agent_id,
+        "thinkingOptionId": Value::Null,
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["accepted"], true);
+    assert!(writes.lock().unwrap().is_empty(), "null must not call the session");
+}
+
+#[tokio::test]
+async fn set_agent_thinking_propagates_provider_error() {
+    // When the provider/session rejects the change, the response must be
+    // accepted:false with a non-null error (never a fake ok).
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let mut provider = RecordingProvider::new(prompts);
+    provider.fail_config = true;
+    let provider = Arc::new(provider);
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider as Arc<dyn AgentProvider>);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-thinking-fail").await;
+    let env = envelope(json!({
+        "type": "set_agent_thinking_request",
+        "requestId": "st-fail",
+        "agentId": agent_id,
+        "thinkingOptionId": "high",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["accepted"], false);
+    assert!(!out["message"]["payload"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn set_agent_thinking_missing_agent_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider = Arc::new(RecordingProvider::new(prompts));
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider as Arc<dyn AgentProvider>);
+
+    let env = envelope(json!({
+        "type": "set_agent_thinking_request",
+        "requestId": "st-missing",
+        "agentId": "does-not-exist",
+        "thinkingOptionId": "low",
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["accepted"], false);
+    assert!(!out["message"]["payload"]["error"].is_null());
 }
