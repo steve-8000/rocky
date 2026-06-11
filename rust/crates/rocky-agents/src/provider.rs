@@ -9,7 +9,7 @@
 //! of `AgentStreamEvent`s, prompt submission, cancellation, and close.
 
 use async_trait::async_trait;
-use rocky_agent_domain::{AgentRuntimeInfo, AgentStreamEvent};
+use rocky_agent_domain::{AgentMode, AgentRuntimeInfo, AgentStreamEvent};
 use rocky_store::PersistenceHandle;
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,18 @@ pub trait AgentSession: Send + Sync {
 
     /// Persistence handle for resume/reload, if the provider supports it.
     fn describe_persistence(&self) -> Option<PersistenceHandle> {
+        None
+    }
+    /// Modes the live session advertised (`session/new` `modes.availableModes`,
+    /// plus any synthetic mode the provider appends). Default: empty. ACP-backed
+    /// sessions override this so the WebUI composer can render the mode selector
+    /// for an existing agent.
+    fn available_modes(&self) -> Vec<AgentMode> {
+        Vec::new()
+    }
+
+    /// The session's current mode id (`modes.currentModeId`). Default: `None`.
+    fn current_mode_id(&self) -> Option<String> {
         None
     }
 

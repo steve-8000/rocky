@@ -163,6 +163,21 @@ impl AgentProvider for AcpProvider {
             .await
             .map_err(|e| AgentError::Provider(e.to_string()))?;
 
+        // Apply the requested initial mode (e.g. bypass selected at creation in
+        // the mission/composer draft). The WebUI passes the choice as
+        // `config.mode_id`, NOT as `approval_policy`, so without this a
+        // mission-set bypass would never reach the session and would silently
+        // revert to the agent default in chat. `set_mode` also flips Rocky's
+        // auto-grant policy for synthetic bypass.
+        if let Some(mode_id) = config.mode_id.as_deref() {
+            if session.current_mode_id().as_deref() != Some(mode_id) {
+                session
+                    .set_mode(mode_id)
+                    .await
+                    .map_err(|e| AgentError::Provider(e.to_string()))?;
+            }
+        }
+
         Ok(Box::new(AcpAgentSession::new(session, &config)))
     }
 
@@ -257,6 +272,14 @@ impl AcpAgentSession {
 impl AgentSession for AcpAgentSession {
     fn session_id(&self) -> Option<String> {
         Some(self.inner.session_id().to_string())
+    }
+
+    fn available_modes(&self) -> Vec<AgentMode> {
+        self.inner.available_modes().to_vec()
+    }
+
+    fn current_mode_id(&self) -> Option<String> {
+        self.inner.current_mode_id()
     }
 
     fn runtime_info(&self) -> AgentRuntimeInfo {

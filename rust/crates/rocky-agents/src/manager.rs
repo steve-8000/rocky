@@ -521,6 +521,22 @@ impl AgentManager {
         self.inner.state.lock().await.agents.get(id).cloned()
     }
 
+    /// Modes the agent's live session advertises, plus its current mode id.
+    /// Returns `(modes, current_mode_id)`. When the agent has no live session
+    /// (hydrated after restart, or closed) both are empty/`None` — the WebUI
+    /// then hides the composer mode selector, matching the TS behavior of an
+    /// agent with no `availableModes`.
+    pub async fn agent_modes(
+        &self,
+        id: &str,
+    ) -> (Vec<rocky_agent_domain::AgentMode>, Option<String>) {
+        let guard = self.inner.state.lock().await;
+        match guard.sessions.get(id) {
+            Some(session) => (session.available_modes(), session.current_mode_id()),
+            None => (Vec::new(), None),
+        }
+    }
+
     /// List all live agents (sorted by id for determinism).
     pub async fn list(&self) -> Vec<ManagedAgent> {
         self.inner

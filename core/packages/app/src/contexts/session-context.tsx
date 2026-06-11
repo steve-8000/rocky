@@ -469,6 +469,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const setHasHydratedAgents = useSessionStore((state) => state.setHasHydratedAgents);
   const setHasHydratedWorkspaces = useSessionStore((state) => state.setHasHydratedWorkspaces);
   const setAgents = useSessionStore((state) => state.setAgents);
+  const setAgentDetails = useSessionStore((state) => state.setAgentDetails);
   const setWorkspaces = useSessionStore((state) => state.setWorkspaces);
   const mergeWorkspaces = useSessionStore((state) => state.mergeWorkspaces);
   const removeWorkspace = useSessionStore((state) => state.removeWorkspace);
@@ -1244,6 +1245,38 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       ) {
         voiceRuntime?.onTurnEvent(serverId, agentId, event.type);
       }
+      // Live config-mutation events (mode/model/thinking) are not timeline
+      // items; the daemon emits them so the composer's selectors reflect a
+      // runtime change without a reload. Patch the agent slice directly.
+      if (
+        event.type === "mode_changed" ||
+        event.type === "model_changed" ||
+        event.type === "thinking_option_changed"
+      ) {
+        const patchAgent = (agent: Agent): Agent => {
+          if (event.type === "mode_changed") {
+            return { ...agent, currentModeId: event.currentModeId };
+          }
+          if (event.type === "thinking_option_changed") {
+            return { ...agent, thinkingOptionId: event.thinkingOptionId ?? undefined };
+          }
+          // model_changed carries the full runtimeInfo.
+          return {
+            ...agent,
+            runtimeInfo: event.runtimeInfo,
+            model: event.runtimeInfo.model ?? agent.model,
+          };
+        };
+        const applyPatch = (prev: Map<string, Agent>): Map<string, Agent> => {
+          const existing = prev.get(agentId);
+          if (!existing) return prev;
+          const next = new Map(prev);
+          next.set(agentId, patchAgent(existing));
+          return next;
+        };
+        setAgents(serverId, applyPatch);
+        setAgentDetails(serverId, applyPatch);
+      }
 
       // Attention notification stays in React (not extractable to pure reducer)
       if (event.type === "attention_required") {
@@ -1674,6 +1707,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     setAgentTimelineCursor,
     setInitializingAgents,
     setAgents,
+    setAgentDetails,
     setWorkspaces,
     mergeWorkspaces,
     removeWorkspace,

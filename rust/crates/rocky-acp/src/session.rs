@@ -21,6 +21,7 @@
 //!   optionId } }`
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rocky_agent_domain::{
@@ -30,7 +31,7 @@ use rocky_agent_domain::{
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::approval::{append_rocky_bypass_mode, is_rocky_autonomous_approval};
+use crate::approval::{append_rocky_bypass_mode, is_rocky_autonomous_approval, ROCKY_BYPASS_MODE_ID};
 use crate::error::{AcpError, AcpResult};
 use crate::process::{AcpProcess, ProcessSpec};
 use crate::tool_detail::{map_tool_detail, map_tool_status, AcpToolSnapshot};
@@ -120,8 +121,19 @@ pub struct AcpSession {
     process: Mutex<Option<AcpProcess>>,
     session_id: String,
     provider: String,
-    autonomous: bool,
+    /// Whether Rocky auto-grants permission requests. Shared with the
+    /// [`Translator`] so a runtime mode change (selecting/leaving bypass via
+    /// [`AcpSession::set_mode`]) takes effect immediately on in-flight and
+    /// future permission prompts, not just at connect.
+    autonomous: Arc<AtomicBool>,
     available_modes: Vec<AgentMode>,
+    /// True when the `bypass` mode we expose is Rocky's synthetic one (the agent
+    /// advertised no native autonomous mode). Used by [`AcpSession::set_mode`] to
+    /// short-circuit: selecting synthetic bypass must NOT be forwarded to the
+    /// agent (it would reject an unknown mode) — Rocky auto-grants permissions
+    /// itself. Computed BEFORE `available_modes` is augmented with the synthetic
+    /// entry, so it cannot be derived by scanning `available_modes` afterwards.
+    bypass_is_synthetic: bool,
     available_models: Vec<AcpModel>,
     thinking_options: Vec<AcpSelectOption>,
     /// Wire `configId` of the `thought_level` select option, if the agent
@@ -130,7 +142,12 @@ pub struct AcpSession {
     thinking_config_id: Option<String>,
     /// Wire `configId` of the `model` select option, if any (amaze: `"model"`).
     model_config_id: Option<String>,
-    current_mode_id: Option<String>,
+    /// The session's current mode id (`modes.currentModeId`). Interior-mutable
+    /// and shared with the [`Translator`] so it tracks both runtime
+    /// [`AcpSession::set_mode`] calls and agent-driven `current_mode_update`
+    /// events. Without this the value is frozen at connect and the WebUI
+    /// composer's mode selector never reflects a change.
+    current_mode_id: Arc<std::sync::Mutex<Option<String>>>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentStreamEvent>>>,
     lifecycle_tx: mpsc::UnboundedSender<AgentStreamEvent>,
     pending: PendingPermissions,
@@ -180,16 +197,26 @@ impl AcpSession {
         };
 
         let available_modes = extract_modes(&session_state);
+        // Rocky appends a synthetic `bypass` mode iff the agent advertised no
+        // native autonomous mode. When synthetic, selecting it is handled by
+        // Rocky (auto-grant) and must NOT be forwarded to the agent.
+        let bypass_is_synthetic = !available_modes
+            .iter()
+            .any(|mode| is_rocky_autonomous_approval(&mode.id));
         let available_models = extract_models(&session_state);
         let thinking_options = extract_thinking_options(&session_state);
         let thinking_config_id = extract_select_config_id(&session_state, "thought_level");
         let model_config_id = extract_select_config_id(&session_state, "model");
-        let current_mode_id = extract_current_mode_id(&session_state);
-        let autonomous = config
-            .approval_policy
-            .as_deref()
-            .map(is_rocky_autonomous_approval)
-            .unwrap_or(false);
+        let current_mode_id = Arc::new(std::sync::Mutex::new(extract_current_mode_id(
+            &session_state,
+        )));
+        let autonomous = Arc::new(AtomicBool::new(
+            config
+                .approval_policy
+                .as_deref()
+                .map(is_rocky_autonomous_approval)
+                .unwrap_or(false),
+        ));
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
@@ -206,7 +233,8 @@ impl AcpSession {
             events_tx: events_tx.clone(),
             pending: pending.clone(),
             transport: transport.clone(),
-            autonomous,
+            autonomous: autonomous.clone(),
+            current_mode_id: current_mode_id.clone(),
             tool_calls: HashMap::new(),
         };
         tokio::spawn(translator.run(inbound_rx));
@@ -218,6 +246,7 @@ impl AcpSession {
             provider: ACP_PROVIDER.to_string(),
             autonomous,
             available_modes: append_rocky_bypass_mode(available_modes),
+            bypass_is_synthetic,
             available_models,
             thinking_options,
             thinking_config_id,
@@ -289,9 +318,10 @@ impl AcpSession {
         Ok(canonical.unwrap_or_else(|| model_id.to_string()))
     }
 
-    /// The session's current mode id (`modes.currentModeId`), if any.
-    pub fn current_mode_id(&self) -> Option<&str> {
-        self.current_mode_id.as_deref()
+    /// The session's current mode id (`modes.currentModeId`), if any. Reflects
+    /// runtime [`AcpSession::set_mode`] calls and agent-driven updates.
+    pub fn current_mode_id(&self) -> Option<String> {
+        self.current_mode_id.lock().unwrap().clone()
     }
 
     /// Take the event receiver. Returns `None` if already taken.
@@ -379,10 +409,20 @@ impl AcpSession {
     /// Rocky autonomous alias not exposed by the agent, this is a no-op handled
     /// by Rocky (mirrors the `providerModeWriter` short-circuit).
     pub async fn set_mode(&self, mode_id: &str) -> AcpResult<()> {
-        if is_rocky_autonomous_approval(mode_id)
-            && !self.available_modes.iter().any(|m| m.id == mode_id)
-        {
+        // A mode is "native" only if the agent itself advertised it — the
+        // synthetic `bypass` entry we appended does not count. Selecting an
+        // autonomous alias that is not native is handled by Rocky (auto-grant)
+        // and must NOT be forwarded (the agent would reject an unknown mode).
+        let is_native = self.available_modes.iter().any(|m| m.id == mode_id)
+            && !(mode_id == ROCKY_BYPASS_MODE_ID && self.bypass_is_synthetic);
+        let is_autonomous_mode = is_rocky_autonomous_approval(mode_id);
+        // Reflect the runtime mode change in our auto-grant policy so permission
+        // prompts are auto-approved while in bypass and held again when leaving.
+        // Shared with the Translator, so this takes effect immediately.
+        self.autonomous.store(is_autonomous_mode, Ordering::SeqCst);
+        if is_autonomous_mode && !is_native {
             // Rocky handles bypass itself; do not forward to the agent.
+            *self.current_mode_id.lock().unwrap() = Some(mode_id.to_string());
             return Ok(());
         }
         self.transport
@@ -391,7 +431,9 @@ impl AcpSession {
                 json!({ "sessionId": self.session_id, "modeId": mode_id }),
             )
             .await
-            .map(|_| ())
+            .map(|_| ())?;
+        *self.current_mode_id.lock().unwrap() = Some(mode_id.to_string());
+        Ok(())
     }
 
     /// Set a `select` config option (`session/set_config_option`, the wire
@@ -467,7 +509,7 @@ impl AcpSession {
 
     /// Whether this session auto-grants permissions (autonomous approval).
     pub fn is_autonomous(&self) -> bool {
-        self.autonomous
+        self.autonomous.load(Ordering::SeqCst)
     }
 
     /// Graceful shutdown: close stdin, SIGTERM, wait, then SIGKILL.
@@ -494,7 +536,8 @@ struct Translator {
     events_tx: mpsc::UnboundedSender<AgentStreamEvent>,
     pending: PendingPermissions,
     transport: Transport,
-    autonomous: bool,
+    autonomous: Arc<AtomicBool>,
+    current_mode_id: Arc<std::sync::Mutex<Option<String>>>,
     tool_calls: HashMap<String, AcpToolSnapshot>,
 }
 
@@ -584,12 +627,16 @@ impl Translator {
                 }
             }
             Some("current_mode_update") => {
+                let current_mode_id = update
+                    .get("currentModeId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // Track agent-driven mode changes so AcpSession::current_mode_id
+                // (read by the agent snapshot) stays in sync.
+                *self.current_mode_id.lock().unwrap() = current_mode_id.clone();
                 self.emit(AgentStreamEvent::ModeChanged {
                     provider: self.provider.clone(),
-                    current_mode_id: update
-                        .get("currentModeId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    current_mode_id,
                     available_modes: Vec::new(),
                 });
             }
@@ -659,7 +706,7 @@ impl Translator {
             turn_id: None,
         });
 
-        if self.autonomous {
+        if self.autonomous.load(Ordering::SeqCst) {
             // Rocky auto-grants (generic-acp-agent.ts autonomous handling).
             let response = AgentPermissionResponse::Allow {
                 selected_action_id: None,

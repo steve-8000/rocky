@@ -592,6 +592,15 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, z.ZodT
     }),
   ]);
 
+const AgentRuntimeInfoSchema: z.ZodType<AgentRuntimeInfo> = z.object({
+  provider: AgentProviderSchema,
+  sessionId: z.string().nullable(),
+  model: z.string().nullable().optional(),
+  thinkingOptionId: z.string().nullable().optional(),
+  modeId: z.string().nullable().optional(),
+  extra: z.record(z.string(), z.unknown()).optional(),
+});
+
 export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("thread_started"),
@@ -653,6 +662,22 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
       })
       .optional(),
   }),
+  z.object({
+    type: z.literal("mode_changed"),
+    provider: AgentProviderSchema,
+    currentModeId: z.string().nullable(),
+    availableModes: z.array(AgentModeSchema),
+  }),
+  z.object({
+    type: z.literal("model_changed"),
+    provider: AgentProviderSchema,
+    runtimeInfo: AgentRuntimeInfoSchema,
+  }),
+  z.object({
+    type: z.literal("thinking_option_changed"),
+    provider: AgentProviderSchema,
+    thinkingOptionId: z.string().nullable(),
+  }),
 ]);
 
 const AgentPersistenceHandleSchema: z.ZodType<AgentPersistenceHandle | null> = z
@@ -663,15 +688,6 @@ const AgentPersistenceHandleSchema: z.ZodType<AgentPersistenceHandle | null> = z
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .nullable();
-
-const AgentRuntimeInfoSchema: z.ZodType<AgentRuntimeInfo> = z.object({
-  provider: AgentProviderSchema,
-  sessionId: z.string().nullable(),
-  model: z.string().nullable().optional(),
-  thinkingOptionId: z.string().nullable().optional(),
-  modeId: z.string().nullable().optional(),
-  extra: z.record(z.string(), z.unknown()).optional(),
-});
 
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),

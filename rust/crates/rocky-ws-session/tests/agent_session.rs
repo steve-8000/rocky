@@ -474,6 +474,23 @@ impl AgentSession for RecordingSession {
             .push(("mode".to_string(), mode_id.to_string()));
         Ok(())
     }
+    fn available_modes(&self) -> Vec<rocky_agent_domain::AgentMode> {
+        vec![
+            rocky_agent_domain::AgentMode {
+                id: "default".to_string(),
+                label: "Default".to_string(),
+                description: None,
+            },
+            rocky_agent_domain::AgentMode {
+                id: "bypass".to_string(),
+                label: "Bypass".to_string(),
+                description: None,
+            },
+        ]
+    }
+    fn current_mode_id(&self) -> Option<String> {
+        Some("default".to_string())
+    }
     async fn cancel(&self) -> Result<(), AgentError> {
         Ok(())
     }
@@ -568,6 +585,35 @@ async fn create_agent_request_without_initial_prompt_does_not_prompt() {
     let out = d.dispatch_envelope(&env).await.unwrap();
     assert_eq!(out["message"]["payload"]["status"], "agent_created");
     assert!(prompts.lock().unwrap().is_empty(), "no prompt for blank initialPrompt");
+}
+
+#[tokio::test]
+async fn fetch_agent_payload_carries_live_session_modes() {
+    // Regression: the composer mode selector (Default/Plan/Bypass) renders only
+    // when the agent snapshot carries a non-empty `availableModes`. The ws layer
+    // used to hardcode `availableModes: []`, so an existing agent never showed
+    // the bypass mode even though its live session advertised it. The payload
+    // must surface the live session's modes and current mode id.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider::new(prompts));
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    let agent_id = create_agent_for(&d, "/tmp/proj-modes").await;
+
+    let env = envelope(json!({
+        "type": "fetch_agent_request",
+        "requestId": "fm",
+        "agentId": agent_id,
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    let agent = &out["message"]["payload"]["agent"];
+    let modes = agent["availableModes"].as_array().expect("availableModes is an array");
+    let ids: Vec<&str> = modes.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(ids, vec!["default", "bypass"], "live session modes surfaced to UI");
+    assert_eq!(agent["currentModeId"], "default");
 }
 
 #[tokio::test]

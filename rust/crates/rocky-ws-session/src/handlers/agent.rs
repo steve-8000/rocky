@@ -194,9 +194,11 @@ async fn agent_payload(manager: &AgentManager, agent: &ManagedAgent) -> Result<V
     let effective_thinking_option_id = runtime
         .and_then(|r| r.thinking_option_id.clone())
         .or_else(|| thinking_option_id.clone());
-    let current_mode_id = runtime
-        .and_then(|r| r.mode_id.clone())
+    let (available_modes, session_mode_id) = manager.agent_modes(&agent.id).await;
+    let current_mode_id = session_mode_id
+        .or_else(|| runtime.and_then(|r| r.mode_id.clone()))
         .or_else(|| config.and_then(|c| c.mode_id.clone()));
+    let available_modes = serde_json::to_value(&available_modes).map_err(internal)?;
 
     let runtime_info = match runtime {
         Some(r) => Some(serde_json::to_value(r).map_err(internal)?),
@@ -230,7 +232,7 @@ async fn agent_payload(manager: &AgentManager, agent: &ManagedAgent) -> Result<V
         "status": status,
         "capabilities": capabilities(),
         "currentModeId": current_mode_id,
-        "availableModes": [],
+        "availableModes": available_modes,
         "pendingPermissions": pending_permissions,
         "persistence": persistence,
         "title": agent.title,
