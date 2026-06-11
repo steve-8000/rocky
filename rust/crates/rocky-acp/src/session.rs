@@ -115,6 +115,13 @@ struct PermissionOption {
 
 type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
 
+/// Live client-served terminals keyed by terminal id, shared between the
+/// [`Translator`] (which creates/reads them) and the [`AcpSession`] (which must
+/// reclaim them on cancel/shutdown so a runaway command's process tree cannot
+/// outlive the turn). A std `Mutex` is sufficient: every critical section is a
+/// short map mutation or a sync `kill()`, never held across an `.await`.
+type Terminals = Arc<std::sync::Mutex<HashMap<String, AcpClientTerminal>>>;
+
 /// Live ACP session. Cloneable handles share the same transport and event sink.
 pub struct AcpSession {
     transport: Transport,
@@ -151,6 +158,10 @@ pub struct AcpSession {
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<AgentStreamEvent>>>,
     lifecycle_tx: mpsc::UnboundedSender<AgentStreamEvent>,
     pending: PendingPermissions,
+    /// Live client-served terminals, shared with the [`Translator`]. The session
+    /// kills every entry's process group on [`AcpSession::cancel`] and
+    /// [`AcpSession::shutdown`] so a runaway command cannot outlive its turn.
+    terminals: Terminals,
 }
 
 impl AcpSession {
@@ -227,6 +238,7 @@ impl AcpSession {
             provider: ACP_PROVIDER.to_string(),
         });
 
+        let terminals: Terminals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let translator = Translator {
             session_id: session_id.clone(),
             provider: ACP_PROVIDER.to_string(),
@@ -237,7 +249,7 @@ impl AcpSession {
             current_mode_id: current_mode_id.clone(),
             tool_calls: HashMap::new(),
             cwd: config.process.cwd.clone(),
-            terminals: HashMap::new(),
+            terminals: terminals.clone(),
         };
         tokio::spawn(translator.run(inbound_rx));
 
@@ -257,6 +269,7 @@ impl AcpSession {
             events_rx: Mutex::new(Some(events_rx)),
             lifecycle_tx: events_tx,
             pending,
+            terminals,
         })
     }
 
@@ -401,10 +414,32 @@ impl AcpSession {
     }
 
     /// Cancel the active turn (`session/cancel`).
+    ///
+    /// Beyond notifying the agent, this reclaims every live client-served
+    /// terminal: a cancelled turn must not leave a runaway command's process
+    /// tree (e.g. a wide `find`) running. The agent's own `terminal/kill` may
+    /// never arrive once the turn is abandoned, so the session is the
+    /// backstop owner of those process groups.
     pub async fn cancel(&self) -> AcpResult<()> {
+        self.reclaim_terminals();
         self.transport
             .notify("session/cancel", json!({ "sessionId": self.session_id }))
             .await
+    }
+
+    /// Kill and drop every live client-served terminal. Each `kill()` signals the
+    /// whole process group (TERM then KILL), so shell grandchildren are reaped
+    /// too. Aborts the per-terminal wait task. Idempotent: a second call sees an
+    /// empty registry.
+    fn reclaim_terminals(&self) {
+        let drained: Vec<AcpClientTerminal> = {
+            let mut guard = self.terminals.lock().expect("terminals registry poisoned");
+            guard.drain().map(|(_, term)| term).collect()
+        };
+        for terminal in drained {
+            terminal.kill();
+            terminal.wait_handle.abort();
+        }
     }
 
     /// Set the session mode (`session/set_mode`). When the requested mode is a
@@ -514,8 +549,11 @@ impl AcpSession {
         self.autonomous.load(Ordering::SeqCst)
     }
 
-    /// Graceful shutdown: close stdin, SIGTERM, wait, then SIGKILL.
+    /// Graceful shutdown: reclaim live terminals, close stdin, SIGTERM, wait,
+    /// then SIGKILL. Reclaiming first ensures client-served command trees die
+    /// with the session rather than outliving the agent process.
     pub async fn shutdown(&self) {
+        self.reclaim_terminals();
         self.transport.shutdown();
         if let Some(process) = self.process.lock().await.take() {
             process.shutdown().await;
@@ -547,7 +585,7 @@ struct Translator {
     /// Live client-served terminals keyed by terminal id. Populated by
     /// `terminal/create` and consulted by `terminal/output` /
     /// `terminal/wait_for_exit` / `terminal/kill` / `terminal/release`.
-    terminals: HashMap<String, AcpClientTerminal>,
+    terminals: Terminals,
 }
 
 impl Translator {
@@ -721,6 +759,14 @@ impl Translator {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Run the child as the leader of its own process group so we can signal
+        // the WHOLE tree on kill. A shell-wrapped command (`/bin/sh -c "a; b"`)
+        // spawns grandchildren (e.g. `find`) that would otherwise be orphaned and
+        // keep running when we only SIGTERM the shell pid — exactly the runaway
+        // `find ~` leak we observed where cancel reported success but the search
+        // processes survived. `process_group(0)` => setpgid(0,0): pgid == pid.
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (key, value) in &env {
             cmd.env(key, value);
         }
@@ -780,7 +826,7 @@ impl Translator {
             let _ = exit_tx.send(true);
         });
 
-        self.terminals.insert(
+        self.terminals.lock().expect("terminals registry poisoned").insert(
             terminal_id.clone(),
             AcpClientTerminal {
                 state,
@@ -800,7 +846,14 @@ impl Translator {
     /// truncation flag, and exit status (when the command has completed).
     async fn handle_terminal_output(&self, id: Value, params: Value) {
         let terminal_id = params.get("terminalId").and_then(Value::as_str);
-        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+        let state = terminal_id.and_then(|t| {
+            self.terminals
+                .lock()
+                .expect("terminals registry poisoned")
+                .get(t)
+                .map(|term| term.state.clone())
+        });
+        let Some(state) = state else {
             let _ = self
                 .transport
                 .respond_error(id, -32000, "Unknown terminal")
@@ -808,10 +861,7 @@ impl Translator {
             return;
         };
         let payload = {
-            let snapshot = terminal
-                .state
-                .lock()
-                .expect("terminal output state poisoned");
+            let snapshot = state.lock().expect("terminal output state poisoned");
             let mut payload = json!({
                 "output": snapshot.output,
                 "truncated": snapshot.truncated,
@@ -828,22 +878,27 @@ impl Translator {
     /// child exits, then returns its exit status.
     async fn handle_terminal_wait_for_exit(&self, id: Value, params: Value) {
         let terminal_id = params.get("terminalId").and_then(Value::as_str);
-        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+        let handles = terminal_id.and_then(|t| {
+            self.terminals
+                .lock()
+                .expect("terminals registry poisoned")
+                .get(t)
+                .map(|term| (term.exit_rx.clone(), term.state.clone()))
+        });
+        let Some((mut exit_rx, state)) = handles else {
             let _ = self
                 .transport
                 .respond_error(id, -32000, "Unknown terminal")
                 .await;
             return;
         };
-        let mut exit_rx = terminal.exit_rx.clone();
         // Wait until the watch channel reports the exit has been recorded.
         while !*exit_rx.borrow() {
             if exit_rx.changed().await.is_err() {
                 break;
             }
         }
-        let exit = terminal
-            .state
+        let exit = state
             .lock()
             .expect("terminal output state poisoned")
             .exit
@@ -859,14 +914,24 @@ impl Translator {
     /// final output and exit status afterward.
     async fn handle_terminal_kill(&self, id: Value, params: Value) {
         let terminal_id = params.get("terminalId").and_then(Value::as_str);
-        let Some(terminal) = terminal_id.and_then(|t| self.terminals.get(t)) else {
+        let found = terminal_id
+            .map(|t| {
+                let guard = self.terminals.lock().expect("terminals registry poisoned");
+                if let Some(term) = guard.get(t) {
+                    term.kill();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if !found {
             let _ = self
                 .transport
                 .respond_error(id, -32000, "Unknown terminal")
                 .await;
             return;
-        };
-        terminal.kill();
+        }
         let _ = self.transport.respond(id, json!({})).await;
     }
 
@@ -878,7 +943,12 @@ impl Translator {
             .and_then(Value::as_str)
             .map(str::to_string);
         if let Some(terminal_id) = terminal_id {
-            if let Some(terminal) = self.terminals.remove(&terminal_id) {
+            let removed = self
+                .terminals
+                .lock()
+                .expect("terminals registry poisoned")
+                .remove(&terminal_id);
+            if let Some(terminal) = removed {
                 terminal.kill();
                 terminal.wait_handle.abort();
             }
@@ -1426,8 +1496,17 @@ struct AcpClientTerminal {
 }
 
 impl AcpClientTerminal {
-    /// SIGTERM the child if it has not exited yet (best-effort, matching the TS
-    /// `child.kill("SIGTERM")` guarded by `!entry.exit`).
+    /// Terminate the child's entire process group if it has not exited yet.
+    ///
+    /// We signal the negated pid (the process group, since the child leads its
+    /// own group — see `process_group(0)` at spawn) rather than the lone child
+    /// pid. A shell-wrapped command spawns grandchildren (`/bin/sh -c "find …"`)
+    /// that survive a SIGTERM aimed only at the shell; signalling the group
+    /// reaches every descendant. We send SIGTERM first for a graceful stop, then
+    /// escalate to SIGKILL shortly after so a child that ignores/blocks SIGTERM
+    /// (or is stuck in an uninterruptible syscall it later returns from) cannot
+    /// leak. Mirrors the intent of the TS `child.kill("SIGTERM")` guarded by
+    /// `!entry.exit`, hardened for process trees.
     fn kill(&self) {
         let already_exited = self
             .state
@@ -1438,15 +1517,35 @@ impl AcpClientTerminal {
         if already_exited {
             return;
         }
-        if let Some(pid) = self.pid {
-            #[cfg(unix)]
-            // SAFETY: kill(2) with a valid pid and SIGTERM has no memory effects.
+        let Some(pid) = self.pid else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            let mut exit_rx = self.exit_rx.clone();
+            // SAFETY: kill(2) with a process-group target (negated pid) and a
+            // standard signal has no memory effects. The group exists for the
+            // lifetime of the leader; signalling a fully-reaped group is a
+            // harmless ESRCH.
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             }
-            #[cfg(not(unix))]
-            let _ = pid;
+            // Escalate to SIGKILL if the group has not exited within a short
+            // grace period. Detached so kill() stays synchronous for callers.
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = async { while !*exit_rx.borrow() {
+                        if exit_rx.changed().await.is_err() { break; }
+                    }} => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        // SAFETY: see above; SIGKILL to the process group.
+                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+                    }
+                }
+            });
         }
+        #[cfg(not(unix))]
+        let _ = pid;
     }
 }
 
@@ -1524,6 +1623,133 @@ fn uuid_like_segment() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Spawn a client-served terminal exactly as `handle_terminal_create` does
+    /// (own process group on unix, piped output, wait task) and return the
+    /// registered handle. Test-only mirror so the kill/reap behavior can be
+    /// exercised without a live ACP transport.
+    #[cfg(unix)]
+    fn spawn_test_terminal(command: &str) -> AcpClientTerminal {
+        let (program, exec_args) = resolve_terminal_command(command, &[]);
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&exec_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn test terminal");
+        let state = Arc::new(std::sync::Mutex::new(TerminalOutputState {
+            output: String::new(),
+            truncated: false,
+            output_byte_limit: None,
+            exit: None,
+        }));
+        let pid = child.id();
+        if let Some(stdout) = child.stdout.take() {
+            spawn_output_pump(stdout, state.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_output_pump(stderr, state.clone());
+        }
+        let (exit_tx, exit_rx) = tokio::sync::watch::channel(false);
+        let wait_state = state.clone();
+        let wait_handle = tokio::spawn(async move {
+            let status = child.wait().await;
+            let exit = match status {
+                Ok(status) => TerminalExitInfo {
+                    exit_code: status.code(),
+                    signal: terminal_exit_signal(&status),
+                },
+                Err(_) => TerminalExitInfo { exit_code: None, signal: None },
+            };
+            wait_state
+                .lock()
+                .expect("terminal output state poisoned")
+                .exit = Some(exit);
+            let _ = exit_tx.send(true);
+        });
+        AcpClientTerminal { state, pid, exit_rx, wait_handle }
+    }
+
+    /// `kill(pid, 0)` probe: true iff the process is still alive (or a zombie we
+    /// have not reaped). ESRCH => gone.
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 performs error checking without delivering a signal.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// The core regression: a shell-wrapped command's grandchildren must die
+    /// when the terminal is killed. Before the fix `kill()` SIGTERM'd only the
+    /// shell pid, orphaning long-running children (the runaway `find ~` leak).
+    /// Now `kill()` signals the whole process group, reaping descendants.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_reaps_shell_grandchildren() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        let pidfile_str = pidfile.to_string_lossy().to_string();
+        // Shell spawns a long sleep (the grandchild), records its pid, and waits.
+        let terminal = spawn_test_terminal(&format!(
+            "sleep 120 & echo $! > {pidfile_str}; wait"
+        ));
+        // Wait for the grandchild pid to be recorded.
+        let grandchild_pid: u32 = {
+            let mut pid = None;
+            for _ in 0..200 {
+                if let Ok(raw) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(p) = raw.trim().parse::<u32>() {
+                        pid = Some(p);
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            pid.expect("grandchild pid was recorded")
+        };
+        assert!(pid_alive(grandchild_pid), "grandchild should be running");
+
+        terminal.kill();
+
+        // The grandchild must die from the group signal within the grace window.
+        let mut reaped = false;
+        for _ in 0..200 {
+            if !pid_alive(grandchild_pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            reaped,
+            "grandchild pid {grandchild_pid} survived terminal kill (process group not signalled)"
+        );
+    }
+
+    /// `kill()` on an already-exited terminal is a no-op and must not panic or
+    /// signal a recycled pid.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_after_exit_is_noop() {
+        let terminal = spawn_test_terminal("true");
+        // Wait for the child to exit (exit recorded in shared state).
+        let mut exit_rx = terminal.exit_rx.clone();
+        for _ in 0..200 {
+            if *exit_rx.borrow() {
+                break;
+            }
+            if exit_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        assert!(
+            terminal.state.lock().unwrap().exit.is_some(),
+            "terminal should have exited"
+        );
+        // Must not panic; nothing to signal.
+        terminal.kill();
+    }
 
     #[test]
     fn plan_with_entries_maps_to_todo() {
