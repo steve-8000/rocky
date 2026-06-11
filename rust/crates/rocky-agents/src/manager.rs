@@ -443,6 +443,94 @@ impl AgentManager {
         Ok(agent)
     }
 
+    /// Resume a hydrated (session-less) agent's live provider session from its
+    /// persisted handle, so config controls (mode/model/thinking) and prompting
+    /// work again after a daemon restart. Mirrors the TS
+    /// `resumeAgentFromPersistence` path invoked by `refresh_agent_request`.
+    ///
+    /// Idempotent: if a live session already exists it is returned as-is (the
+    /// agent is already resumed). Returns `NotFound` for an unknown agent and a
+    /// clear `Provider` error if the agent has no persistence handle to resume
+    /// from (e.g. it never started a thread).
+    pub async fn resume_agent(
+        &self,
+        provider: &dyn AgentProvider,
+        id: &str,
+    ) -> Result<ManagedAgent, AgentError> {
+        // Snapshot what we need under the lock, then drop it before connecting
+        // (the ACP connect spawns a subprocess and awaits `session/load`).
+        let (cwd, config, persistence, already_live) = {
+            let guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            (
+                agent.cwd.clone(),
+                agent.config.clone(),
+                agent.persistence.clone(),
+                guard.sessions.contains_key(id),
+            )
+        };
+
+        if already_live {
+            return self
+                .get(id)
+                .await
+                .ok_or_else(|| AgentError::NotFound(id.to_string()));
+        }
+
+        let handle = persistence.ok_or_else(|| {
+            AgentError::Provider(format!(
+                "agent {id} cannot be resumed because it has no persistence handle"
+            ))
+        })?;
+
+        let session_config = ProviderSessionConfig {
+            provider: provider.id().to_string(),
+            cwd,
+            model: config.as_ref().and_then(|c| c.model.clone()),
+            mode_id: config.as_ref().and_then(|c| c.mode_id.clone()),
+            thinking_option_id: config.as_ref().and_then(|c| c.thinking_option_id.clone()),
+            approval_policy: None,
+        };
+
+        let session = provider
+            .resume_session(session_config, &handle.session_id)
+            .await?;
+
+        let runtime_info = Some(session.runtime_info());
+        let new_persistence = session.describe_persistence();
+
+        // Subscribe BEFORE registering so no early events (e.g. the
+        // `thread_started` emitted during `session/load`) are missed.
+        let session_events = session.subscribe_events();
+        let agent = {
+            let mut guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get_mut(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            agent.runtime_info = runtime_info;
+            if let Some(p) = new_persistence {
+                agent.persistence = Some(p);
+            }
+            transition(agent, AgentStatus::Idle);
+            agent.last_error = None;
+            agent.updated_at = now_iso8601();
+            let snapshot = agent.clone();
+            guard.sessions.insert(id.to_string(), session);
+            snapshot
+        };
+        if let Some(rx) = session_events {
+            self.spawn_event_pump(id.to_string(), rx);
+        }
+        self.persist_record(&agent)?;
+
+        tracing::info!(agent_id = %id, "agent resumed from persistence");
+        Ok(agent)
+    }
+
     /// Submit a prompt to a live agent's session, starting a turn. The
     /// resulting timeline/lifecycle events arrive asynchronously through the
     /// session's event stream and are ingested by the per-agent pump

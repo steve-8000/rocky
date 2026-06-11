@@ -130,7 +130,20 @@ pub fn register(
     reg!("set_agent_thinking_request", handle_set_agent_thinking);
     reg!("set_agent_feature_request", handle_set_agent_feature);
     reg!("update_agent_request", handle_update_agent);
-    reg!("refresh_agent_request", handle_refresh_agent);
+    {
+        // `refresh_agent_request` resumes the agent's live provider session from
+        // persistence, so it needs the provider like `create_agent_request`.
+        let m = manager.clone();
+        let p = provider.clone();
+        dispatcher.register(
+            "refresh_agent_request",
+            Arc::new(move |msg: Value| {
+                let m = m.clone();
+                let p = p.clone();
+                async move { handle_refresh_agent(&m, p.as_ref(), msg).await }
+            }),
+        );
+    }
     reg!("agent_permission_response", handle_permission_response);
 }
 
@@ -930,17 +943,38 @@ async fn handle_update_agent(manager: &AgentManager, msg: Value) -> Result<Value
     Ok(action_result("update_agent_response", &req_id, &agent_id, result))
 }
 
-async fn handle_refresh_agent(manager: &AgentManager, msg: Value) -> Result<Value, SessionRpcError> {
+async fn handle_refresh_agent(
+    manager: &AgentManager,
+    provider: &dyn AgentProvider,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
     let agent_id = opt_str(&msg, "agentId").unwrap_or_default();
-    // Refresh resumes/reloads from persistence (provider + storage), neither of
-    // which is wired here. On success the TS daemon emits a `status`
-    // `agent_refreshed`; failure emits `rpc_error` (session.ts:3366-3388).
-    let error = match resolve(manager, &agent_id).await {
-        Some(_) => "refresh_agent_request requires a live provider session that is not wired into the session dispatcher".to_string(),
-        None => format!("Agent not found: {agent_id}"),
-    };
-    Ok(rpc_error(&req_id, "refresh_agent_request", error, "agent_refresh_failed"))
+    // Refresh resumes the agent's live provider session from persistence (the
+    // ACP `session/load` path), so config controls and prompting work again
+    // after a daemon restart. On success the TS daemon emits a `status`
+    // `agent_refreshed` with the current timeline size; failure emits an
+    // `rpc_error` (session.ts:3366-3388).
+    match manager.resume_agent(provider, &agent_id).await {
+        Ok(_) => {
+            let timeline_size = manager.fetch_timeline(&agent_id, 0, 0).await.len();
+            Ok(json!({
+                "type": "status",
+                "payload": {
+                    "status": "agent_refreshed",
+                    "agentId": agent_id,
+                    "requestId": req_id,
+                    "timelineSize": timeline_size,
+                }
+            }))
+        }
+        Err(e) => Ok(rpc_error(
+            &req_id,
+            "refresh_agent_request",
+            e.to_string(),
+            "agent_refresh_failed",
+        )),
+    }
 }
 
 async fn handle_permission_response(

@@ -168,6 +168,21 @@ pub trait AgentProvider: Send + Sync {
         config: ProviderSessionConfig,
     ) -> Result<Box<dyn AgentSession>, AgentError>;
 
+    /// Resume an existing provider session from its persisted handle (the ACP
+    /// `session/load` path). `config` carries the agent's cwd/model/mode so the
+    /// resumed session is reconstructed with the same context; `session_id` is
+    /// the persisted provider session handle. Default: unsupported (providers
+    /// that cannot resume, and mocks, surface a clear error instead of a panic).
+    async fn resume_session(
+        &self,
+        _config: ProviderSessionConfig,
+        _session_id: &str,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        Err(AgentError::Provider(
+            "provider does not support session resume".into(),
+        ))
+    }
+
     /// Discover the models this provider exposes for `cwd`. Maps to the WebUI
     /// `list_provider_models` RPC. Default: empty (providers that cannot probe
     /// models, and mocks, do not break).

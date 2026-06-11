@@ -864,3 +864,213 @@ async fn update_agent_missing_agent_is_rejected() {
     assert_eq!(out["message"]["payload"]["accepted"], false);
     assert!(!out["message"]["payload"]["error"].is_null());
 }
+
+// --- Resume / refresh (session/load after a daemon restart) ---
+
+/// A session that supports mode changes, used to prove a resumed agent can
+/// mutate config again. Records the last applied mode.
+struct ResumeSession {
+    mode: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl AgentSession for ResumeSession {
+    fn session_id(&self) -> Option<String> {
+        Some("sess-loaded".to_string())
+    }
+    fn runtime_info(&self) -> AgentRuntimeInfo {
+        AgentRuntimeInfo {
+            provider: "claude".to_string(),
+            session_id: self.session_id(),
+            model: None,
+            thinking_option_id: None,
+            mode_id: self.mode.lock().unwrap().clone(),
+            extra: None,
+        }
+    }
+    async fn prompt(&self, _input: PromptInput) -> Result<(), AgentError> {
+        Ok(())
+    }
+    async fn set_mode(&self, mode_id: &str) -> Result<(), AgentError> {
+        *self.mode.lock().unwrap() = Some(mode_id.to_string());
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+/// Provider that fails `create_session` but resumes via `resume_session`,
+/// recording the session id it was asked to load.
+struct ResumeProvider {
+    loaded: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl AgentProvider for ResumeProvider {
+    fn id(&self) -> &str {
+        "claude"
+    }
+    async fn create_session(
+        &self,
+        _config: ProviderSessionConfig,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        Err(AgentError::Provider("create not used in resume test".into()))
+    }
+    async fn resume_session(
+        &self,
+        _config: ProviderSessionConfig,
+        session_id: &str,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        self.loaded.lock().unwrap().push(session_id.to_string());
+        Ok(Box::new(ResumeSession {
+            mode: std::sync::Mutex::new(None),
+        }))
+    }
+}
+
+/// Persist a stored agent record carrying a persistence handle to
+/// `$ROCKY_HOME/agents/{project}/{id}.json`, mirroring an agent that started a
+/// thread before the daemon stopped.
+fn write_resumable_record(home: &std::path::Path, id: &str, cwd: &str, session_id: &str) {
+    let record = rocky_store::StoredAgentRecord {
+        id: id.to_string(),
+        provider: "claude".to_string(),
+        cwd: cwd.to_string(),
+        created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        updated_at: "2026-01-02T00:00:00.000Z".to_string(),
+        last_activity_at: None,
+        last_user_message_at: None,
+        title: Some("Resumable".to_string()),
+        labels: std::collections::BTreeMap::new(),
+        last_status: rocky_store::AgentStatus::Idle,
+        last_mode_id: None,
+        config: None,
+        runtime_info: None,
+        features: None,
+        persistence: Some(rocky_store::PersistenceHandle {
+            provider: "claude".to_string(),
+            session_id: session_id.to_string(),
+            native_handle: None,
+            metadata: None,
+        }),
+        last_error: None,
+        requires_attention: None,
+        attention_reason: None,
+        attention_timestamp: None,
+        internal: None,
+        archived_at: None,
+    };
+    let path = home
+        .join("agents")
+        .join(rocky_store::project_dir_name_from_cwd(cwd))
+        .join(format!("{id}.json"));
+    rocky_store::write_json_atomic(&path, &record).expect("write record");
+}
+
+#[tokio::test]
+async fn refresh_agent_resumes_hydrated_session_and_enables_mode_change() {
+    let home = TempDir::new().unwrap();
+    write_resumable_record(home.path(), "a-resume", "/tmp/proj-resume", "acp-sess-7");
+    // Fresh manager hydrates the record session-less (simulating a restart).
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let loaded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(ResumeProvider {
+        loaded: loaded.clone(),
+    });
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    // Before resume: mode change has no live session -> rejected.
+    let pre = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "set_agent_mode_request",
+            "requestId": "m-pre",
+            "agentId": "a-resume",
+            "modeId": "bypass",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(pre["message"]["payload"]["accepted"], false);
+    assert!(!pre["message"]["payload"]["error"].is_null());
+
+    // Refresh resumes from persistence (session/load with the stored id).
+    let refreshed = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "refresh_agent_request",
+            "requestId": "rf",
+            "agentId": "a-resume",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(refreshed["message"]["type"], "status");
+    assert_eq!(refreshed["message"]["payload"]["status"], "agent_refreshed");
+    assert_eq!(refreshed["message"]["payload"]["agentId"], "a-resume");
+    assert_eq!(refreshed["message"]["payload"]["requestId"], "rf");
+    assert_eq!(loaded.lock().unwrap().as_slice(), ["acp-sess-7"]);
+
+    // After resume: the same mode change now succeeds against the live session.
+    let post = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "set_agent_mode_request",
+            "requestId": "m-post",
+            "agentId": "a-resume",
+            "modeId": "bypass",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(post["message"]["payload"]["accepted"], true);
+    assert!(post["message"]["payload"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn refresh_already_live_agent_is_idempotent() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    // Create a live agent via the mock provider (describe_persistence -> None),
+    // so it has no persistence handle to resume from.
+    let provider: Arc<dyn AgentProvider> = Arc::new(MockProvider {
+        id: "claude".to_string(),
+    });
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager.clone(), provider);
+    let agent_id = create_agent(&manager, "/tmp/proj-no-persist").await;
+
+    let out = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "refresh_agent_request",
+            "requestId": "rf2",
+            "agentId": agent_id,
+        })))
+        .await
+        .unwrap();
+    // Already-live agent with no new persistence resumes idempotently: it has a
+    // live session, so refresh returns agent_refreshed (no-op resume).
+    assert_eq!(out["message"]["payload"]["status"], "agent_refreshed");
+}
+
+#[tokio::test]
+async fn refresh_missing_agent_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let provider: Arc<dyn AgentProvider> = Arc::new(MockProvider {
+        id: "claude".to_string(),
+    });
+    let mut d = SessionDispatcher::new();
+    handlers::agent::register(&mut d, manager, provider);
+
+    let out = d
+        .dispatch_envelope(&envelope(json!({
+            "type": "refresh_agent_request",
+            "requestId": "rf3",
+            "agentId": "ghost",
+        })))
+        .await
+        .unwrap();
+    assert_eq!(out["message"]["type"], "rpc_error");
+    assert_eq!(out["message"]["payload"]["code"], "agent_refresh_failed");
+    assert!(!out["message"]["payload"]["error"].is_null());
+}

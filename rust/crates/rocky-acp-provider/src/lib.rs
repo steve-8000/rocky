@@ -85,6 +85,47 @@ impl AcpProvider {
         self
     }
 
+    /// Open a live session, either fresh (`SessionInit::New`) or resumed
+    /// (`SessionInit::Load`). Both paths spawn the agent, `connect`, then apply
+    /// the requested initial mode if it differs from the session default.
+    async fn open_session(
+        &self,
+        config: ProviderSessionConfig,
+        init: SessionInit,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        let mut process =
+            ProcessSpec::new(self.command.clone(), self.repo_root.clone(), config.cwd.clone());
+        process.env = self.env.clone();
+
+        let session_config = SessionConfig {
+            process,
+            init,
+            mcp_servers: self.mcp_servers.clone(),
+            approval_policy: config.approval_policy.clone(),
+        };
+
+        let session = AcpSession::connect(session_config)
+            .await
+            .map_err(|e| AgentError::Provider(e.to_string()))?;
+
+        // Apply the requested initial mode (e.g. bypass selected at creation in
+        // the mission/composer draft, or the persisted mode on resume). The
+        // WebUI passes the choice as `config.mode_id`, NOT as `approval_policy`,
+        // so without this a mission-set bypass would never reach the session and
+        // would silently revert to the agent default in chat. `set_mode` also
+        // flips Rocky's auto-grant policy for synthetic bypass.
+        if let Some(mode_id) = config.mode_id.as_deref() {
+            if session.current_mode_id().as_deref() != Some(mode_id) {
+                session
+                    .set_mode(mode_id)
+                    .await
+                    .map_err(|e| AgentError::Provider(e.to_string()))?;
+            }
+        }
+
+        Ok(Box::new(AcpAgentSession::new(session, &config)))
+    }
+
     /// Short-lived discovery probe: spawn an ACP session via `session/new`,
     /// invoke `read` against the live [`AcpSession`], then shut the child down
     /// (best-effort, so no process leaks). Wrapped in [`PROBE_TIMEOUT`] so a
@@ -149,36 +190,21 @@ impl AgentProvider for AcpProvider {
         &self,
         config: ProviderSessionConfig,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
-        let mut process = ProcessSpec::new(self.command.clone(), self.repo_root.clone(), config.cwd.clone());
-        process.env = self.env.clone();
+        self.open_session(config, SessionInit::New).await
+    }
 
-        let session_config = SessionConfig {
-            process,
-            init: SessionInit::New,
-            mcp_servers: self.mcp_servers.clone(),
-            approval_policy: config.approval_policy.clone(),
-        };
-
-        let session = AcpSession::connect(session_config)
-            .await
-            .map_err(|e| AgentError::Provider(e.to_string()))?;
-
-        // Apply the requested initial mode (e.g. bypass selected at creation in
-        // the mission/composer draft). The WebUI passes the choice as
-        // `config.mode_id`, NOT as `approval_policy`, so without this a
-        // mission-set bypass would never reach the session and would silently
-        // revert to the agent default in chat. `set_mode` also flips Rocky's
-        // auto-grant policy for synthetic bypass.
-        if let Some(mode_id) = config.mode_id.as_deref() {
-            if session.current_mode_id().as_deref() != Some(mode_id) {
-                session
-                    .set_mode(mode_id)
-                    .await
-                    .map_err(|e| AgentError::Provider(e.to_string()))?;
-            }
-        }
-
-        Ok(Box::new(AcpAgentSession::new(session, &config)))
+    async fn resume_session(
+        &self,
+        config: ProviderSessionConfig,
+        session_id: &str,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        self.open_session(
+            config,
+            SessionInit::Load {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
     }
 
     async fn list_models(&self, cwd: &str) -> Result<Vec<AgentModelDef>, AgentError> {
