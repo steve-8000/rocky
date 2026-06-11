@@ -37,7 +37,17 @@ deliberately honest about what is done, verified, and still missing.
 - Read-only parsers validated against a snapshot of the real `~/.rocky`
   (45 agents, 8 projects, 29 workspaces, chat, keypair, identical server-id).
 - Relay crypto verified interoperable with tweetnacl (cross-impl decrypt both
-  directions).
+  directions.
+- Browser QA (headless Chrome + Playwright against the live Rust binary on a
+  non-prod port with the real `core/packages/app/dist` bundle): the WebUI loads,
+  connects over `/ws` to the Rust daemon, completes `hello → server_info`, and
+  the on-load RPC suite round-trips (`client_heartbeat`,
+  `get_providers_snapshot`, `fetch_workspaces`, `fetch_agents`). The Team
+  (Mission Control) screen renders end-to-end — "Start a mission / Launch
+  Leader" plus the Builder/Researcher/Reviewer/SRE roster from
+  `get_daemon_config`. A full agent lifecycle (`create_agent` → real amaze ACP
+  session → `send_agent_message` → `agent_stream` thread_started/turn_started/
+  turn_completed pushed to the socket) succeeds against the same binary.
 
 ## Phases 1–7: complete and verified per their acceptance criteria.
 
@@ -79,18 +89,19 @@ plus `/mcp/agents` exposing 14 tools.
 
 ### Remaining gap before production cutover (honest)
 
-The session RPC bridge covers the high-traffic groups above, but NOT yet the
-full 122-message surface. Still missing or returning structured "not wired"
-errors:
-- agent `create`/`send`/config-mutation that require a live provider session
-  wired into the WS path (the provider bridge exists and is MCP-wired; the WS
-  agent handlers currently return structured errors for these),
-- checkout PR/merge/push/stash/branch-suggestion git RPCs,
-- provider snapshot/model/mode discovery RPCs,
-- file explorer / download-token / project-icon RPCs,
+The session RPC bridge now covers agent lifecycle (incl. LIVE `create_agent` /
+`send_agent_message` via the wired amaze ACP provider + `agent_stream` push),
+mission control, workspace/git/worktree/terminal control, chat/schedule/loop,
+the on-load read RPCs (daemon config/status, providers snapshot, heartbeat,
+push token, project config), checkout/git/stash, and files/explorer. Still NOT
+covered out of the full 122-message surface (return structured "not wired"
+errors, never fake success):
+- GitHub PR/merge/auto-merge/search RPCs (need the `gh` CLI / GitHub API),
+- rich provider model/mode discovery beyond structural availability,
 - dictation/voice streaming RPCs (capability-gated as unsupported),
-- binary terminal STREAM frames (the JSON control messages are handled; the
-  raw output/input frame piping must be wired at the WS transport layer).
+- binary terminal STREAM frame piping (JSON terminal control messages are
+  handled; raw output/input frame relay must be wired at the WS transport),
+- config mutation RPCs that require live provider/storage writers.
 
 Because of this partial coverage AND live/idle agents on the production daemon,
 production cutover is **intentionally not executed**. Per the user constraints
