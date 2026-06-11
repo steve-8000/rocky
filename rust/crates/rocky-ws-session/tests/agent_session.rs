@@ -414,6 +414,118 @@ async fn create_agent_request_uses_live_provider_and_send_is_accepted() {
     assert!(m["payload"]["error"].is_null());
 }
 
+/// Session that records every prompt it receives, so a test can assert the
+/// initial prompt is delivered as the first turn.
+struct RecordingSession {
+    provider: String,
+    prompts: Arc<std::sync::Mutex<Vec<PromptInput>>>,
+}
+
+#[async_trait]
+impl AgentSession for RecordingSession {
+    fn session_id(&self) -> Option<String> {
+        Some("sess-rec".to_string())
+    }
+    fn runtime_info(&self) -> AgentRuntimeInfo {
+        AgentRuntimeInfo {
+            provider: self.provider.clone(),
+            session_id: self.session_id(),
+            model: None,
+            thinking_option_id: None,
+            mode_id: None,
+            extra: None,
+        }
+    }
+    async fn prompt(&self, input: PromptInput) -> Result<(), AgentError> {
+        self.prompts.lock().unwrap().push(input);
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+struct RecordingProvider {
+    prompts: Arc<std::sync::Mutex<Vec<PromptInput>>>,
+}
+
+#[async_trait]
+impl AgentProvider for RecordingProvider {
+    fn id(&self) -> &str {
+        "claude"
+    }
+    async fn create_session(
+        &self,
+        config: ProviderSessionConfig,
+    ) -> Result<Box<dyn AgentSession>, AgentError> {
+        Ok(Box::new(RecordingSession {
+            provider: config.provider,
+            prompts: self.prompts.clone(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn create_agent_request_delivers_initial_prompt_as_first_turn() {
+    // Regression: the WebUI's Team "Launch Leader" flow (and any first-message
+    // create) passes the message via `create_agent_request.initialPrompt` and
+    // sends NO separate send_agent_message_request. The Rust handler must deliver
+    // that prompt as the first turn (mirrors TS create.ts `sendInitialPrompt`),
+    // otherwise the agent is created idle and the message is silently dropped.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let mut d = SessionDispatcher::new();
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider {
+        prompts: prompts.clone(),
+    });
+    handlers::agent::register(&mut d, manager.clone(), provider);
+
+    let env = envelope(json!({
+        "type": "create_agent_request",
+        "requestId": "cr-ip",
+        "config": { "provider": "claude", "cwd": "/tmp/proj-initial-prompt" },
+        "initialPrompt": "  Launch the mission: build X  ",
+        "clientMessageId": "cmsg-1",
+        "labels": {},
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["status"], "agent_created");
+
+    let recorded = prompts.lock().unwrap();
+    assert_eq!(recorded.len(), 1, "exactly one first-turn prompt expected");
+    // Trimmed, mirroring TS `initialPrompt?.trim()`.
+    assert_eq!(recorded[0].text, "Launch the mission: build X");
+    assert_eq!(recorded[0].message_id.as_deref(), Some("cmsg-1"));
+}
+
+#[tokio::test]
+async fn create_agent_request_without_initial_prompt_does_not_prompt() {
+    // A blank/whitespace initialPrompt (or none) must not start a turn.
+    let home = TempDir::new().unwrap();
+    let manager = Arc::new(AgentManager::new(home.path()));
+    let prompts = Arc::new(std::sync::Mutex::new(Vec::<PromptInput>::new()));
+    let mut d = SessionDispatcher::new();
+    let provider: Arc<dyn AgentProvider> = Arc::new(RecordingProvider {
+        prompts: prompts.clone(),
+    });
+    handlers::agent::register(&mut d, manager, provider);
+
+    let env = envelope(json!({
+        "type": "create_agent_request",
+        "requestId": "cr-empty",
+        "config": { "provider": "claude", "cwd": "/tmp/proj-no-prompt" },
+        "initialPrompt": "   ",
+        "labels": {},
+    }));
+    let out = d.dispatch_envelope(&env).await.unwrap();
+    assert_eq!(out["message"]["payload"]["status"], "agent_created");
+    assert!(prompts.lock().unwrap().is_empty(), "no prompt for blank initialPrompt");
+}
+
 #[tokio::test]
 async fn send_agent_message_to_missing_agent_is_rejected() {
     let home = TempDir::new().unwrap();

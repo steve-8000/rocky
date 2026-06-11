@@ -676,6 +676,26 @@ async fn handle_create_agent(
 
     match manager.create_agent(provider, options).await {
         Ok(agent) => {
+            // Deliver the initial prompt as the first turn, mirroring the TS
+            // create flow (`create-agent/create.ts` `sendInitialPrompt`, invoked
+            // when `resolved.prompt !== undefined`). The WebUI passes the first
+            // message via `create_agent_request.initialPrompt` and does NOT send a
+            // separate `send_agent_message_request`, so without this the agent is
+            // created idle with an empty timeline and the message never arrives.
+            if let Some(text) = opt_str(&msg, "initialPrompt")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let message_id = opt_str(&msg, "clientMessageId");
+                let input = rocky_agents::PromptInput { text, message_id };
+                if let Err(e) = manager.prompt(&agent.id, input).await {
+                    tracing::warn!(
+                        agent_id = %agent.id,
+                        error = %e,
+                        "failed to deliver initial prompt after agent creation"
+                    );
+                }
+            }
             let agent_payload = agent_payload(manager, &agent).await?;
             Ok(json!({
                 "type": "status",
