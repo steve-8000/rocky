@@ -2030,7 +2030,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Skip when reusing a parent's manager — the parent owns the callbacks.
 		if (mcpManager && !options.mcpManager) {
 			mcpManager.setOnToolsChanged(tools => {
-				void session.refreshMCPTools(tools);
+				// Scope to the config-file manager's own servers so reconnects here never evict
+				// tools owned by other managers (e.g. the daemon-injected `rocky` ACP server).
+				void session.refreshMCPTools(tools, { ownedServerNames: mcpManager.getAllServerNames() });
 			});
 			// Wire prompt refresh → rebuild MCP prompt slash commands
 			mcpManager.setOnPromptsChanged(serverName => {

@@ -3703,14 +3703,37 @@ export class AgentSession {
 	/**
 	 * Replace MCP tools in the registry and recompute the visible MCP tool set immediately.
 	 * This allows /mcp add/remove/reauth to take effect without restarting the session.
+	 *
+	 * A single session can be fed by multiple independent {@link MCPManager}s — e.g. the
+	 * daemon-injected `rocky` server (delivered through the ACP `mcpServers` channel) and the
+	 * config-file servers discovered from `.mcp.json`. Each manager owns a disjoint set of
+	 * server names. Pass `ownedServerNames` so a refresh only replaces tools belonging to the
+	 * calling manager's servers; tools owned by other managers are left untouched. Without it,
+	 * every MCP tool is replaced (legacy behavior, for callers that own the entire MCP set).
 	 */
-	async refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
+	async refreshMCPTools(
+		mcpTools: CustomTool[],
+		options?: { ownedServerNames?: readonly string[] },
+	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
+		const scopedServers = options?.ownedServerNames
+			? new Set<string>([
+					...options.ownedServerNames,
+					...mcpTools
+						.map(tool => (tool as { mcpServerName?: string }).mcpServerName)
+						.filter((name): name is string => name !== undefined),
+				])
+			: null;
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
-			if (isMCPToolName(name)) {
-				this.#toolRegistry.delete(name);
+			if (!isMCPToolName(name)) continue;
+			if (scopedServers) {
+				// Scoped refresh: only evict tools whose owning server this manager controls.
+				// Tools with an unknown owner belong to another manager and are preserved.
+				const owner = (this.#toolRegistry.get(name) as { mcpServerName?: string } | undefined)?.mcpServerName;
+				if (owner === undefined || !scopedServers.has(owner)) continue;
 			}
+			this.#toolRegistry.delete(name);
 		}
 
 		const getCustomToolContext = (): CustomToolContext => ({
@@ -3734,6 +3757,21 @@ export class AgentSession {
 
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#pruneSelectedMCPToolNames();
+		// Default-SERVER tools (e.g. the daemon-injected `rocky` server listed in
+		// `mcp.discoveryDefaultServers`) are an always-on policy, not a user choice: seed them
+		// whenever their server is present — even after a prior selection was persisted. These
+		// servers connect asynchronously (the ACP `mcpServers` channel arrives after the config
+		// servers), so gating them behind `hasPersistedMCPToolSelection` would strand them
+		// behind tool-discovery and the model would never see `mcp__rocky_*`.
+		const defaultServerToolNames = this.#filterSelectableMCPToolNames(
+			selectDiscoverableMCPToolNamesByServer(
+				this.#discoverableMCPTools.values(),
+				this.#defaultSelectedMCPServerNames,
+			),
+		);
+		if (defaultServerToolNames.length > 0) {
+			this.#selectedMCPToolNames = new Set([...this.#selectedMCPToolNames, ...defaultServerToolNames]);
+		}
 		if (!this.buildDisplaySessionContext().hasPersistedMCPToolSelection) {
 			this.#selectedMCPToolNames = new Set([
 				...this.#selectedMCPToolNames,

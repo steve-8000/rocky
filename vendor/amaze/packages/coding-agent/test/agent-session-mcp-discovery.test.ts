@@ -948,4 +948,79 @@ describe("AgentSession MCP discovery", () => {
 		expect(names).not.toContain("resolve"); // hidden — no discoverable loadMode
 		expect(names).not.toContain("custom_inactive"); // unknown — no discoverable loadMode
 	});
+
+	it("scoped refresh preserves MCP tools owned by another manager", async () => {
+		// Reproduces the rockyd multi-manager bug: the daemon-injected `rocky` server and the
+		// config-file servers feed the SAME session through two independent MCPManagers. A scoped
+		// refresh must only evict its own servers' tools, never the peer manager's.
+		const readTool = createBasicTool("read", "Read");
+		const toolRegistry = new Map<string, AgentTool>([[readTool.name, readTool]]);
+		const agent = new Agent({
+			initialState: { model: createModel(), systemPrompt: ["initial"], tools: [readTool], messages: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		sessions.push(session);
+
+		// Manager A (ACP-injected `rocky`) registers first.
+		await session.refreshMCPTools(
+			[createMcpCustomTool("mcp__rocky_create_agent", "rocky", "create_agent", "Create an agent", ["title"])],
+			{ ownedServerNames: ["rocky"] },
+		);
+		// Manager B (config-file servers) registers next — must NOT wipe `rocky`.
+		await session.refreshMCPTools(
+			[createMcpCustomTool("mcp__gbrain_query", "gbrain", "query", "Query the brain", ["q"])],
+			{ ownedServerNames: ["gbrain"] },
+		);
+
+		const discoverable = session.getDiscoverableMCPSearchIndex().documents.map(d => d.tool.name).sort();
+		expect(discoverable).toEqual(["mcp__gbrain_query", "mcp__rocky_create_agent"]);
+	});
+
+	it("seeds default-server tools even when they arrive after a persisted selection", async () => {
+		// The `rocky` server connects asynchronously via the ACP channel, AFTER the config-file
+		// servers have already persisted a selection. Default-server (always-on policy) tools must
+		// still be seeded so the model can see `mcp__rocky_*`.
+		const readTool = createBasicTool("read", "Read");
+		const toolRegistry = new Map<string, AgentTool>([[readTool.name, readTool]]);
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			initialState: { model: createModel(), systemPrompt: ["initial"], tools: [readTool], messages: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": true }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: true,
+			defaultSelectedMCPServerNames: ["rocky"],
+			rebuildSystemPrompt: async toolNames => ({ systemPrompt: [`tools:${toolNames.join(",")}`] }),
+		});
+		sessions.push(session);
+
+		// Config servers connect first; the user activates one, persisting a (rocky-free) selection.
+		await session.refreshMCPTools(
+			[createMcpCustomTool("mcp__gbrain_query", "gbrain", "query", "Query the brain", ["q"])],
+			{ ownedServerNames: ["gbrain"] },
+		);
+		await session.activateDiscoveredMCPTools(["mcp__gbrain_query"]);
+		expect(sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(true);
+
+		// `rocky` arrives late via the ACP channel — its default-server tools must be auto-selected.
+		await session.refreshMCPTools(
+			[createMcpCustomTool("mcp__rocky_create_agent", "rocky", "create_agent", "Create an agent", ["title"])],
+			{ ownedServerNames: ["rocky"] },
+		);
+
+		expect(session.getSelectedMCPToolNames()).toContain("mcp__rocky_create_agent");
+		expect(session.getActiveToolNames()).toContain("mcp__rocky_create_agent");
+	});
 });

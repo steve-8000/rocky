@@ -1964,12 +1964,17 @@ export class AcpAgent implements Agent {
 	}
 
 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+		// Server names this ACP manager owns — the only ones a refresh here may evict.
+		// Includes both the previously-configured set (so removed servers are cleared) and the
+		// incoming set. Tools owned by the session's config-file MCP manager are left intact.
+		const previousOwned = record.mcpManager?.getAllServerNames() ?? [];
+		const ownedServerNames = [...new Set([...previousOwned, ...servers.map(server => server.name)])];
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
 		}
 		if (servers.length === 0) {
 			record.mcpManager = undefined;
-			await record.session.refreshMCPTools([]);
+			await record.session.refreshMCPTools([], { ownedServerNames });
 			return;
 		}
 
@@ -1996,7 +2001,7 @@ export class AcpAgent implements Agent {
 		}
 
 		record.mcpManager = manager;
-		await record.session.refreshMCPTools(result.tools);
+		await record.session.refreshMCPTools(result.tools, { ownedServerNames });
 	}
 
 	#toMcpConfig(server: McpServer): MCPServerConfig {
