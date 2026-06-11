@@ -26,6 +26,7 @@ fn ctx(port: u16) -> ServerContext {
         public_dir: std::path::PathBuf::from("/tmp"),
         session_dispatcher: None,
         agent_manager: None,
+        internal_mcp_token: None,
     }
 }
 

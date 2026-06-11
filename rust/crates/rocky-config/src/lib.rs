@@ -14,7 +14,7 @@ mod home;
 mod listen;
 
 pub use daemon_config::{
-    AuthSection, CorsSection, DaemonSection, HostnamesConfig, PersistedConfig,
+    AuthSection, CorsSection, DaemonSection, HostnamesConfig, McpSection, PersistedConfig,
 };
 pub use home::{resolve_rocky_home, resolve_rocky_home_from, RockyHomeError, PRIVATE_DIRECTORY_MODE};
 pub use listen::{format_listen_target, parse_listen_string, ListenParseError, ListenTarget};

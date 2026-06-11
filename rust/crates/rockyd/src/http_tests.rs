@@ -25,6 +25,7 @@ fn base_ctx() -> ServerContext {
         public_dir: std::path::PathBuf::from("/nonexistent-public"),
         session_dispatcher: None,
         agent_manager: None,
+        internal_mcp_token: None,
     }
 }
 
@@ -421,4 +422,66 @@ async fn static_asset_public_when_password_set() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_string(resp).await, "ASSET");
+}
+
+/// The `/mcp/agents` mount accepts the boot-scoped internal token via
+/// `?rockyToken=` even when a password is set, but rejects a wrong/absent
+/// token. Mirrors `auth.ts` internal-token handling for daemon-injected agents.
+#[tokio::test]
+async fn mcp_mount_accepts_internal_token_query_param() {
+    use crate::http::build_router_with_mcp;
+    use axum::routing::post;
+    use axum::Router;
+
+    let mut ctx = base_ctx();
+    ctx.password = Some(hash_daemon_password("secret").unwrap());
+    ctx.internal_mcp_token = Some("boottoken".into());
+    // Minimal stand-in MCP router that 200s so we observe the auth decision.
+    let mcp = Router::new().route("/", post(|| async { "ok" }));
+    let app = build_router_with_mcp(Arc::new(ctx), mcp);
+
+    // Correct token in query -> passes auth (200).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp/agents?rockyToken=boottoken&callerAgentId=a1")
+                .header(header::HOST, "localhost:7767")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wrong token -> 401.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp/agents?rockyToken=nope")
+                .header(header::HOST, "localhost:7767")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Daemon password as bearer still works on the MCP mount.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp/agents")
+                .header(header::HOST, "localhost:7767")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

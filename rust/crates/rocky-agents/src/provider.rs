@@ -25,6 +25,27 @@ pub struct ProviderSessionConfig {
     pub mode_id: Option<String>,
     pub thinking_option_id: Option<String>,
     pub approval_policy: Option<String>,
+    /// MCP servers to advertise to this session (passed verbatim into the ACP
+    /// `session/new` / `session/load` `mcpServers` array). The manager fills
+    /// this with the daemon-injected `rocky` server (so the agent can call back
+    /// into `mcp__rocky_*` tools) plus any user-configured servers. Empty when
+    /// MCP injection is disabled. Use `serde_json::Value` to stay schema-opaque.
+    pub mcp_servers: Vec<serde_json::Value>,
+}
+
+/// Result of [`crate::AgentManager::wait_for_agent_event`]: a terminal snapshot
+/// of the agent's run, used to shape the `wait_for_agent` MCP tool response.
+#[derive(Debug, Clone)]
+pub struct WaitForAgentResult {
+    /// The agent's lifecycle status when the wait resolved.
+    pub status: rocky_agent_domain::AgentStatus,
+    /// A pending permission request, if the run paused awaiting a decision.
+    pub permission: Option<rocky_agent_domain::AgentPermissionRequest>,
+    /// The most recent assistant message text observed during the wait, if any.
+    pub last_message: Option<String>,
+    /// Whether the wait hit its timeout before a terminal signal (the caller
+    /// may simply call again to keep waiting). Mirrors the TS timeout result.
+    pub timed_out: bool,
 }
 
 /// A prompt submitted to a live session.

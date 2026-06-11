@@ -97,10 +97,16 @@ impl AcpProvider {
             ProcessSpec::new(self.command.clone(), self.repo_root.clone(), config.cwd.clone());
         process.env = self.env.clone();
 
+        // Provider-level servers (rare; usually empty) plus the per-session
+        // servers the manager injects (the daemon `rocky` MCP server carrying
+        // `callerAgentId`, enabling `mcp__rocky_*` self-calls for team mode).
+        let mut mcp_servers = self.mcp_servers.clone();
+        mcp_servers.extend(config.mcp_servers.iter().cloned());
+
         let session_config = SessionConfig {
             process,
             init,
-            mcp_servers: self.mcp_servers.clone(),
+            mcp_servers,
             approval_policy: config.approval_policy.clone(),
         };
 

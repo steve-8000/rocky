@@ -49,6 +49,8 @@ pub struct DaemonSection {
     pub cors: Option<CorsSection>,
     /// `daemon.auth` — bearer auth settings (password is a bcrypt hash).
     pub auth: Option<AuthSection>,
+    /// `daemon.mcp` — agent MCP injection settings.
+    pub mcp: Option<McpSection>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -56,6 +58,16 @@ pub struct DaemonSection {
 pub struct CorsSection {
     #[serde(rename = "allowedOrigins")]
     pub allowed_origins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct McpSection {
+    /// `daemon.mcp.injectIntoAgents` — whether the daemon injects its own
+    /// `rocky` MCP server into every created/resumed agent. Absent => enabled
+    /// (matches the TS default `config.mcpInjectIntoAgents !== false`).
+    #[serde(rename = "injectIntoAgents")]
+    pub inject_into_agents: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -104,6 +116,17 @@ impl PersistedConfig {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether the daemon injects its own `rocky` MCP server into agents
+    /// (`daemon.mcp.injectIntoAgents`). Defaults to `true` when absent, matching
+    /// the TS `config.mcpInjectIntoAgents !== false` default.
+    pub fn mcp_inject_into_agents(&self) -> bool {
+        self.daemon
+            .as_ref()
+            .and_then(|d| d.mcp.as_ref())
+            .and_then(|m| m.inject_into_agents)
+            .unwrap_or(true)
     }
 
     /// Persisted bcrypt password hash (`daemon.auth.password`), if any.

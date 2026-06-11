@@ -74,6 +74,69 @@ pub fn extract_ws_bearer_token(protocol: Option<&str>) -> Option<String> {
     Some(segments[2..].join("."))
 }
 
+/// Extract the value of a query-string parameter (`key=value`), application/
+/// x-www-form-urlencoded style. Returns the first match, percent-decoding only
+/// the minimal set that matters for tokens (`%XX` and `+`). Returns `None` when
+/// the param is absent.
+pub fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
+    let query = query?;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == key {
+            return Some(percent_decode_form(v));
+        }
+    }
+    None
+}
+
+fn percent_decode_form(input: &str) -> String {
+    let replaced = input.replace('+', " ");
+    let bytes = replaced.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Constant-time equality for the boot-scoped internal MCP token. Mirrors the
+/// TS `timingSafeTokenEqual` used for `?rockyToken=` auth (`auth.ts`).
+pub fn internal_mcp_token_matches(expected: Option<&str>, provided: Option<&str>) -> bool {
+    let (Some(expected), Some(provided)) = (expected, provided) else {
+        return false;
+    };
+    let a = expected.as_bytes();
+    let b = provided.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Whether bearer auth is bypassed for a request.
 ///
 /// Mirrors `shouldBypassBearerAuth`: OPTIONS always bypasses (CORS preflight);
@@ -138,5 +201,32 @@ mod tests {
         assert!(should_bypass_bearer_auth("GET", "/api/health"));
         assert!(!should_bypass_bearer_auth("GET", "/api/status"));
         assert!(!should_bypass_bearer_auth("POST", "/public/x"));
+    }
+    #[test]
+    fn query_param_extraction() {
+        assert_eq!(
+            extract_query_param(Some("rockyToken=abc&callerAgentId=x"), "rockyToken").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            extract_query_param(Some("callerAgentId=x&rockyToken=abc"), "rockyToken").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            extract_query_param(Some("rockyToken=a%2Bb+c"), "rockyToken").as_deref(),
+            Some("a+b c")
+        );
+        assert_eq!(extract_query_param(Some("foo=1"), "rockyToken"), None);
+        assert_eq!(extract_query_param(None, "rockyToken"), None);
+    }
+
+    #[test]
+    fn internal_token_constant_time_match() {
+        assert!(internal_mcp_token_matches(Some("tok123"), Some("tok123")));
+        assert!(!internal_mcp_token_matches(Some("tok123"), Some("tok124")));
+        assert!(!internal_mcp_token_matches(Some("tok123"), Some("tok1234")));
+        assert!(!internal_mcp_token_matches(None, Some("tok123")));
+        assert!(!internal_mcp_token_matches(Some("tok123"), None));
+        assert!(!internal_mcp_token_matches(None, None));
     }
 }

@@ -59,6 +59,11 @@ pub struct ServerContext {
     /// Live agent control plane, used by `/ws` to subscribe to and push
     /// `agent_stream` broadcast events. `None` in API-only/test contexts.
     pub agent_manager: Option<Arc<rocky_agents::AgentManager>>,
+    /// Boot-scoped internal MCP token. When set, requests to `/mcp/*` may
+    /// authenticate with `?rockyToken=<token>` instead of the daemon password
+    /// (mirrors `auth.ts` internal-token handling). Minted fresh on each daemon
+    /// start; injected into agent MCP server URLs so their self-calls pass auth.
+    pub internal_mcp_token: Option<String>,
 }
 
 /// Build the CORS allowed-origin set, matching `bootstrap.ts:396-409`.
@@ -114,7 +119,7 @@ fn build_router_inner(ctx: Arc<ServerContext>, mcp_router: Option<Router>) -> Ro
     if let Some(mcp_router) = mcp_router {
         let mcp = Router::new()
             .nest_service("/mcp/agents", mcp_router)
-            .route_layer(middleware::from_fn_with_state(ctx.clone(), bearer_auth));
+            .route_layer(middleware::from_fn_with_state(ctx.clone(), mcp_auth));
         router = router.merge(mcp);
     }
 
@@ -239,6 +244,39 @@ async fn bearer_auth(
     }
 
     next.run(request).await
+}
+
+/// Auth middleware for the `/mcp/*` mount. Accepts the daemon password
+/// (`Authorization: Bearer`) like every protected route, but ALSO accepts the
+/// boot-scoped internal token via `?rockyToken=<token>`. Mirrors `auth.ts`:
+/// daemon-injected agent MCP clients carry the token in their server URL, so
+/// their self-calls to `/mcp/agents` authenticate without the user password.
+async fn mcp_auth(
+    State(ctx): State<Arc<ServerContext>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str();
+    let path = request.uri().path();
+    let auth_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    if is_request_authorized(&ctx, method, path, auth_header) {
+        return next.run(request).await;
+    }
+
+    // Fall back to the internal `?rockyToken=` token (constant-time compare).
+    let provided = crate::auth::extract_query_param(request.uri().query(), "rockyToken");
+    if crate::auth::internal_mcp_token_matches(
+        ctx.internal_mcp_token.as_deref(),
+        provided.as_deref(),
+    ) {
+        return next.run(request).await;
+    }
+
+    unauthorized_response()
 }
 
 /// `GET /api/health` (`bootstrap.ts:462-464`). Public.

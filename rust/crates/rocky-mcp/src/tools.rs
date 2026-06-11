@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use rocky_agent_domain::{AgentPermissionResponse, AgentStatus};
-use rocky_agents::{AgentError, CreateAgentOptions, FollowUp, ManagedAgent};
+use rocky_agents::{AgentError, CreateAgentOptions, FollowUp, ManagedAgent, PromptInput};
 use rocky_mission_control::{
     CreateMissionInput, CreateMissionTaskInput, MissionControlError, MissionStatus,
     MissionTaskIsolation, MissionTaskStatus, UpdateMissionTaskInput,
@@ -574,7 +574,7 @@ fn register_agent_tools(registry: &mut ToolRegistry) {
     );
 
     register_create_agent(registry);
-    register_not_wired_session_tools(registry);
+    register_session_tools(registry);
 }
 
 /// Build an `AgentPermissionResponse` from either a nested `response` object or
@@ -702,11 +702,11 @@ fn split_provider_model(pair: &str) -> (String, Option<String>) {
     }
 }
 
-/// `send_agent_prompt` (mcp-server.ts lines 1135-1233) and `wait_for_agent`
-/// (lines 1058-1133) need a live provider session loop and a wait tracker that
-/// this phase does not own. Register descriptors + validation but return a
-/// structured `not_wired` error rather than faking success.
-fn register_not_wired_session_tools(registry: &mut ToolRegistry) {
+/// `send_agent_prompt` (mcp-server.ts lines 1135-1233) dispatches a prompt to a
+/// live agent session and waits for the run to start. `wait_for_agent` (lines
+/// 1058-1133) blocks until the run reaches a terminal signal or a permission
+/// request. Both drive the live [`AgentManager`].
+fn register_session_tools(registry: &mut ToolRegistry) {
     registry.register(
         ToolDescriptor {
             name: "send_agent_prompt".into(),
@@ -722,13 +722,39 @@ fn register_not_wired_session_tools(registry: &mut ToolRegistry) {
                 ],
             ),
         },
-        boxed(|args, _ctx| async move {
+        boxed(|args, ctx| async move {
             let map = as_object(&args)?;
-            let _agent_id = req_str(map, "agentId")?;
-            let _prompt = req_str(map, "prompt")?;
-            Err(ToolError::not_wired(
-                "send_agent_prompt requires a live provider session loop; the orchestrator wires prompt dispatch in a later phase.",
-            ))
+            let agent_id = req_str(map, "agentId")?;
+            let prompt = req_str(map, "prompt")?;
+            let background = opt_bool(map, "background")?.unwrap_or(false);
+            ctx.agent_manager()
+                .prompt(
+                    &agent_id,
+                    PromptInput {
+                        text: prompt,
+                        message_id: None,
+                    },
+                )
+                .await
+                .map_err(agent_err)?;
+
+            // Foreground (default): wait for the run to settle (or pause on a
+            // permission). Background: return immediately after dispatch so the
+            // caller can fan out and `wait_for_agent` later. Mirrors the TS
+            // `send_agent_prompt` background flag.
+            if background {
+                return Ok(tool_result(json!({
+                    "agentId": agent_id,
+                    "status": "running",
+                    "background": true,
+                })));
+            }
+            let result = ctx
+                .agent_manager()
+                .wait_for_agent_event(&agent_id, AGENT_WAIT_TIMEOUT)
+                .await
+                .map_err(agent_err)?;
+            Ok(tool_result(wait_result_payload(&agent_id, &result)))
         }),
     );
 
@@ -740,14 +766,34 @@ fn register_not_wired_session_tools(registry: &mut ToolRegistry) {
                 "Block until the agent requests permission or the current run completes.".into(),
             input_schema: object_schema(&[("agentId", "string")], &[]),
         },
-        boxed(|args, _ctx| async move {
+        boxed(|args, ctx| async move {
             let map = as_object(&args)?;
-            let _agent_id = req_str(map, "agentId")?;
-            Err(ToolError::not_wired(
-                "wait_for_agent requires the run wait-tracker; the orchestrator wires turn completion signaling in a later phase.",
-            ))
+            let agent_id = req_str(map, "agentId")?;
+            let result = ctx
+                .agent_manager()
+                .wait_for_agent_event(&agent_id, AGENT_WAIT_TIMEOUT)
+                .await
+                .map_err(agent_err)?;
+            Ok(tool_result(wait_result_payload(&agent_id, &result)))
         }),
     );
+}
+
+/// Self-imposed wait bound for `wait_for_agent` / foreground `send_agent_prompt`,
+/// matching the TS `AGENT_WAIT_TIMEOUT_MS` (mcp-shared.ts). On timeout the tool
+/// returns a `timed_out` payload rather than erroring; the caller may call again.
+const AGENT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(110);
+
+/// Shape a [`rocky_agents::WaitForAgentResult`] into the `wait_for_agent` /
+/// `send_agent_prompt` structured payload (mcp-server.ts lines 1112-1132).
+fn wait_result_payload(agent_id: &str, result: &rocky_agents::WaitForAgentResult) -> Value {
+    json!({
+        "agentId": agent_id,
+        "status": result.status,
+        "permission": result.permission,
+        "lastMessage": result.last_message,
+        "timedOut": result.timed_out,
+    })
 }
 
 // --- schema helpers ---------------------------------------------------------

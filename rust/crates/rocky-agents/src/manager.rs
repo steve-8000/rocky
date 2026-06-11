@@ -29,7 +29,9 @@ use crate::clock::now_iso8601;
 use crate::error::AgentError;
 use crate::paths::{expand_user_path, resolve_child_agent_cwd};
 use crate::permissions::{FollowUp, PendingPermission, PermissionQueue, Resolution};
-use crate::provider::{AgentProvider, AgentSession, PromptInput, ProviderSessionConfig};
+use crate::provider::{
+    AgentProvider, AgentSession, PromptInput, ProviderSessionConfig, WaitForAgentResult,
+};
 use crate::timeline::{Timeline, TimelineRow};
 
 /// `rocky.parent-agent-id` label key (mirrors
@@ -270,6 +272,13 @@ struct Inner {
     rocky_home: PathBuf,
     state: Mutex<ManagerState>,
     broadcast: broadcast::Sender<AgentStreamBroadcast>,
+    /// Boot-scoped base URL for the daemon-injected `rocky` MCP server, e.g.
+    /// `http://127.0.0.1:7767/mcp/agents?rockyToken=<tok>`. When set, every
+    /// created/resumed agent gets a `rocky` MCP server whose URL also carries
+    /// `callerAgentId=<id>`, so the agent can call back into `mcp__rocky_*`
+    /// tools (create/wait/etc). `None` disables injection. Mirrors the TS
+    /// `AgentManager.mcpBaseUrl`.
+    mcp_base_url: std::sync::RwLock<Option<String>>,
 }
 
 /// Error for config-mutation calls that need a live provider session.
@@ -330,8 +339,38 @@ impl AgentManager {
                     permissions: PermissionQueue::new(),
                 }),
                 broadcast: tx,
+                mcp_base_url: std::sync::RwLock::new(None),
             }),
         }
+    }
+
+    /// Set (or clear) the daemon-injected `rocky` MCP server base URL. Called by
+    /// the daemon bootstrap once the listener is bound and the boot-scoped token
+    /// minted, and again whenever `mcp.injectIntoAgents` toggles. `None`
+    /// disables injection. Mirrors `AgentManager.setMcpBaseUrl` (bootstrap.ts).
+    pub fn set_mcp_base_url(&self, url: Option<String>) {
+        *self.inner.mcp_base_url.write().expect("mcp_base_url poisoned") = url;
+    }
+
+    /// Build the MCP servers array to advertise to an agent's session: the
+    /// daemon-injected `rocky` HTTP server (when a base URL is configured),
+    /// carrying `callerAgentId=<id>` so the agent's `mcp__rocky_*` calls are
+    /// attributed to it. Returns empty when injection is disabled. Mirrors the
+    /// TS `injectedConfig.mcpServers.rocky` shape (agent-manager.ts lines
+    /// 818-826), normalized to the ACP wire form (`{type,name,url}`).
+    fn injected_mcp_servers(&self, agent_id: &str) -> Vec<serde_json::Value> {
+        let base = self.inner.mcp_base_url.read().expect("mcp_base_url poisoned");
+        let Some(base) = base.as_deref() else {
+            return Vec::new();
+        };
+        let sep = if base.contains('?') { '&' } else { '?' };
+        let url = format!("{base}{sep}callerAgentId={agent_id}");
+        vec![serde_json::json!({
+            "type": "http",
+            "name": "rocky",
+            "url": url,
+            "headers": [],
+        })]
     }
 
     /// Subscribe to broadcast stream events (one receiver per session).
@@ -385,6 +424,7 @@ impl AgentManager {
                 mode_id: options.mode_id.clone(),
                 thinking_option_id: options.thinking_option_id.clone(),
                 approval_policy: options.approval_policy.clone(),
+                mcp_servers: self.injected_mcp_servers(&id),
             })
             .await?;
 
@@ -493,6 +533,7 @@ impl AgentManager {
             mode_id: config.as_ref().and_then(|c| c.mode_id.clone()),
             thinking_option_id: config.as_ref().and_then(|c| c.thinking_option_id.clone()),
             approval_policy: None,
+            mcp_servers: self.injected_mcp_servers(id),
         };
 
         let session = provider
@@ -544,6 +585,115 @@ impl AgentManager {
             .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
         session.prompt(input).await
     }
+    /// Block until the agent's current run reaches a terminal signal: a turn
+    /// completes/fails/cancels, or a permission request needs a human/orchestrator
+    /// decision. Returns a [`WaitForAgentResult`] snapshot. Mirrors the TS
+    /// `AgentManager.waitForAgentEvent` consumed by the `wait_for_agent` MCP tool.
+    ///
+    /// If the agent is already idle/errored with no pending permission, returns
+    /// immediately. Otherwise subscribes to the broadcast stream and resolves on
+    /// the first terminal event for THIS agent. The `timeout` bounds the wait so
+    /// a hung agent surfaces a `timed_out` result rather than blocking forever
+    /// (matching the TS self-imposed timeout in `mcp-shared.ts`).
+    pub async fn wait_for_agent_event(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<WaitForAgentResult, AgentError> {
+        // Subscribe BEFORE the status snapshot so a terminal event that races
+        // the snapshot is not missed.
+        let mut rx = self.inner.broadcast.subscribe();
+
+        // Fast path: a pending permission, or an already-settled run.
+        {
+            let guard = self.inner.state.lock().await;
+            let agent = guard
+                .agents
+                .get(id)
+                .ok_or_else(|| AgentError::NotFound(id.to_string()))?;
+            let pending = guard.permissions.list_pending(Some(id));
+            if let Some(p) = pending.into_iter().next() {
+                return Ok(WaitForAgentResult {
+                    status: agent.status,
+                    permission: Some(p.request),
+                    last_message: agent.last_error.clone(),
+                    timed_out: false,
+                });
+            }
+            if matches!(agent.status, AgentStatus::Idle | AgentStatus::Error | AgentStatus::Closed) {
+                return Ok(WaitForAgentResult {
+                    status: agent.status,
+                    permission: None,
+                    last_message: agent.last_error.clone(),
+                    timed_out: false,
+                });
+            }
+        }
+
+        // Slow path: await a terminal stream event for this agent.
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let mut last_message: Option<String> = None;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    let status = self.get(id).await.map(|a| a.status).unwrap_or(AgentStatus::Idle);
+                    return Ok(WaitForAgentResult {
+                        status,
+                        permission: None,
+                        last_message,
+                        timed_out: true,
+                    });
+                }
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(b) if b.agent_id == id => {
+                            match b.event {
+                                AgentStreamEvent::Timeline { ref item, .. } => {
+                                    if let AgentTimelineItem::AssistantMessage { text, .. } = item.as_ref() {
+                                        last_message = Some(text.clone());
+                                    }
+                                }
+                                AgentStreamEvent::PermissionRequested { request, .. } => {
+                                    let status = self.get(id).await.map(|a| a.status).unwrap_or(AgentStatus::Running);
+                                    return Ok(WaitForAgentResult {
+                                        status,
+                                        permission: Some(*request),
+                                        last_message,
+                                        timed_out: false,
+                                    });
+                                }
+                                AgentStreamEvent::TurnCompleted { .. }
+                                | AgentStreamEvent::TurnFailed { .. }
+                                | AgentStreamEvent::TurnCanceled { .. } => {
+                                    let status = self.get(id).await.map(|a| a.status).unwrap_or(AgentStatus::Idle);
+                                    return Ok(WaitForAgentResult {
+                                        status,
+                                        permission: None,
+                                        last_message,
+                                        timed_out: false,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            let status = self.get(id).await.map(|a| a.status).unwrap_or(AgentStatus::Idle);
+                            return Ok(WaitForAgentResult {
+                                status,
+                                permission: None,
+                                last_message,
+                                timed_out: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     /// Spawn a background task that ingests a session's stream events through
     /// the manager's full pipeline (timeline persist-before-broadcast, live

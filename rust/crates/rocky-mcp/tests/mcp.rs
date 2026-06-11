@@ -396,19 +396,113 @@ async fn cancel_unknown_agent_returns_not_found() {
 }
 
 #[tokio::test]
-async fn session_tools_report_not_wired() {
-    let h = build_harness(None);
-    let response = call(
+async fn send_agent_prompt_dispatches_and_waits_when_wired() {
+    let provider = Arc::new(RecordingProvider::default());
+    let h = build_harness(Some(provider as Arc<dyn AgentProvider>));
+    let created = call(
         &h.server,
-        "send_agent_prompt",
-        json!({ "agentId": "a", "prompt": "hi" }),
+        "create_agent",
+        json!({ "provider": "claude/sonnet", "title": "worker", "cwd": "/tmp/work" }),
         None,
     )
     .await;
-    assert_eq!(error_of(&response)["code"], -32010);
+    let agent_id = result_of(&created)["agentId"].as_str().unwrap().to_string();
 
-    let response = call(&h.server, "wait_for_agent", json!({ "agentId": "a" }), None).await;
-    assert_eq!(error_of(&response)["code"], -32010);
+    // Foreground prompt dispatches to the live (mock) session and waits. The
+    // mock session emits no turn events and the agent is idle, so the wait
+    // fast-paths to a settled (non-timed-out) idle snapshot.
+    let response = call(
+        &h.server,
+        "send_agent_prompt",
+        json!({ "agentId": agent_id, "prompt": "do the thing" }),
+        None,
+    )
+    .await;
+    let structured = result_of(&response);
+    assert_eq!(structured["agentId"], agent_id);
+    assert_eq!(structured["status"], "idle");
+    assert_eq!(structured["timedOut"], false);
+
+    // wait_for_agent on the settled agent returns immediately.
+    let response = call(&h.server, "wait_for_agent", json!({ "agentId": agent_id }), None).await;
+    assert_eq!(result_of(&response)["status"], "idle");
+}
+
+#[tokio::test]
+async fn send_agent_prompt_background_returns_immediately() {
+    let provider = Arc::new(RecordingProvider::default());
+    let h = build_harness(Some(provider as Arc<dyn AgentProvider>));
+    let created = call(
+        &h.server,
+        "create_agent",
+        json!({ "provider": "claude/sonnet", "title": "bg", "cwd": "/tmp/work" }),
+        None,
+    )
+    .await;
+    let agent_id = result_of(&created)["agentId"].as_str().unwrap().to_string();
+    let response = call(
+        &h.server,
+        "send_agent_prompt",
+        json!({ "agentId": agent_id, "prompt": "fan out", "background": true }),
+        None,
+    )
+    .await;
+    let structured = result_of(&response);
+    assert_eq!(structured["background"], true);
+    assert_eq!(structured["status"], "running");
+}
+
+#[tokio::test]
+async fn wait_for_agent_on_missing_agent_is_not_found() {
+    let provider = Arc::new(RecordingProvider::default());
+    let h = build_harness(Some(provider as Arc<dyn AgentProvider>));
+    let response = call(&h.server, "wait_for_agent", json!({ "agentId": "ghost" }), None).await;
+    assert_eq!(error_of(&response)["data"]["code"], "agent_not_found");
+}
+
+#[tokio::test]
+async fn create_agent_injects_rocky_mcp_server_with_caller_id() {
+    let provider = Arc::new(RecordingProvider::default());
+    let h = build_harness(Some(provider.clone() as Arc<dyn AgentProvider>));
+    // Simulate the daemon bootstrap wiring the injected base URL.
+    h.manager
+        .set_mcp_base_url(Some("http://127.0.0.1:7767/mcp/agents?rockyToken=tok".into()));
+
+    let created = call(
+        &h.server,
+        "create_agent",
+        json!({ "provider": "claude/sonnet", "title": "leader", "cwd": "/tmp/work" }),
+        None,
+    )
+    .await;
+    let agent_id = result_of(&created)["agentId"].as_str().unwrap().to_string();
+
+    let configs = provider.configs.lock().unwrap();
+    let injected = &configs[0].mcp_servers;
+    assert_eq!(injected.len(), 1, "exactly the rocky server is injected");
+    assert_eq!(injected[0]["type"], "http");
+    assert_eq!(injected[0]["name"], "rocky");
+    assert_eq!(injected[0]["headers"], json!([]));
+    assert_eq!(
+        injected[0]["url"],
+        format!("http://127.0.0.1:7767/mcp/agents?rockyToken=tok&callerAgentId={agent_id}")
+    );
+}
+
+#[tokio::test]
+async fn create_agent_without_injection_advertises_no_mcp_servers() {
+    let provider = Arc::new(RecordingProvider::default());
+    let h = build_harness(Some(provider.clone() as Arc<dyn AgentProvider>));
+    // No set_mcp_base_url call: injection disabled.
+    call(
+        &h.server,
+        "create_agent",
+        json!({ "provider": "claude/sonnet", "title": "solo", "cwd": "/tmp/work" }),
+        None,
+    )
+    .await;
+    let configs = provider.configs.lock().unwrap();
+    assert!(configs[0].mcp_servers.is_empty());
 }
 
 // --- router smoke (axum mount) ----------------------------------------------

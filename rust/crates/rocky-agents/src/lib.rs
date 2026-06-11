@@ -32,6 +32,6 @@ pub use manager::{
 pub use permissions::{FollowUp, PendingPermission, PermissionQueue, Resolution};
 pub use provider::{
     AgentModelDef, AgentProvider, AgentSelectOption, AgentSession, ProviderSessionConfig,
-    PromptInput,
+    PromptInput, WaitForAgentResult,
 };
 pub use timeline::{Timeline, TimelineRow};

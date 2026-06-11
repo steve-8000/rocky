@@ -194,10 +194,39 @@ async fn serve(
     let allowed_origins: HashSet<String> =
         build_allowed_origins(&cors_origins, is_tcp, &cors_host, cors_port);
 
+    // Boot-scoped internal MCP token + base URL for agent self-calls. Minted
+    // fresh every start (so a persisted, stale token from a previous boot is
+    // rejected). When a password is set, the token rides in the injected MCP
+    // server URL as `?rockyToken=` so the agent's call to `/mcp/agents` passes
+    // the bearer gate. Mirrors `bootstrap.ts:957-968`.
+    let internal_mcp_token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let mcp_base_url = if is_tcp {
+        let mut url = format!("http://{cors_host}:{cors_port}/mcp/agents");
+        if password.is_some() {
+            url = format!("{url}?rockyToken={internal_mcp_token}");
+        }
+        Some(url)
+    } else {
+        // Unix-socket listeners have no HTTP origin the agent can dial; skip
+        // injection rather than emit a dead URL.
+        None
+    };
+    let inject_mcp = persisted.mcp_inject_into_agents();
+
     // The agent control plane is shared between the MCP surface and the WS
     // session dispatcher. `AgentManager` is `Clone` (Arc inner), so both paths
     // observe the same live agent state.
     let agent_manager = AgentManager::new(rocky_home);
+    // Wire the injected `rocky` MCP server URL into the manager so every
+    // created/resumed agent gets `mcp__rocky_*` tools (team mode). Disabled when
+    // `mcp.injectIntoAgents === false` or on non-TCP listeners.
+    if inject_mcp {
+        agent_manager.set_mcp_base_url(mcp_base_url.clone());
+    }
 
     // Build the WS session dispatcher (mission/agent/workspace/chat+schedule+loop
     // handler groups) and the agent + mission MCP surface, sharing the agent
@@ -237,6 +266,7 @@ async fn serve(
         public_dir,
         session_dispatcher,
         agent_manager: Some(Arc::new(agent_manager.clone())),
+        internal_mcp_token: Some(internal_mcp_token.clone()),
     });
 
     // Build the agent + mission MCP surface and mount it under `/mcp/agents`.

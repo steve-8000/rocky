@@ -411,6 +411,7 @@ mod tests {
             public_dir: std::path::PathBuf::from("/tmp/public"),
             session_dispatcher: None,
             agent_manager: None,
+            internal_mcp_token: None,
         }
     }
 
