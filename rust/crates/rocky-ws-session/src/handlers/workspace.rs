@@ -120,6 +120,8 @@ pub fn register(dispatcher: &mut SessionDispatcher, ctx: WorkspaceHandlerContext
     reg!("rocky_worktree_archive_request", handle_worktree_archive);
     reg!("create_terminal_request", handle_create_terminal);
     reg!("list_terminals_request", handle_list_terminals);
+    reg!("subscribe_terminals_request", handle_subscribe_terminals);
+    reg!("unsubscribe_terminals_request", handle_unsubscribe_terminals);
     reg!("kill_terminal_request", handle_kill_terminal);
     reg!("subscribe_terminal_request", handle_subscribe_terminal);
     reg!("capture_terminal_request", handle_capture_terminal);
@@ -812,6 +814,63 @@ async fn handle_list_terminals(
         payload["cwd"] = json!(cwd);
     }
     Ok(json!({ "type": "list_terminals_response", "payload": payload }))
+}
+
+/// `true` when `candidate` is `root` or a descendant of `root`, comparing
+/// path components (mirrors TS `isSameOrDescendantPath`, used by
+/// `TerminalManager.getTerminals` to surface terminals opened in subdirectories
+/// of a subscribed workspace root).
+fn is_same_or_descendant_path(root: &str, candidate: &str) -> bool {
+    let root = Path::new(root);
+    let candidate = Path::new(candidate);
+    candidate == root || candidate.starts_with(root)
+}
+
+/// Snapshot the terminals at or below `cwd` as a `terminals_changed` message
+/// payload (`{id, name}` per `TerminalInfoSchema.omit({cwd})`).
+fn terminals_changed_for_cwd(ctx: &WorkspaceHandlerContext, cwd: &str) -> Vec<Value> {
+    ctx.terminal_manager
+        .list()
+        .into_iter()
+        .filter(|t| match t.cwd.as_deref() {
+            Some(term_cwd) => is_same_or_descendant_path(cwd, term_cwd),
+            None => false,
+        })
+        .map(|t| json!({ "id": t.id, "name": t.name }))
+        .collect()
+}
+
+/// `subscribe_terminals_request` -> `terminals_changed` (messages.ts:3656-3662;
+/// terminal-session-controller.ts:316-344). The TS controller adds the cwd to a
+/// subscription set and emits an initial snapshot; the Rust daemon has no live
+/// terminal-mutation broadcast yet, so it replies with the current snapshot for
+/// the root. The directory subscription is implicit: every later snapshot is
+/// recomputed from the manager, so there is no per-session set to maintain.
+async fn handle_subscribe_terminals(
+    ctx: &WorkspaceHandlerContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let cwd = opt_str(&msg, "cwd").unwrap_or_default();
+    let terminals = terminals_changed_for_cwd(ctx, &cwd);
+    Ok(json!({
+        "type": "terminals_changed",
+        "payload": { "cwd": cwd, "terminals": terminals }
+    }))
+}
+
+/// `unsubscribe_terminals_request` -> internal ack (terminal-session-controller.ts
+/// :321-323 returns void; the TS daemon emits no response message). Returns an
+/// internal ack the WS transport leaves unhandled by the client, exactly like
+/// `terminal_input` -> `terminal_input_ack`.
+async fn handle_unsubscribe_terminals(
+    _ctx: &WorkspaceHandlerContext,
+    msg: Value,
+) -> Result<Value, SessionRpcError> {
+    let cwd = opt_str(&msg, "cwd").unwrap_or_default();
+    Ok(json!({
+        "type": "unsubscribe_terminals_ack",
+        "payload": { "cwd": cwd }
+    }))
 }
 
 async fn handle_kill_terminal(

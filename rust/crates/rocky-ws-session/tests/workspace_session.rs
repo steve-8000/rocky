@@ -371,6 +371,70 @@ async fn terminal_create_then_capture_returns_output() {
 }
 
 #[tokio::test]
+async fn subscribe_terminals_returns_changed_snapshot_for_cwd() {
+    // Regression: the WebUI sends `subscribe_terminals_request` /
+    // `unsubscribe_terminals_request` (plural) when opening or removing a
+    // workspace. Before these handlers existed the daemon replied `rpc_error`
+    // ("no handler registered"), breaking the terminal panel after a delete.
+    let home = tempfile::tempdir().unwrap();
+    let (dispatcher, _term) = build_dispatcher(home.path());
+    let root = home.path().to_string_lossy().to_string();
+    let sub_dir = home.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    // A terminal in the root and one in a subdirectory of the root.
+    for (name, cwd) in [("root-term", root.clone()), ("sub-term", sub_dir.to_string_lossy().to_string())] {
+        let created = dispatch(
+            &dispatcher,
+            json!({
+                "type": "create_terminal_request",
+                "cwd": cwd,
+                "name": name,
+                "command": "sh",
+                "args": ["-c", "sleep 5"],
+                "requestId": format!("r-create-{name}"),
+            }),
+        )
+        .await;
+        assert_eq!(created["payload"]["error"], Value::Null);
+    }
+
+    // Subscribing to the root surfaces both terminals (root + descendant).
+    let changed = dispatch(
+        &dispatcher,
+        json!({ "type": "subscribe_terminals_request", "cwd": root, "requestId": "r-subs" }),
+    )
+    .await;
+    assert_eq!(changed["type"], "terminals_changed");
+    assert_eq!(changed["payload"]["cwd"], root);
+    let names: Vec<&str> = changed["payload"]["terminals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"root-term"), "missing root-term: {names:?}");
+    assert!(names.contains(&"sub-term"), "missing sub-term: {names:?}");
+
+    // Subscribing to an unrelated path returns an empty snapshot, not an error.
+    let other = dispatch(
+        &dispatcher,
+        json!({ "type": "subscribe_terminals_request", "cwd": "/nonexistent/elsewhere", "requestId": "r-subs2" }),
+    )
+    .await;
+    assert_eq!(other["type"], "terminals_changed");
+    assert!(other["payload"]["terminals"].as_array().unwrap().is_empty());
+
+    // Unsubscribe is acknowledged (no rpc_error).
+    let unsub = dispatch(
+        &dispatcher,
+        json!({ "type": "unsubscribe_terminals_request", "cwd": root, "requestId": "r-unsub" }),
+    )
+    .await;
+    assert_eq!(unsub["type"], "unsubscribe_terminals_ack");
+}
+
+#[tokio::test]
 async fn archive_workspace_unknown_returns_error() {
     let home = tempfile::tempdir().unwrap();
     let (dispatcher, _term) = build_dispatcher(home.path());

@@ -82,6 +82,7 @@ pub struct TerminalInfo {
     pub name: String,
     pub rows: u16,
     pub cols: u16,
+    pub cwd: Option<String>,
 }
 
 struct Terminal {
@@ -90,6 +91,7 @@ struct Terminal {
     name: String,
     rows: u16,
     cols: u16,
+    cwd: Option<String>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -186,6 +188,7 @@ impl TerminalManager {
             name,
             rows,
             cols,
+            cwd: opts.cwd.clone(),
             master: pair.master,
             writer,
             child,
@@ -215,6 +218,7 @@ impl TerminalManager {
                 name: t.name.clone(),
                 rows: t.rows,
                 cols: t.cols,
+                cwd: t.cwd.clone(),
             })
             .collect()
     }
