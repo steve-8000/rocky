@@ -32,6 +32,30 @@ fn build_dispatcher(rocky_home: &Path) -> (SessionDispatcher, Arc<TerminalManage
     (dispatcher, terminal_manager)
 }
 
+/// Like [`build_dispatcher`] but also returns the shared workspace registry
+/// handle so tests can inspect persisted `archivedAt` state directly.
+fn build_dispatcher_with_registry(
+    rocky_home: &Path,
+) -> (
+    SessionDispatcher,
+    Arc<TerminalManager>,
+    Arc<Mutex<WorkspaceRegistry>>,
+) {
+    let workspace_registry = Arc::new(Mutex::new(WorkspaceRegistry::load(rocky_home)));
+    let project_registry = Arc::new(Mutex::new(ProjectRegistry::load(rocky_home)));
+    let terminal_manager = Arc::new(TerminalManager::new());
+    let ctx = WorkspaceHandlerContext {
+        workspace_registry: workspace_registry.clone(),
+        project_registry,
+        terminal_manager: terminal_manager.clone(),
+        rocky_home: rocky_home.to_path_buf(),
+        worktrees_root: None,
+    };
+    let mut dispatcher = SessionDispatcher::new();
+    register(&mut dispatcher, ctx);
+    (dispatcher, terminal_manager, workspace_registry)
+}
+
 /// Wrap an inner message, dispatch, and return the unwrapped inner response.
 async fn dispatch(dispatcher: &SessionDispatcher, inner: Value) -> Value {
     let env = json!({ "type": "session", "message": inner });
@@ -397,6 +421,146 @@ async fn open_project_then_archive_round_trip() {
     .await;
     assert_eq!(archived["payload"]["error"], Value::Null);
     assert!(archived["payload"]["archivedAt"].is_string());
+}
+
+/// Regression: archiving a worktree must mark its workspace registry record
+/// archived so it leaves `fetch_workspaces` (the sidebar). Previously the
+/// handler only ran `git worktree remove` and never touched the registry, so
+/// the workspace stayed in the sidebar forever ("삭제가 안 됨").
+#[tokio::test]
+async fn worktree_archive_removes_workspace_from_fetch_and_marks_record() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (dispatcher, _term, registry) = build_dispatcher_with_registry(home.path());
+
+    let created = dispatch(
+        &dispatcher,
+        json!({
+            "type": "create_rocky_worktree_request",
+            "cwd": repo.path().to_string_lossy(),
+            "projectId": "proj-arch",
+            "worktreeSlug": "feature/del",
+            "requestId": "r-c",
+        }),
+    )
+    .await;
+    assert_eq!(created["payload"]["error"], Value::Null);
+    let workspace_id = created["payload"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worktree_path = created["payload"]["workspace"]["workspaceDirectory"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Present in fetch before archive.
+    let before = dispatch(
+        &dispatcher,
+        json!({ "type": "fetch_workspaces_request", "requestId": "r-b" }),
+    )
+    .await;
+    assert!(before["payload"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == workspace_id.as_str()));
+
+    let archived = dispatch(
+        &dispatcher,
+        json!({
+            "type": "rocky_worktree_archive_request",
+            "worktreePath": worktree_path,
+            "repoRoot": repo.path().to_string_lossy(),
+            "requestId": "r-a",
+        }),
+    )
+    .await;
+    assert_eq!(archived["type"], "rocky_worktree_archive_response");
+    assert_eq!(archived["payload"]["success"], true);
+    assert_eq!(archived["payload"]["error"], Value::Null);
+
+    // Gone from fetch after archive.
+    let after = dispatch(
+        &dispatcher,
+        json!({ "type": "fetch_workspaces_request", "requestId": "r-a2" }),
+    )
+    .await;
+    assert!(
+        after["payload"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["id"] != workspace_id.as_str()),
+        "worktree should be gone from fetch_workspaces after archive"
+    );
+
+    // The persisted record is marked archived (not merely hidden in memory).
+    let record = registry
+        .lock()
+        .unwrap()
+        .get(&workspace_id)
+        .cloned()
+        .expect("record still present");
+    assert!(record.archived_at.is_some(), "archived_at must be set");
+}
+
+/// Regression: archiving a worktree whose git admin entry is already gone (a
+/// prior partial archive) must still succeed and archive the registry record,
+/// rather than hard-failing on `git worktree remove`.
+#[tokio::test]
+async fn worktree_archive_succeeds_when_admin_entry_already_gone() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (dispatcher, _term, registry) = build_dispatcher_with_registry(home.path());
+
+    let created = dispatch(
+        &dispatcher,
+        json!({
+            "type": "create_rocky_worktree_request",
+            "cwd": repo.path().to_string_lossy(),
+            "projectId": "proj-stale",
+            "worktreeSlug": "feature/stale",
+            "requestId": "r-c",
+        }),
+    )
+    .await;
+    assert_eq!(created["payload"]["error"], Value::Null);
+    let workspace_id = created["payload"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let worktree_path = created["payload"]["workspace"]["workspaceDirectory"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drop git's admin entry so `git worktree remove` would fail.
+    run_git(repo.path(), &["worktree", "prune"]);
+    std::fs::remove_dir_all(repo.path().join(".git").join("worktrees")).ok();
+
+    let archived = dispatch(
+        &dispatcher,
+        json!({
+            "type": "rocky_worktree_archive_request",
+            "worktreePath": worktree_path,
+            "repoRoot": repo.path().to_string_lossy(),
+            "requestId": "r-a",
+        }),
+    )
+    .await;
+    assert_eq!(archived["payload"]["success"], true);
+    assert_eq!(archived["payload"]["error"], Value::Null);
+
+    let record = registry
+        .lock()
+        .unwrap()
+        .get(&workspace_id)
+        .cloned()
+        .expect("record still present");
+    assert!(record.archived_at.is_some(), "archived_at must be set");
 }
 
 /// `workspace_setup_status_request` -> `workspace_setup_status_response` with a

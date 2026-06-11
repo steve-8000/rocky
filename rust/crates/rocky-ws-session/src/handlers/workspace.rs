@@ -671,20 +671,36 @@ async fn handle_worktree_list(
 }
 
 async fn handle_worktree_archive(
-    _ctx: &WorkspaceHandlerContext,
+    ctx: &WorkspaceHandlerContext,
     msg: Value,
 ) -> Result<Value, SessionRpcError> {
     let req_id = request_id(&msg);
     let worktree_path = opt_str(&msg, "worktreePath");
     let repo_root = opt_str(&msg, "repoRoot");
 
-    let result: Result<(), Value> = match (worktree_path, repo_root) {
-        (Some(path), Some(root)) => archive_worktree(Path::new(&root), Path::new(&path))
+    let result: Result<(), Value> = match (worktree_path.as_deref(), repo_root.as_deref()) {
+        (Some(path), Some(root)) => archive_worktree(Path::new(root), Path::new(path))
             .await
             .map_err(|e| checkout_error("UNKNOWN", e.to_string())),
         (None, _) => Err(checkout_error("UNKNOWN", "worktreePath is required")),
         (_, None) => Err(checkout_error("UNKNOWN", "repoRoot is required")),
     };
+
+    // Whether or not the git/FS teardown succeeded, archive the workspace
+    // registry record so the worktree leaves the sidebar (matches the TS
+    // `archiveWorkspaceRecord` step, which runs even when teardown throws a
+    // `WorktreeTeardownError`; rocky-worktree-archive-service.ts:124-166). The
+    // `fetch_workspaces` handler filters on `archived_at.is_none()`, so an
+    // un-archived record would otherwise persist forever.
+    if let Some(path) = worktree_path.as_deref() {
+        let workspace_id = normalize_workspace_id(Path::new(path));
+        let archived_at = now_iso8601();
+        if let Ok(mut registry) = ctx.workspace_registry.lock() {
+            if let Err(err) = registry.archive(&workspace_id, &archived_at) {
+                tracing::warn!(error = %err, workspace_id, "failed to archive workspace record after worktree teardown");
+            }
+        }
+    }
 
     Ok(match result {
         Ok(()) => json!({

@@ -30,6 +30,9 @@ pub enum WorktreeError {
     #[error("invalid branch slug: {0}")]
     InvalidBranch(String),
 
+    #[error("worktree teardown failed: {0}")]
+    Teardown(String),
+
     #[error(transparent)]
     Git(#[from] GitError),
 
@@ -250,14 +253,56 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
 
 /// Remove the worktree at `path` and prune stale admin entries.
 ///
-/// Runs `git worktree remove --force <path>` followed by
-/// `git worktree prune`, the core of `deleteRockyWorktree`
-/// (worktree.ts:1039-1114).
+/// Mirrors `deleteRockyWorktree` (worktree.ts:1039-1114): the operation is
+/// idempotent. `git worktree remove --force` fails when the admin dir is
+/// already gone (a prior partial archive, or the repo root moved) — that
+/// failure is intentionally swallowed so we fall through to removing the
+/// directory ourselves and pruning lazily. The only hard error is when the
+/// working-tree directory still exists on disk and cannot be deleted.
 pub async fn archive_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
     let path_str = path.to_string_lossy().into_owned();
-    git::run_git_checked(repo_root, ["worktree", "remove", "--force", &path_str]).await?;
-    git::run_git_checked(repo_root, ["worktree", "prune"]).await?;
+
+    // Best-effort `git worktree remove --force`; ignore failures (e.g. the
+    // admin entry is already gone, "is not a working tree").
+    let _ = git::run_git(repo_root, ["worktree", "remove", "--force", &path_str]).await;
+
+    // Ensure the working-tree directory is gone, retrying transient FS errors.
+    remove_dir_with_retries(path).await?;
+
+    // Lazily prune stale admin entries; not critical if it fails.
+    let _ = git::run_git(repo_root, ["worktree", "prune"]).await;
     Ok(())
+}
+
+/// Remove `path` and its contents, retrying transient failures, mirroring the
+/// `removeDirectoryWithRetries` helper (worktree.ts:1128-1150). A missing path
+/// is success.
+async fn remove_dir_with_retries(path: &Path) -> Result<(), WorktreeError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let delays_ms = [0u64, 100, 300, 700, 1500];
+    let mut last_err: Option<std::io::Error> = None;
+    for delay in delays_ms {
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+    }
+    Err(WorktreeError::Teardown(format!(
+        "failed to remove worktree directory {}: {}",
+        path.display(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string()),
+    )))
 }
 
 /// Upsert a `worktree`-kind workspace record for `cwd`.
@@ -470,6 +515,33 @@ mod tests {
         let after = list_worktrees(&repo).await.unwrap();
         assert!(after.iter().all(|w| w.branch.as_deref() != Some("feature-x")));
         assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn archive_worktree_is_idempotent_when_admin_entry_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let wt_path = dir.path().join("worktrees").join("stale-x");
+        create_worktree(&repo, &wt_path, "stale-x", None)
+            .await
+            .unwrap();
+        assert!(wt_path.exists());
+
+        // Simulate a prior partial archive: drop git's admin entry so that
+        // `git worktree remove` will fail with "is not a working tree", while
+        // the working-tree directory itself still exists on disk.
+        git::run_git(&repo, ["worktree", "prune"]).await.unwrap();
+        std::fs::remove_dir_all(repo.join(".git").join("worktrees")).ok();
+
+        // Archive must still succeed (idempotent) and remove the directory.
+        archive_worktree(&repo, &wt_path).await.unwrap();
+        assert!(!wt_path.exists());
+
+        // A second archive of an already-gone path is a no-op success.
+        archive_worktree(&repo, &wt_path).await.unwrap();
     }
 
     #[tokio::test]
