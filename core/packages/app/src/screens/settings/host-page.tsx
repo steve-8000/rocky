@@ -24,7 +24,6 @@ import {
   useHosts,
 } from "@/runtime/host-runtime";
 import { ProvidersSection } from "@/screens/settings/providers-section";
-import { TeamAgentsSection } from "@/screens/settings/team-agents-section";
 import { SettingsSection } from "@/screens/settings/settings-section";
 import { useSessionStore } from "@/stores/session-store";
 import { settingsStyles } from "@/styles/settings";
@@ -203,8 +202,6 @@ export function HostAgentsPage({ serverId }: { serverId: string }) {
     <View>
       {isConnected ? (
         <SettingsSection title="Agents">
-          <TeamAgentsSection serverId={serverId} />
-          <InjectRockyToolsCard serverId={serverId} />
           <AppendSystemPromptCard serverId={serverId} />
         </SettingsSection>
       ) : (
@@ -612,42 +609,6 @@ function RestartDaemonCard({ host }: { host: HostProfile }) {
         >
           {isRestarting ? "Restarting..." : "Restart"}
         </Button>
-      </View>
-    </View>
-  );
-}
-
-function InjectRockyToolsCard({ serverId }: { serverId: string }) {
-  const isConnected = useHostRuntimeIsConnected(serverId);
-  const { config, patchConfig } = useDaemonConfig(serverId);
-
-  const handleValueChange = useCallback(
-    (next: boolean) => {
-      void patchConfig({
-        mcp: {
-          injectIntoAgents: next,
-        },
-      });
-    },
-    [patchConfig],
-  );
-
-  if (!isConnected) return null;
-
-  return (
-    <View style={settingsStyles.card} testID="host-page-inject-mcp-card">
-      <View style={settingsStyles.row}>
-        <View style={settingsStyles.rowContent}>
-          <Text style={settingsStyles.rowTitle}>Enable Rocky tools</Text>
-          <Text style={settingsStyles.rowHint}>
-            Agents will be able to manage worktrees, agents and schedules
-          </Text>
-        </View>
-        <Switch
-          value={config?.mcp.injectIntoAgents !== false}
-          onValueChange={handleValueChange}
-          accessibilityLabel="Inject Rocky tools"
-        />
       </View>
     </View>
   );
