@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from rocky.serve import EMBEDDING_PRESETS, PRESETS, run
+from rocky.serve import EMBEDDING_PRESETS, PRESETS, run, run_embed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -39,6 +39,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     srv.add_argument("extra", nargs=argparse.REMAINDER, help="Extra flags forwarded to rapid-mlx serve")
 
+    emb = sub.add_parser("embed", help="Launch embedding-only server")
+    emb.add_argument(
+        "preset",
+        nargs="?",
+        default=None,
+        choices=list(EMBEDDING_PRESETS),
+        help=f"Embedding preset (default: qwen3-embed-0.6b). Available: {', '.join(EMBEDDING_PRESETS)}",
+    )
+    emb.add_argument("--host", default=None)
+    emb.add_argument("--port", type=int, default=None, help="Port (default: 7778 or ROCKY_EMBED_PORT)")
+    emb.add_argument("--api-key", default=None, dest="api_key")
+
     sub.add_parser("presets", help="List available model presets")
     sub.add_parser("embedding-presets", help="List available embedding model presets")
 
@@ -60,6 +72,13 @@ def main() -> None:
             api_key=args.api_key,
             embedding_model=embedding_model,
             extra=args.extra,
+        )
+    elif args.command == "embed":
+        run_embed(
+            preset_name=args.preset,
+            host=args.host,
+            port=args.port,
+            api_key=args.api_key,
         )
     elif args.command == "presets":
         print(f"{'preset':<14} {'alias':<38} {'prefill_step':<14} max_tokens")

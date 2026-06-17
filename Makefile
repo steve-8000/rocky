@@ -1,4 +1,6 @@
-.PHONY: install serve serve-gemma4-12b serve-qwen3.6-27b serve-qwen3.6-35b health presets install-service uninstall-service logs status restart
+.PHONY: install serve serve-gemma4-12b serve-qwen3.6-27b serve-qwen3.6-35b embed health presets install-service uninstall-service logs status restart
+
+EMBED_PORT ?= 7778
 
 ROCKY := uv run rocky
 PORT   ?= 7777
@@ -25,19 +27,27 @@ health:
 presets: install
 	$(ROCKY) presets
 
+embed: install
+	$(ROCKY) embed --host $(HOST) --port $(EMBED_PORT)
+
 install-service:
 	launchctl load ~/Library/LaunchAgents/dev.rocky.llm.plist
+	launchctl load ~/Library/LaunchAgents/dev.rocky.embed.plist
 
 uninstall-service:
 	launchctl unload ~/Library/LaunchAgents/dev.rocky.llm.plist
+	launchctl unload ~/Library/LaunchAgents/dev.rocky.embed.plist
 
 restart:
 	launchctl unload ~/Library/LaunchAgents/dev.rocky.llm.plist
+	launchctl unload ~/Library/LaunchAgents/dev.rocky.embed.plist
 	sleep 2
 	launchctl load ~/Library/LaunchAgents/dev.rocky.llm.plist
+	launchctl load ~/Library/LaunchAgents/dev.rocky.embed.plist
 
 status:
 	launchctl list dev.rocky.llm
+	launchctl list dev.rocky.embed
 
 logs:
-	tail -f ~/.rocky/logs/rocky-llm.err.log
+	tail -f ~/.rocky/logs/rocky-llm.err.log ~/.rocky/logs/rocky-embed.err.log

@@ -32,19 +32,16 @@ PRESETS: dict[str, Preset] = {
         prefill_step_size=4096,
         max_tokens=32768,
         no_thinking=True,
-        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
     "qwen3.6-27b": Preset(
         alias="qwen3.6-27b-4bit",
         prefill_step_size=4096,
         max_tokens=32768,
-        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
     "qwen3.6-35b": Preset(
         alias="qwen3.6-35b-4bit",
         prefill_step_size=8192,
         max_tokens=32768,
-        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
 }
 
@@ -72,11 +69,10 @@ def run(
     host = host or _env("ROCKY_HOST", "127.0.0.1")
     port = port or int(_env("ROCKY_PORT", "7777"))
     api_key = api_key or _env("ROCKY_API_KEY", "") or None
-    embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or preset.embedding_model or None
+    embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or None
 
     import uvicorn
     from rocky.core import server as _server
-    from rocky.core.middleware.auth import configure_rate_limiter
     from rocky.core.model_aliases import resolve_profile
     from rocky.core.scheduler import SchedulerConfig
 
@@ -89,8 +85,7 @@ def run(
 
     scheduler_config = SchedulerConfig(prefill_step_size=preset.prefill_step_size)
 
-    print(f"rocky → {preset_name} ({preset.alias})")
-    print(f"  host={host}:{port}  no_thinking={preset.no_thinking}  prefill_step={preset.prefill_step_size}")
+    print(f"rocky serve → {preset_name} ({preset.alias}) {host}:{port}")
 
     _server.load_model(
         model_name=model_name,
@@ -101,5 +96,33 @@ def run(
 
     if embedding_model:
         _server.load_embedding_model(embedding_model, lock=True)
+
+    uvicorn.run(_server.app, host=host, port=port, log_level="warning")
+
+
+def run_embed(
+    preset_name: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    api_key: str | None = None,
+) -> None:
+    preset_name = preset_name or _env("ROCKY_EMBED_PRESET", "qwen3-embed-0.6b")
+    if preset_name not in EMBEDDING_PRESETS:
+        print(f"Unknown embedding preset '{preset_name}'. Available: {', '.join(EMBEDDING_PRESETS)}", file=sys.stderr)
+        sys.exit(1)
+
+    model_name = EMBEDDING_PRESETS[preset_name]
+    host = host or _env("ROCKY_HOST", "127.0.0.1")
+    port = port or int(_env("ROCKY_EMBED_PORT", "7778"))
+    api_key = api_key or _env("ROCKY_API_KEY", "") or None
+
+    import uvicorn
+    from rocky.core import server as _server
+
+    _server._api_key = api_key
+
+    print(f"rocky embed → {preset_name} ({model_name}) {host}:{port}")
+
+    _server.load_embedding_model(model_name, lock=True)
 
     uvicorn.run(_server.app, host=host, port=port, log_level="warning")
