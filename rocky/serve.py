@@ -83,9 +83,15 @@ def run(
     profile = resolve_profile(preset.alias)
     model_name = profile.hf_path if profile else preset.alias
 
+    from rocky.core.model_auto_config import detect_model_config
+    auto_cfg = detect_model_config(model_name)
+    if auto_cfg and auto_cfg.tool_call_parser:
+        _server._tool_call_parser = auto_cfg.tool_call_parser
+        _server._enable_auto_tool_choice = True
+
     scheduler_config = SchedulerConfig(prefill_step_size=preset.prefill_step_size)
 
-    print(f"rocky serve → {preset_name} ({preset.alias}) {host}:{port}")
+    print(f"rocky serve → {preset_name} ({preset.alias}) {host}:{port}  tool_parser={_server._tool_call_parser}")
 
     _server.load_model(
         model_name=model_name,

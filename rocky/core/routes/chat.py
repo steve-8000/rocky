@@ -681,7 +681,14 @@ async def _create_chat_completion_impl(
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
-    if resolved_thinking is not None:
+    # When tools are present, never pass enable_thinking=False.
+    # Gemma4's chat template injects <|channel>thought<channel|> on False
+    # (even as default), locking the model into the thought channel and
+    # preventing tool_call generation. Pass True explicitly so the template
+    # renders a clean generation prompt and the model can choose tool_call.
+    if request.tools and (resolved_thinking is False or resolved_thinking is None):
+        chat_kwargs["enable_thinking"] = True
+    elif resolved_thinking is not None:
         chat_kwargs["enable_thinking"] = resolved_thinking
 
     # Cloud routing: offload large-context requests to cloud LLM.
