@@ -36,7 +36,7 @@ uv run rocky serve qwen3.6-27b --port 7777
 
 | preset | model (HuggingFace) | max_tokens | tool call | thinking |
 |---|---|---|---|---|
-| `gemma4-12b` ✦ | [mlx-community/gemma-4-12B-it-qat-4bit](https://huggingface.co/mlx-community/gemma-4-12B-it-qat-4bit) | 32768 | ✅ gemma4 | off |
+| `gemma4-12b` ✦ | [mlx-community/gemma-4-12B-it-qat-4bit](https://huggingface.co/mlx-community/gemma-4-12B-it-qat-4bit) | 32768 | ✅ gemma4 | off (tools 시 auto) |
 | `qwen3.6-27b` | [mlx-community/Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit) | 32768 | ✅ qwen3_coder_xml | on |
 | `qwen3.6-35b` | [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) | 32768 | ✅ qwen3_coder_xml | on |
 
