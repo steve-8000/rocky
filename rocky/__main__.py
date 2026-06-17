@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from rocky.serve import PRESETS, run
+from rocky.serve import EMBEDDING_PRESETS, PRESETS, run
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -30,9 +30,17 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="embedding_model",
         help="Pre-load embedding model for /v1/embeddings (or ROCKY_EMBEDDING_MODEL)",
     )
+    srv.add_argument(
+        "--embedding-preset",
+        default=None,
+        dest="embedding_preset",
+        choices=list(EMBEDDING_PRESETS),
+        help=f"Embedding model preset. Available: {', '.join(EMBEDDING_PRESETS)}",
+    )
     srv.add_argument("extra", nargs=argparse.REMAINDER, help="Extra flags forwarded to rapid-mlx serve")
 
     sub.add_parser("presets", help="List available model presets")
+    sub.add_parser("embedding-presets", help="List available embedding model presets")
 
     return p
 
@@ -42,20 +50,28 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "serve":
+        embedding_model = args.embedding_model
+        if not embedding_model and args.embedding_preset:
+            embedding_model = EMBEDDING_PRESETS[args.embedding_preset]
         run(
             preset_name=args.preset,
             host=args.host,
             port=args.port,
             api_key=args.api_key,
-            embedding_model=args.embedding_model,
+            embedding_model=embedding_model,
             extra=args.extra,
         )
     elif args.command == "presets":
-        print(f"{'preset':<12} {'alias':<35} {'prefill_step':<14} max_tokens")
-        print("-" * 72)
+        print(f"{'preset':<14} {'alias':<38} {'prefill_step':<14} max_tokens")
+        print("-" * 74)
         for name, preset in PRESETS.items():
-            flags = " ".join(preset.extra_flags) or "-"
-            print(f"{name:<12} {preset.alias:<35} {preset.prefill_step_size:<14} {preset.max_tokens}  {flags}")
+            emb = "+ embed" if preset.embedding_model else "-"
+            print(f"{name:<14} {preset.alias:<38} {preset.prefill_step_size:<14} {preset.max_tokens}  {emb}")
+    elif args.command == "embedding-presets":
+        print(f"{'preset':<20} {'model'}")
+        print("-" * 72)
+        for name, model in EMBEDDING_PRESETS.items():
+            print(f"{name:<20} {model}")
     else:
         parser.print_help()
         sys.exit(0)

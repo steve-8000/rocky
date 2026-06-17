@@ -46,6 +46,9 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     try:
         model_name = request.model
 
+        if model_name in ("default", "text-embedding-ada-002") and cfg.embedding_model_locked:
+            model_name = cfg.embedding_model_locked
+
         if (
             cfg.embedding_model_locked is not None
             and model_name != cfg.embedding_model_locked
@@ -54,9 +57,8 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
                 status_code=400,
                 detail=(
                     f"Embedding model '{model_name}' is not available. "
-                    f"This server was started with --embedding-model {cfg.embedding_model_locked}. "
-                    f"Only '{cfg.embedding_model_locked}' can be used for embeddings. "
-                    f"Restart the server with a different --embedding-model to use '{model_name}'."
+                    f"Loaded: {cfg.embedding_model_locked}. "
+                    f"Use model='default' or model='{cfg.embedding_model_locked}'."
                 ),
             )
 

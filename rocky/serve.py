@@ -12,8 +12,19 @@ class Preset:
     max_tokens: int = 8192
     no_thinking: bool = False
     mllm: bool = False
+    embedding_model: str | None = None
     extra_flags: list[str] = field(default_factory=list)
 
+
+EMBEDDING_PRESETS: dict[str, str] = {
+    "qwen3-embed-0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+    "qwen3-embed-4b":   "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+    "qwen3-embed-8b":   "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
+    "nomic":            "mlx-community/nomicai-modernbert-embed-base-4bit",
+    "gemma-embed":      "mlx-community/embeddinggemma-300m-4bit",
+}
+
+EMBEDDING_MODEL_DEFAULT = EMBEDDING_PRESETS["qwen3-embed-0.6b"]
 
 PRESETS: dict[str, Preset] = {
     "gemma4-12b": Preset(
@@ -21,16 +32,19 @@ PRESETS: dict[str, Preset] = {
         prefill_step_size=4096,
         max_tokens=32768,
         no_thinking=True,
+        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
     "qwen3.6-27b": Preset(
         alias="qwen3.6-27b-4bit",
         prefill_step_size=4096,
         max_tokens=32768,
+        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
     "qwen3.6-35b": Preset(
         alias="qwen3.6-35b-4bit",
         prefill_step_size=8192,
         max_tokens=32768,
+        embedding_model=EMBEDDING_MODEL_DEFAULT,
     ),
 }
 
@@ -58,7 +72,7 @@ def run(
     host = host or _env("ROCKY_HOST", "127.0.0.1")
     port = port or int(_env("ROCKY_PORT", "7777"))
     api_key = api_key or _env("ROCKY_API_KEY", "") or None
-    embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or None
+    embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or preset.embedding_model or None
 
     import uvicorn
     from rocky.core import server as _server
