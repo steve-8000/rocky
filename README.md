@@ -32,16 +32,51 @@ uv run rocky serve
 uv run rocky serve qwen3.6-27b --port 7777
 ```
 
-## Presets
+## LLM Presets
 
-| preset | model | max_tokens |
-|---|---|---|
-| `gemma4-12b` | gemma-4-12b-qat-4bit | 32768 |
-| `qwen3.6-27b` | qwen3.6-27b-4bit | 32768 |
-| `qwen3.6-35b` | qwen3.6-35b-4bit | 32768 |
+| preset | model (HuggingFace) | max_tokens | tool call | thinking |
+|---|---|---|---|---|
+| `gemma4-12b` ✦ | [mlx-community/gemma-4-12B-it-qat-4bit](https://huggingface.co/mlx-community/gemma-4-12B-it-qat-4bit) | 32768 | ✅ gemma4 | off |
+| `qwen3.6-27b` | [mlx-community/Qwen3.6-27B-4bit](https://huggingface.co/mlx-community/Qwen3.6-27B-4bit) | 32768 | ✅ qwen3_coder_xml | on |
+| `qwen3.6-35b` | [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) | 32768 | ✅ qwen3_coder_xml | on |
+
+✦ default preset
 
 ```bash
+# list presets
 uv run rocky presets
+
+# load a specific preset (downloads model on first run)
+make serve                  # gemma4-12b (default)
+make serve-qwen3.6-27b
+make serve-qwen3.6-35b
+
+# or directly
+uv run rocky serve gemma4-12b
+uv run rocky serve qwen3.6-27b
+uv run rocky serve qwen3.6-35b
+```
+
+## Embedding Presets
+
+| preset | model (HuggingFace) | dim | default |
+|---|---|---|---|
+| `qwen3-embed-0.6b` ✦ | [mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ](https://huggingface.co/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ) | 1024 | ✅ |
+| `qwen3-embed-4b` | [mlx-community/Qwen3-Embedding-4B-4bit-DWQ](https://huggingface.co/mlx-community/Qwen3-Embedding-4B-4bit-DWQ) | 2560 | |
+| `qwen3-embed-8b` | [mlx-community/Qwen3-Embedding-8B-4bit-DWQ](https://huggingface.co/mlx-community/Qwen3-Embedding-8B-4bit-DWQ) | 4096 | |
+| `nomic` | [mlx-community/nomicai-modernbert-embed-base-4bit](https://huggingface.co/mlx-community/nomicai-modernbert-embed-base-4bit) | 768 | |
+| `gemma-embed` | [mlx-community/embeddinggemma-300m-4bit](https://huggingface.co/mlx-community/embeddinggemma-300m-4bit) | 1152 | |
+
+✦ default preset
+
+```bash
+# list embedding presets
+uv run rocky embedding-presets
+
+# load embedding server (port 7778)
+make embed                                          # qwen3-embed-0.6b (default)
+uv run rocky embed qwen3-embed-4b --port 7778
+uv run rocky embed nomic --port 7778
 ```
 
 ## Connect
