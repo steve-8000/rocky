@@ -942,6 +942,7 @@ from .routes.health import probe_router as _probe_router
 from .routes.health import router as _health_router
 from .routes.mcp_routes import router as _mcp_router
 from .routes.models import router as _models_router
+from .routes.rocky_native import router as _rocky_native_router
 from .routes.responses import router as _responses_router
 
 app.include_router(_probe_router)
@@ -953,6 +954,7 @@ app.include_router(_anthropic_router)
 app.include_router(_responses_router)
 app.include_router(_embeddings_router)
 app.include_router(_mcp_router)
+app.include_router(_rocky_native_router)
 
 
 # =============================================================================

@@ -6,3 +6,9 @@ __pycache__/
 .env
 dist/
 *.egg-info/
+.harness/
+.amaze-work/
+.rocky/
+vendor/
+*.log
+*.pid

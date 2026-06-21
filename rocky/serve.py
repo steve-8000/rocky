@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -13,7 +13,7 @@ class Preset:
     no_thinking: bool = False
     mllm: bool = False
     embedding_model: str | None = None
-    extra_flags: list[str] = field(default_factory=list)
+    tool_call_parser: str | None = None
 
 
 EMBEDDING_PRESETS: dict[str, str] = {
@@ -43,9 +43,15 @@ PRESETS: dict[str, Preset] = {
         prefill_step_size=8192,
         max_tokens=32768,
     ),
+    "fastcontext": Preset(
+        alias="microsoft/FastContext-1.0-4B-SFT",
+        prefill_step_size=4096,
+        max_tokens=8192,
+        tool_call_parser="qwen",
+    ),
 }
 
-DEFAULT_PRESET = "gemma4-12b"
+DEFAULT_PRESET = "fastcontext"
 
 
 def _env(key: str, fallback: str) -> str:
@@ -67,7 +73,7 @@ def run(
 
     preset = PRESETS[preset_name]
     host = host or _env("ROCKY_HOST", "127.0.0.1")
-    port = port or int(_env("ROCKY_PORT", "7777"))
+    port = port or int(_env("ROCKY_PORT", "30000"))
     api_key = api_key or _env("ROCKY_API_KEY", "") or None
     embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or None
 
@@ -85,7 +91,10 @@ def run(
 
     from rocky.core.model_auto_config import detect_model_config
     auto_cfg = detect_model_config(model_name)
-    if auto_cfg and auto_cfg.tool_call_parser:
+    if preset.tool_call_parser:
+        _server._tool_call_parser = preset.tool_call_parser
+        _server._enable_auto_tool_choice = True
+    elif auto_cfg and auto_cfg.tool_call_parser:
         _server._tool_call_parser = auto_cfg.tool_call_parser
         _server._enable_auto_tool_choice = True
 
