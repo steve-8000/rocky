@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..engine.base import BaseEngine
+if TYPE_CHECKING:
+    from ..engine.base import BaseEngine
 
 
 @dataclass
@@ -87,10 +88,6 @@ class ServerConfig:
     # --- MCP ---
     mcp_manager: Any = None
     mcp_executor: Any = None
-
-    # --- Embeddings ---
-    embedding_engine: Any = None
-    embedding_model_locked: str | None = None
 
     # --- Auth ---
     api_key: str | None = None

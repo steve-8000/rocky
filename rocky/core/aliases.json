@@ -872,5 +872,13 @@
     "supports_spec_decode": false,
     "supports_dflash": false,
     "suffix_decoding_tier": "unknown"
+  },
+  "qwen-fable-9b-8bit": {
+    "hf_path": "shamsghi/Qwen-9B-Claude-Fable-5-1M-MLX-8bit",
+    "tool_call_parser": "hermes",
+    "reasoning_parser": "qwen3",
+    "is_hybrid": true,
+    "is_moe": false,
+    "supports_spec_decode": false
   }
 }

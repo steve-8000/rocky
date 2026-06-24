@@ -77,13 +77,6 @@ async def list_models() -> ModelsResponse:
         models.append(_build_model_info(cfg.model_name))
         if cfg.model_alias and cfg.model_alias != cfg.model_name:
             models.append(_build_model_info(cfg.model_alias))
-    elif cfg.embedding_model_locked:
-        models.append(_build_model_info(cfg.embedding_model_locked))
-    else:
-        from ..server import _embedding_model_locked
-
-        if _embedding_model_locked:
-            models.append(_build_model_info(_embedding_model_locked))
     return ModelsResponse(data=models)
 
 
@@ -99,10 +92,6 @@ async def retrieve_model(model_id: str) -> ModelInfo:
 
     if cfg.model_registry and model_id in cfg.model_registry:
         return _build_model_info(model_id)
-    if model_id in (cfg.model_name, cfg.model_alias, cfg.embedding_model_locked):
+    if model_id in (cfg.model_name, cfg.model_alias):
         return _build_model_info(model_id)
-    from ..server import _embedding_model_locked
-
-    if _embedding_model_locked and model_id in ("default", _embedding_model_locked):
-        return _build_model_info(_embedding_model_locked)
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")

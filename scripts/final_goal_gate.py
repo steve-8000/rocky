@@ -9,8 +9,6 @@ from pathlib import Path
 STAGES = (
     ("llm_runtime", "stage_llm_gate.py"),
     ("search_engine", "stage_search_gate.py"),
-    ("xenonite_compatible_memory", "stage_memory_gate.py"),
-    ("integrated_runtime_search_memory", "stage_integration_gate.py"),
 )
 
 

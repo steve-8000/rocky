@@ -12,19 +12,8 @@ class Preset:
     max_tokens: int = 8192
     no_thinking: bool = False
     mllm: bool = False
-    embedding_model: str | None = None
     tool_call_parser: str | None = None
 
-
-EMBEDDING_PRESETS: dict[str, str] = {
-    "qwen3-embed-0.6b": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
-    "qwen3-embed-4b":   "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
-    "qwen3-embed-8b":   "mlx-community/Qwen3-Embedding-8B-4bit-DWQ",
-    "nomic":            "mlx-community/nomicai-modernbert-embed-base-4bit",
-    "gemma-embed":      "mlx-community/embeddinggemma-300m-4bit",
-}
-
-EMBEDDING_MODEL_DEFAULT = EMBEDDING_PRESETS["qwen3-embed-0.6b"]
 
 PRESETS: dict[str, Preset] = {
     "gemma4-12b": Preset(
@@ -43,15 +32,14 @@ PRESETS: dict[str, Preset] = {
         prefill_step_size=8192,
         max_tokens=32768,
     ),
-    "fastcontext": Preset(
-        alias="microsoft/FastContext-1.0-4B-SFT",
+    "qwen-fable-9b": Preset(
+        alias="qwen-fable-9b-8bit",
         prefill_step_size=4096,
-        max_tokens=8192,
-        tool_call_parser="qwen",
+        max_tokens=32768,
     ),
 }
 
-DEFAULT_PRESET = "fastcontext"
+DEFAULT_PRESET = "gemma4-12b"
 
 
 def _env(key: str, fallback: str) -> str:
@@ -63,7 +51,8 @@ def run(
     host: str | None = None,
     port: int | None = None,
     api_key: str | None = None,
-    embedding_model: str | None = None,
+    mcp: bool | None = None,
+    skills_dir: str | None = None,
     extra: list[str] | None = None,
 ) -> None:
     preset_name = preset_name or _env("ROCKY_PRESET", DEFAULT_PRESET)
@@ -75,7 +64,14 @@ def run(
     host = host or _env("ROCKY_HOST", "127.0.0.1")
     port = port or int(_env("ROCKY_PORT", "30000"))
     api_key = api_key or _env("ROCKY_API_KEY", "") or None
-    embedding_model = embedding_model or _env("ROCKY_EMBEDDING_MODEL", "") or None
+
+    # Wire MCP toggles into env before importing the app: `rocky.core.server`
+    # decides whether to mount /mcp at import time (ROCKY_MCP_ENABLED) and the
+    # skills service reads ROCKY_SKILLS_DIR when it is constructed.
+    if skills_dir:
+        os.environ["ROCKY_SKILLS_DIR"] = skills_dir
+    if mcp is not None:
+        os.environ["ROCKY_MCP_ENABLED"] = "true" if mcp else "false"
 
     import uvicorn
     from rocky.core import server as _server
@@ -108,36 +104,5 @@ def run(
         max_tokens=preset.max_tokens,
         force_mllm=preset.mllm,
     )
-
-    if embedding_model:
-        _server.load_embedding_model(embedding_model, lock=True)
-
-    uvicorn.run(_server.app, host=host, port=port, log_level="warning")
-
-
-def run_embed(
-    preset_name: str | None = None,
-    host: str | None = None,
-    port: int | None = None,
-    api_key: str | None = None,
-) -> None:
-    preset_name = preset_name or _env("ROCKY_EMBED_PRESET", "qwen3-embed-0.6b")
-    if preset_name not in EMBEDDING_PRESETS:
-        print(f"Unknown embedding preset '{preset_name}'. Available: {', '.join(EMBEDDING_PRESETS)}", file=sys.stderr)
-        sys.exit(1)
-
-    model_name = EMBEDDING_PRESETS[preset_name]
-    host = host or _env("ROCKY_HOST", "127.0.0.1")
-    port = port or int(_env("ROCKY_EMBED_PORT", "7778"))
-    api_key = api_key or _env("ROCKY_API_KEY", "") or None
-
-    import uvicorn
-    from rocky.core import server as _server
-
-    _server._api_key = api_key
-
-    print(f"rocky embed → {preset_name} ({model_name}) {host}:{port}")
-
-    _server.load_embedding_model(model_name, lock=True)
 
     uvicorn.run(_server.app, host=host, port=port, log_level="warning")

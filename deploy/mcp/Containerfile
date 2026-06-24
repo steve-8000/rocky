@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# ML-free Skills+Codebase MCP server image.
+#
+# Build context: the rocky repo root (~/amaze_s3/rocky):
+#   container build -t rocky-mcp -f deploy/mcp/Containerfile .
+#
+# The optional C-engine builder stage (rocky-codebase) is layered in separately;
+# without the binary the codebase/graph tools degrade gracefully and the five
+# skill_* tools still work off the SKILL.md manifest.
+
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY deploy/mcp/requirements-mcp.txt /tmp/requirements-mcp.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-mcp.txt
+
+COPY rocky/ /app/rocky/
+
+# Fail the build if the "ML-free" guarantee ever regresses.
+RUN python -c "import sys; import rocky.mcp_app; \
+heavy=sorted({n.split('.')[0] for n in sys.modules if n.split('.')[0] in {'mlx','mlx_lm','torch','transformers','PIL','outlines'}}); \
+assert not heavy, ('ML stack leaked into MCP image: %s' % heavy); \
+print('import OK — MCP app is ML-free')"
+
+RUN mkdir -p /skills
+
+ENV ROCKY_MCP_ENABLED=true \
+    ROCKY_SKILLS_DIR=/skills \
+    ROCKY_CODEBASE_ENABLED=true \
+    ROCKY_HOST=0.0.0.0 \
+    ROCKY_PORT=7777
+
+EXPOSE 7777
+CMD ["uvicorn", "rocky.mcp_app:app", "--host", "0.0.0.0", "--port", "7777"]

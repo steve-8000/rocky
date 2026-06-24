@@ -1,0 +1,8 @@
+# Runtime deps for the ML-free Skills+Codebase MCP server (rocky.mcp_app).
+# Deliberately excludes mlx / torch / transformers — this image runs on Linux.
+fastapi
+uvicorn
+httpx
+pyyaml
+python-multipart
+rich

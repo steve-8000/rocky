@@ -11,9 +11,8 @@ These models define the request and response schemas for:
 
 import time
 import uuid
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -574,78 +573,6 @@ class AudioSeparationRequest(BaseModel):
 
     model: str = "htdemucs"
     stems: list[str] = Field(default_factory=lambda: ["vocals", "accompaniment"])
-
-
-# =============================================================================
-# Embeddings
-# =============================================================================
-
-
-class EmbeddingRequest(BaseModel):
-    """Request for text embeddings (OpenAI compatible)."""
-
-    # extra="forbid" turns silent-drop into a 422 with a clear field name.
-    # Without it, fields like `dimensions` or `encoding_format` typos pass
-    # through and the user only notices when the response shape is wrong.
-    # protected_namespaces=() suppresses the Pydantic v2 warning about
-    # the `model` field colliding with the reserved `model_` prefix; a
-    # future Pydantic point release could otherwise promote that warning
-    # to an error and 500 every embeddings request.
-    model_config = ConfigDict(extra="forbid", protected_namespaces=())
-
-    # OpenAI spec lists 4 input shapes: ``str``, ``list[str]``,
-    # ``list[int]`` (single pre-tokenized input), and
-    # ``list[list[int]]`` (batch of pre-tokenized inputs). Production
-    # pipelines that pre-tokenize with a shared HF tokenizer send the
-    # latter two forms — refusing them broke LangChain / LlamaIndex
-    # integrations that hard-code the spec shape (R10 sweep H6).
-    #
-    # ``StrictInt`` / ``StrictStr`` so Pydantic does NOT silently
-    # coerce ``"123"`` → 123 (would be treated as token id 123, a
-    # different embedding from the word "123") or ``True`` → 1
-    # (Python ``bool`` is an ``int`` subclass; without ``StrictInt``
-    # a JSON ``true`` would pass as token id 1).
-    input: StrictStr | list[StrictStr] | list[StrictInt] | list[list[StrictInt]]
-    model: str
-    # Literal so an unknown value (typo like "base65" or "BASE64") 422s
-    # at parse time rather than silently falling back to float — that
-    # silent fallback is the same class of bug this PR exists to close.
-    encoding_format: Literal["float", "base64"] | None = "float"
-    # OpenAI spec: per-vector truncation. Common for MRL-style models
-    # (text-embedding-3-large, nomic-embed-text-v1.5). Implemented in
-    # the route as a post-embed slice + L2 renormalization (required
-    # for the truncated vector to remain a valid embedding for cosine
-    # similarity per the OpenAI cookbook).
-    dimensions: int | None = None
-    # OpenAI abuse-tracking field. Accepted (not validated) so clients
-    # using the upstream SDK don't see a 422 on unknown field.
-    user: str | None = None
-
-
-class EmbeddingData(BaseModel):
-    """A single embedding result."""
-
-    object: str = "embedding"
-    index: int
-    # `list[float]` for encoding_format="float"; base64-encoded float32
-    # little-endian bytes (as ASCII string) for encoding_format="base64".
-    embedding: list[float] | str
-
-
-class EmbeddingUsage(BaseModel):
-    """Token usage for embedding requests."""
-
-    prompt_tokens: int = 0
-    total_tokens: int = 0
-
-
-class EmbeddingResponse(BaseModel):
-    """Response for embeddings endpoint (OpenAI compatible)."""
-
-    object: str = "list"
-    data: list[EmbeddingData]
-    model: str
-    usage: EmbeddingUsage = Field(default_factory=EmbeddingUsage)
 
 
 # =============================================================================

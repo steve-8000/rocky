@@ -29,8 +29,6 @@ def test_search_contract_prefers_query_hint_files_over_noisy_changelog(tmp_path:
         to_search_json(
             "Only search these likely integration files: package.json. Need release flow workspace package scripts.",
             "",
-            turns=1,
-            tool_messages=1,
             repo=tmp_path,
         )
     )

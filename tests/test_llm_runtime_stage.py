@@ -3,22 +3,16 @@ from __future__ import annotations
 from rocky.serve import DEFAULT_PRESET, PRESETS
 
 
-def test_fastcontext_preset_exists_for_stage_one_llm_runtime() -> None:
-    preset = PRESETS["fastcontext"]
+def test_fastcontext_preset_is_not_registered() -> None:
+    assert "fastcontext" not in PRESETS
 
-    assert preset.alias == "microsoft/FastContext-1.0-4B-SFT"
-    assert preset.tool_call_parser == "qwen"
+
+def test_default_runtime_preset_is_gemma4() -> None:
+    preset = PRESETS[DEFAULT_PRESET]
+
+    assert DEFAULT_PRESET == "gemma4-12b"
+    assert preset.alias == "gemma-4-12b-qat-4bit"
     assert preset.prefill_step_size == 4096
-    assert preset.max_tokens == 8192
-
-
-def test_fastcontext_runtime_uses_single_model_without_embedding_preset() -> None:
-    preset = PRESETS["fastcontext"]
-
-    assert preset.embedding_model is None
+    assert preset.max_tokens == 32768
+    assert preset.no_thinking is True
     assert preset.mllm is False
-    assert preset.no_thinking is False
-
-
-def test_zero_config_serve_defaults_to_integrated_fastcontext_backend() -> None:
-    assert DEFAULT_PRESET == "fastcontext"

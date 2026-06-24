@@ -1,112 +1,152 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from rocky.integration import build_integrated_search_result
-from rocky.memory import MemoryEngine, MemoryScope
-from rocky.search import FastContextCodebaseRunner, to_search_json
-from rocky.search.codebase_memory import get_codebase_memory_client
-from rocky.serve import PRESETS
+from rocky.core.config import get_config
+from rocky.search import to_search_json
+from rocky.search.profile_engine import RockyProfileEngine
+from rocky.search.rocky_codebase import get_rocky_codebase_client
+from rocky.serve import DEFAULT_PRESET, PRESETS
+
+
+def _runtime_root() -> Path:
+    raw = os.getenv("ROCKY_RUNTIME_ROOT")
+    return Path(raw).expanduser().resolve() if raw else Path.home() / ".rocky"
 
 
 router = APIRouter()
-_memory = MemoryEngine(Path.home() / ".rocky" / "memory")
-_cbm = get_codebase_memory_client()
-_fastcontext = FastContextCodebaseRunner(_cbm)
+_rocky_codebase = get_rocky_codebase_client()
+_profile_engine = RockyProfileEngine(_rocky_codebase, _runtime_root() / "codebase-plans")
 
 
 @dataclass(frozen=True)
 class SearchTargetsResult:
     final_answer: str
-    fastcontext_used: bool
     fallback_used: bool
-    fastcontext_turns: int = 0
-    fastcontext_tool_messages: int = 0
-    fastcontext_error: str | None = None
-    fastcontext_tool_names: tuple[str, ...] = ()
-
-
-class ScopeRequest(BaseModel):
-    kind: Literal["global", "project", "path"] = "global"
-    project_path: str | None = None
-    path: str | None = None
-
-
-class MemoryStoreRequest(BaseModel):
-    text: str
-    scope: ScopeRequest = Field(default_factory=ScopeRequest)
-    source: str = "verified_durable_fact"
-    tags: list[str] = Field(default_factory=list)
-
-
-class MemoryRecallRequest(BaseModel):
-    query: str
-    scope: ScopeRequest = Field(default_factory=ScopeRequest)
-    limit: int = 8
-
-
-class MemoryDeleteRequest(BaseModel):
-    scope: ScopeRequest = Field(default_factory=ScopeRequest)
-    id: str | None = None
-    text: str | None = None
-    text_prefix: str | None = None
 
 
 class SearchRequest(BaseModel):
     query: str
     path: str = "."
+    cwd: str | None = None
+    codebase_scope: Literal["cwd", "workspace", "parent_1", "parent_2", "explicit_roots"] = "workspace"
+    roots: list[str] | None = None
+    max_parent_depth: int | None = None
     final_answer: str = ""
-    turns: int = 0
-    tool_messages: int = 0
 
 
 class CodebaseIndexRequest(BaseModel):
     path: str = "."
+    cwd: str | None = None
+    scope: Literal["cwd", "workspace", "parent_1", "parent_2", "explicit_roots"] = "workspace"
+    roots: list[str] | None = None
+    max_parent_depth: int | None = None
 
 
 class CodebaseSearchRequest(BaseModel):
     query: str | None = None
     pattern: str | None = None
     path: str = "."
-    limit: int = 20
+    cwd: str | None = None
+    scope: Literal["cwd", "workspace", "parent_1", "parent_2", "explicit_roots"] = "workspace"
+    roots: list[str] | None = None
+    max_parent_depth: int | None = None
+    limit: int = 50
+
+
+class CodebaseCallRequest(BaseModel):
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    path: str = "."
+    cwd: str | None = None
+    scope: Literal["cwd", "workspace", "parent_1", "parent_2", "explicit_roots"] = "workspace"
+    roots: list[str] | None = None
+    max_parent_depth: int | None = None
+
+
+class CodebaseProfileScope(BaseModel):
+    kind: Literal["cwd", "workspace", "parent_1", "parent_2", "explicit_roots"] = "workspace"
+    cwd: str = "."
+    roots: list[str] | None = None
+    path: str | None = None
+    max_parent_depth: int | None = None
+
+
+class CodebaseProfileBudget(BaseModel):
+    max_primary_points: int | None = None
+    max_primary_files: int | None = None
+    max_primary_lines: int | None = None
+    max_deferred_clusters: int | None = None
+    max_total_response_chars: int | None = None
+
+
+class CodebaseProfileConstraints(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_tests: bool | None = None
+    prefer_changed_files: bool | None = None
+    allow_lexical_fallback: bool | None = None
+    allow_llm_summary: bool | None = None
+    changed_files: list[str] | None = None
+
+
+class CodebaseProfilePlanRequest(BaseModel):
+    profile: str = "bug_investigation"
+    query: str
+    scope: CodebaseProfileScope = Field(default_factory=CodebaseProfileScope)
+    budget: CodebaseProfileBudget | None = None
+    constraints: CodebaseProfileConstraints | None = None
+
+
+class CodebaseProfileReadRequest(BaseModel):
+    plan_id: str
+    point_ids: list[str] = Field(default_factory=list)
+
+
+class CodebaseProfileExpandRequest(BaseModel):
+    plan_id: str
+    cluster_id: str
+    budget: CodebaseProfileBudget | None = None
 
 
 class ContextBuildRequest(SearchRequest):
-    scope: ScopeRequest = Field(default_factory=ScopeRequest)
+    pass
 
 
-def _scope(raw: ScopeRequest) -> MemoryScope:
-    return MemoryScope(raw.kind, project_path=raw.project_path, path=raw.path)
-
-
-def _fact_json(fact: Any) -> dict[str, Any]:
-    return {
-        "id": fact.id,
-        "scope": fact.scope.key(),
-        "text": fact.text,
-        "source": fact.source,
-        "tags": list(fact.tags),
-        "created_at": fact.created_at,
-        "updated_at": fact.updated_at,
-    }
+def _codebase_scope_meta(
+    *,
+    path: str,
+    cwd: str | None = None,
+    scope: str = "workspace",
+    roots: list[str] | None = None,
+    max_parent_depth: int | None = None,
+) -> dict[str, Any]:
+    return _rocky_codebase.resolve_search_scope(
+        path=path,
+        cwd=cwd,
+        scope=scope,
+        roots=roots,
+        max_parent_depth=max_parent_depth,
+    )
 
 
 def _ensure_codebase_indexed(path: str) -> dict[str, Any]:
     try:
-        return _cbm.ensure_indexed(path)
+        return _rocky_codebase.ensure_indexed(path)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
 def _codebase_targets(query: str, path: str, *, limit: int = 8) -> str:
     try:
-        candidates = _cbm.search_graph(query, path, limit=limit)
+        candidates = _rocky_codebase.search_graph(query, path, limit=limit)
     except Exception:
         return ""
     seen: set[str] = set()
@@ -121,166 +161,88 @@ def _codebase_targets(query: str, path: str, *, limit: int = 8) -> str:
 
 async def _search_targets(request: SearchRequest) -> SearchTargetsResult:
     if request.final_answer.strip():
-        return SearchTargetsResult(request.final_answer, fastcontext_used=False, fallback_used=False)
-    try:
-        result = await _fastcontext.search(request.query, request.path)
-        request.turns += result.turns
-        request.tool_messages += result.tool_messages
-        if result.final_answer:
-            return SearchTargetsResult(
-                result.final_answer,
-                fastcontext_used=True,
-                fallback_used=False,
-                fastcontext_turns=result.turns,
-                fastcontext_tool_messages=result.tool_messages,
-                fastcontext_error=result.error,
-                fastcontext_tool_names=result.tool_names,
-            )
-        fallback = _codebase_targets(request.query, request.path)
-        return SearchTargetsResult(
-            fallback,
-            fastcontext_used=True,
-            fallback_used=True,
-            fastcontext_turns=result.turns,
-            fastcontext_tool_messages=result.tool_messages,
-            fastcontext_error=result.error or "fastcontext returned no final_answer",
-            fastcontext_tool_names=result.tool_names,
-        )
-    except Exception as exc:
-        fallback = _codebase_targets(request.query, request.path)
-        return SearchTargetsResult(
-            fallback,
-            fastcontext_used=False,
-            fallback_used=True,
-            fastcontext_error=str(exc),
-        )
+        return SearchTargetsResult(request.final_answer, fallback_used=False)
+    return SearchTargetsResult(_codebase_targets(request.query, request.path), fallback_used=True)
 
 
 @router.get("/v1/runtime/status")
 async def runtime_status() -> dict[str, Any]:
-    preset = PRESETS["fastcontext"]
+    cfg = get_config()
+    llm_model = cfg.model_name or PRESETS[DEFAULT_PRESET].alias
     return {
         "ok": True,
         "package": "rocky",
         "modules": {
             "llm": {
-                "model": preset.alias,
-                "tool_call_parser": preset.tool_call_parser,
-                "port_ready": True,
+                "model": llm_model,
+                "tool_call_parser": cfg.tool_call_parser,
+                "port_ready": cfg.ready,
             },
             "search": {"ready": True},
-            "memory": {"ready": True, "root": str(_memory.root)},
         },
     }
 
 
 @router.post("/v1/search")
 async def search(request: SearchRequest) -> dict[str, Any]:
-    codebase_index = _ensure_codebase_indexed(request.path)
+    search_scope = _codebase_scope_meta(
+        path=request.path,
+        cwd=request.cwd,
+        scope=request.codebase_scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
+    )
+    codebase_index = [_ensure_codebase_indexed(root) for root in search_scope["effective_roots"]]
     targets = await _search_targets(request)
     payload = json.loads(
         to_search_json(
             request.query,
             targets.final_answer,
-            request.turns,
-            request.tool_messages,
             repo=request.path,
         )
     )
     payload["runtime"] = {
+        "search_scope": search_scope,
         "codebase_index": codebase_index,
-        "fastcontext": {
-            "used": targets.fastcontext_used,
-            "fallback_used": targets.fallback_used,
-            "turns": targets.fastcontext_turns,
-            "tool_messages": targets.fastcontext_tool_messages,
-            "tool_names": list(targets.fastcontext_tool_names),
-            "error": targets.fastcontext_error,
-        }
+        "codebase_fallback_used": targets.fallback_used,
     }
     return payload
 
 
 @router.post("/v1/context/build")
 async def context_build(request: ContextBuildRequest) -> dict[str, Any]:
-    codebase_index = _ensure_codebase_indexed(request.path)
-    targets = await _search_targets(request)
-    result = build_integrated_search_result(
-        query=request.query,
+    search_scope = _codebase_scope_meta(
         path=request.path,
-        final_answer=targets.final_answer,
-        memory_engine=_memory,
-        memory_scope=_scope(request.scope),
-        turns=request.turns,
-        tool_messages=request.tool_messages,
+        cwd=request.cwd,
+        scope=request.codebase_scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
     )
-    result.search_payload["runtime"]["codebase_index"] = codebase_index
-    result.search_payload["runtime"]["fastcontext"] = {
-        "used": targets.fastcontext_used,
-        "fallback_used": targets.fallback_used,
-        "turns": targets.fastcontext_turns,
-        "tool_messages": targets.fastcontext_tool_messages,
-        "tool_names": list(targets.fastcontext_tool_names),
-        "error": targets.fastcontext_error,
+    codebase_index = [_ensure_codebase_indexed(root) for root in search_scope["effective_roots"]]
+    targets = await _search_targets(request)
+    payload = json.loads(
+        to_search_json(
+            request.query,
+            targets.final_answer,
+            repo=request.path,
+        )
+    )
+    payload["runtime"] = {
+        "search_scope": search_scope,
+        "codebase_index": codebase_index,
+        "codebase_fallback_used": targets.fallback_used,
     }
-    return result.search_payload
+    return payload
 
 
-@router.post("/v1/rocky/memory/store")
-@router.post("/v1/memory/store")
-async def memory_store(request: MemoryStoreRequest) -> dict[str, Any]:
-    fact = _memory.store(
-        request.text,
-        _scope(request.scope),
-        source=request.source,
-        tags=tuple(request.tags),
-    )
-    return {"ok": True, "item": _fact_json(fact)}
-
-
-@router.post("/v1/rocky/memory/recall")
-@router.post("/v1/rocky/memory/search")
-@router.post("/v1/memory/recall")
-@router.post("/v1/memory/search")
-async def memory_recall(request: MemoryRecallRequest) -> dict[str, Any]:
-    hits = _memory.recall(request.query, _scope(request.scope), limit=request.limit)
-    return {
-        "ok": True,
-        "items": [
-            {
-                **_fact_json(hit.fact),
-                "score": hit.score,
-            }
-            for hit in hits
-        ],
-    }
-
-
-@router.post("/v1/rocky/memory/delete")
-@router.post("/v1/memory/delete")
-async def memory_delete(request: MemoryDeleteRequest) -> dict[str, Any]:
-    deleted = _memory.delete(
-        _scope(request.scope),
-        id=request.id,
-        text=request.text,
-        text_prefix=request.text_prefix,
-    )
-    return {"ok": True, "deleted": deleted}
-
-
-@router.post("/v1/rocky/memory/optimize")
-@router.post("/v1/memory/optimize")
-async def memory_optimize() -> dict[str, Any]:
-    return {"ok": True, **_memory.optimize()}
-
-
+@router.get("/v1/rocky/codebase/status")
 @router.get("/v1/codebase/status")
 async def codebase_status() -> dict[str, Any]:
-    cfg = _cbm.config
+    cfg = _rocky_codebase.config
     return {
         "ok": True,
         "enabled": cfg.enabled,
-        "available": _cbm.available(),
+        "available": _rocky_codebase.available(),
         "auto_index": cfg.auto_index,
         "endpoint": cfg.endpoint,
         "binary": cfg.binary,
@@ -288,25 +250,142 @@ async def codebase_status() -> dict[str, Any]:
     }
 
 
+@router.get("/v1/rocky/codebase/profiles")
+@router.get("/v1/codebase/profiles")
+async def codebase_profiles() -> dict[str, Any]:
+    return _profile_engine.profiles()
+
+
+@router.get("/v1/rocky/codebase/health")
+@router.get("/v1/codebase/health")
+async def codebase_profile_health() -> dict[str, Any]:
+    return _profile_engine.health()
+
+
+@router.post("/v1/rocky/codebase/plan")
+@router.post("/v1/codebase/plan")
+async def codebase_profile_plan(request: CodebaseProfilePlanRequest) -> dict[str, Any]:
+    return _profile_engine.plan(request.model_dump(exclude_none=True))
+
+
+@router.get("/v1/rocky/codebase/plan/{plan_id}")
+@router.get("/v1/codebase/plan/{plan_id}")
+async def codebase_profile_get_plan(plan_id: str) -> dict[str, Any]:
+    return _profile_engine.get_plan(plan_id)
+
+
+@router.delete("/v1/rocky/codebase/plan/{plan_id}")
+@router.delete("/v1/codebase/plan/{plan_id}")
+async def codebase_profile_delete(plan_id: str) -> dict[str, Any]:
+    return _profile_engine.delete_plan(plan_id)
+
+
+@router.post("/v1/rocky/codebase/read")
+@router.post("/v1/codebase/read")
+async def codebase_profile_read(request: CodebaseProfileReadRequest) -> dict[str, Any]:
+    return _profile_engine.read_points(request.model_dump())
+
+
+@router.post("/v1/rocky/codebase/validate_points")
+@router.post("/v1/codebase/validate_points")
+async def codebase_profile_validate(request: CodebaseProfileReadRequest) -> dict[str, Any]:
+    return _profile_engine.validate_points(request.model_dump())
+
+
+@router.post("/v1/rocky/codebase/expand")
+@router.post("/v1/codebase/expand")
+async def codebase_profile_expand(request: CodebaseProfileExpandRequest) -> dict[str, Any]:
+    return _profile_engine.expand(request.model_dump(exclude_none=True))
+
+
+@router.post("/v1/rocky/codebase/index")
 @router.post("/v1/codebase/index")
 async def codebase_index(request: CodebaseIndexRequest) -> dict[str, Any]:
-    return {"ok": True, **_cbm.index_repository(request.path)}
+    search_scope = _codebase_scope_meta(
+        path=request.path,
+        cwd=request.cwd,
+        scope=request.scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
+    )
+    results = [_rocky_codebase.index_repository(root) for root in search_scope["effective_roots"]]
+    return {"ok": True, "search_scope": search_scope, "results": results}
 
 
+@router.post("/v1/rocky/codebase/search_graph")
 @router.post("/v1/codebase/search_graph")
 async def codebase_search_graph(request: CodebaseSearchRequest) -> dict[str, Any]:
     if not request.query:
         return {"ok": False, "error": "query is required"}
-    _cbm.ensure_indexed(request.path)
-    candidates = _cbm.search_graph(request.query, request.path, limit=request.limit)
-    return {"ok": True, "results": [candidate.__dict__ for candidate in candidates]}
+    search_scope = _codebase_scope_meta(
+        path=request.path,
+        cwd=request.cwd,
+        scope=request.scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
+    )
+    candidates = []
+    for root in search_scope["effective_roots"]:
+        _rocky_codebase.ensure_indexed(root)
+        candidates.extend(_rocky_codebase.search_graph(request.query, root, limit=request.limit))
+        if len(candidates) >= request.limit:
+            candidates = candidates[: request.limit]
+            break
+    return {
+        "ok": True,
+        "search_scope": search_scope,
+        "results": [candidate.__dict__ for candidate in candidates],
+    }
 
 
+@router.post("/v1/rocky/codebase/search_code")
 @router.post("/v1/codebase/search_code")
 async def codebase_search_code(request: CodebaseSearchRequest) -> dict[str, Any]:
     pattern = request.pattern or request.query
     if not pattern:
         return {"ok": False, "error": "pattern or query is required"}
-    _cbm.ensure_indexed(request.path)
-    candidates = _cbm.search_code(pattern, request.path, limit=request.limit)
-    return {"ok": True, "results": [candidate.__dict__ for candidate in candidates]}
+    search_scope = _codebase_scope_meta(
+        path=request.path,
+        cwd=request.cwd,
+        scope=request.scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
+    )
+    candidates = []
+    for root in search_scope["effective_roots"]:
+        _rocky_codebase.ensure_indexed(root)
+        candidates.extend(_rocky_codebase.search_code(pattern, root, limit=request.limit))
+        if len(candidates) >= request.limit:
+            candidates = candidates[: request.limit]
+            break
+    return {
+        "ok": True,
+        "search_scope": search_scope,
+        "results": [candidate.__dict__ for candidate in candidates],
+    }
+
+
+@router.post("/v1/rocky/codebase/call")
+@router.post("/v1/codebase/call")
+async def codebase_call(request: CodebaseCallRequest) -> dict[str, Any]:
+    """Generic passthrough for project-scoped graph tools (get_code_snippet,
+    trace_path, get_architecture, query_graph). Resolves the same search scope as
+    search_graph/search_code, ensures the root is indexed, then proxies the tool to
+    the rocky-codebase binary so every graph tool shares one project/cache namespace."""
+    search_scope = _codebase_scope_meta(
+        path=request.path,
+        cwd=request.cwd,
+        scope=request.scope,
+        roots=request.roots,
+        max_parent_depth=request.max_parent_depth,
+    )
+    roots = search_scope["effective_roots"]
+    root = roots[0] if roots else (request.cwd or request.path)
+    _ensure_codebase_indexed(root)
+    try:
+        result = _rocky_codebase.call(request.tool, root, request.arguments)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "search_scope": search_scope}
+    except Exception as exc:  # noqa: BLE001 — surface backend failure as structured error
+        return {"ok": False, "error": str(exc), "search_scope": search_scope}
+    return {"ok": True, "search_scope": search_scope, "result": result}

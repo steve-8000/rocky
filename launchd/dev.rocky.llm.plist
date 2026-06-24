@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.rocky.llm</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/steve/amaze_s3/rocky/.venv/bin/rocky</string>
+    <string>serve</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/steve/amaze_s3/rocky/.venv/bin:/Users/steve/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/steve</string>
+    <key>ROCKY_PRESET</key>
+    <string>gemma4-12b</string>
+    <key>ROCKY_HOST</key>
+    <string>127.0.0.1</string>
+    <key>ROCKY_PORT</key>
+    <string>7777</string>
+    <key>ROCKY_RUNTIME_ROOT</key>
+    <string>/Users/steve/amaze_s3/rocky/.rocky</string>
+    <key>ROCKY_CODEBASE_BINARY</key>
+    <string>/Users/steve/amaze_s3/rocky/bin/rocky-codebase</string>
+    <key>ROCKY_CODEBASE_PROJECT_PATH</key>
+    <string>/Users/steve/amaze_s3/amaze</string>
+    <key>ROCKY_API_KEY</key>
+    <string>rocky-secret</string>
+    <key>ROCKY_MCP_ENABLED</key>
+    <string>true</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/steve/amaze_s3/rocky</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/steve/amaze_s3/rocky/.rocky/logs/rocky-llm.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/steve/amaze_s3/rocky/.rocky/logs/rocky-llm.err.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>

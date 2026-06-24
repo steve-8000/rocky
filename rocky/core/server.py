@@ -132,6 +132,7 @@ from .service.helpers import (  # noqa: F401 — re-export for backward compat
     get_usage,
 )
 from .tool_parsers import ToolParserManager
+from rocky.search.rocky_codebase import get_rocky_codebase_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -198,10 +199,6 @@ _generation_config_sampling: dict[str, float | int] | None = None
 _mcp_manager = None
 _mcp_executor = None
 
-# Global embedding engine (lazy loaded)
-_embedding_engine = None
-_embedding_model_locked: str | None = None  # Set when --embedding-model is used
-
 # API key authentication
 _api_key: str | None = None
 _auth_warning_logged: bool = False
@@ -239,6 +236,23 @@ from .runtime.cache import (
 from .runtime.cache import (
     save_prefix_cache_to_disk as _save_prefix_cache_to_disk,
 )
+
+
+def _bootstrap_codebase_index() -> None:
+    client = get_rocky_codebase_client()
+    if not client.available() or not client.config.enabled or not client.config.auto_index:
+        return
+    repo = client.default_repo_path()
+    try:
+        result = client.ensure_default_indexed()
+    except Exception as exc:
+        logger.warning("Rocky codebase auto-index bootstrap failed for %s: %s", repo, exc)
+        return
+    if result.get("ok"):
+        state = result.get("status") or result.get("reason") or "ok"
+        logger.info("Rocky codebase auto-index ready for %s (%s)", repo, state)
+        return
+    logger.warning("Rocky codebase auto-index bootstrap returned %s for %s", result, repo)
 
 
 async def lifespan(app: FastAPI):
@@ -339,6 +353,8 @@ async def lifespan(app: FastAPI):
     )
     if mcp_config:
         await init_mcp(mcp_config)
+
+    _bootstrap_codebase_index()
 
     # All slow startup work done. Flip the readiness flag so /health/ready
     # starts returning 200. Anything that races a request before this point
@@ -523,39 +539,6 @@ def _detect_native_tool_support() -> bool:
         # Unexpected error during detection
         logger.warning(f"Failed to detect native tool support: {e}")
         return False
-
-
-def load_embedding_model(
-    model_name: str | None,
-    *,
-    lock: bool = False,
-    reuse_existing: bool = True,
-) -> None:
-    """Load or reuse the embedding model engine when configured."""
-    global _embedding_engine, _embedding_model_locked
-
-    if not model_name:
-        return
-
-    if lock:
-        _embedding_model_locked = model_name
-
-    if (
-        reuse_existing
-        and _embedding_engine is not None
-        and _embedding_engine.model_name == model_name
-    ):
-        return
-
-    from .embedding import EmbeddingEngine
-
-    _embedding_engine = EmbeddingEngine(model_name)
-    _embedding_engine.load()
-
-    # Sync into config for route modules
-    cfg = get_config()
-    cfg.embedding_engine = _embedding_engine
-    cfg.embedding_model_locked = _embedding_model_locked
 
 
 def load_model(
@@ -872,8 +855,6 @@ def _sync_config() -> None:
     cfg.reasoning_parser = _reasoning_parser
     cfg.reasoning_parser_name = _reasoning_parser_name
     cfg.mcp_manager = _mcp_manager
-    cfg.embedding_engine = _embedding_engine
-    cfg.embedding_model_locked = _embedding_model_locked
     cfg.api_key = _api_key
     cfg.cloud_router = _cloud_router
     cfg.gc_control = _gc_control
@@ -937,10 +918,10 @@ async def init_mcp(config_path: str):
 from .routes.anthropic import router as _anthropic_router
 from .routes.chat import router as _chat_router
 from .routes.completions import router as _completions_router
-from .routes.embeddings import router as _embeddings_router
 from .routes.health import probe_router as _probe_router
 from .routes.health import router as _health_router
 from .routes.mcp_routes import router as _mcp_router
+from .routes.mcp_server import router as _mcp_server_router
 from .routes.models import router as _models_router
 from .routes.rocky_native import router as _rocky_native_router
 from .routes.responses import router as _responses_router
@@ -952,8 +933,9 @@ app.include_router(_chat_router)
 app.include_router(_completions_router)
 app.include_router(_anthropic_router)
 app.include_router(_responses_router)
-app.include_router(_embeddings_router)
 app.include_router(_mcp_router)
+if os.getenv("ROCKY_MCP_ENABLED", "true").lower() != "false":
+    app.include_router(_mcp_server_router)
 app.include_router(_rocky_native_router)
 
 
@@ -1174,12 +1156,6 @@ Examples:
         help="Enable jump-forward decoding bias for tool call structural tokens",
     )
     parser.add_argument(
-        "--embedding-model",
-        type=str,
-        default=None,
-        help="Pre-load an embedding model at startup (e.g. mlx-community/all-MiniLM-L6-v2-4bit)",
-    )
-    parser.add_argument(
         "--default-temperature",
         type=float,
         default=None,
@@ -1328,9 +1304,6 @@ Examples:
         _reasoning_parser = parser_cls()
         _reasoning_parser_name = args.reasoning_parser
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
-
-    # Pre-load embedding model if specified
-    load_embedding_model(args.embedding_model, lock=True)
 
     # Build a SchedulerConfig so user-supplied flags on this standalone entry
     # (`python -m rocky.server` / `mise run`) reach the engine. Pre-0.6.52

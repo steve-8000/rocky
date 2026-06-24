@@ -53,7 +53,7 @@ _TEXT_EXTENSIONS = {
 }
 
 
-def to_search_json(query: str, answer: str, turns: int, tool_messages: int, repo: str | Path = ".") -> str:
+def to_search_json(query: str, answer: str, repo: str | Path = ".") -> str:
     root = _normalize_root(repo)
     extracted = _extract_evidence(answer, root)
     if not extracted:
@@ -69,8 +69,6 @@ def to_search_json(query: str, answer: str, turns: int, tool_messages: int, repo
             if evidence
             else "No evidence found. Narrow the query or verify the local path."
         ),
-        "turns": turns,
-        "tool_calls": tool_messages,
     }
     return json.dumps(payload, indent=2)
 
@@ -136,7 +134,7 @@ def _package_blocks(evidence: list[dict[str, Any]], root: Path) -> list[dict[str
                     "context_end_line": context_end,
                     "snippet": snippet,
                     "why": " | ".join(dict.fromkeys(str(item.get("why", "")).strip() for item in group if item.get("why")))[:500],
-                    "source": "fastcontext",
+                    "source": "codebase",
                     "confidence": "high",
                 }
             )

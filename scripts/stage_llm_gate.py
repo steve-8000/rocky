@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from rocky.serve import PRESETS
+from rocky.serve import DEFAULT_PRESET, PRESETS
 
 
 @dataclass(frozen=True)
@@ -19,37 +19,37 @@ class Check:
 
 
 def main() -> int:
-    preset = PRESETS.get("fastcontext")
+    preset = PRESETS.get(DEFAULT_PRESET)
     checks = [
         Check(
-            "fastcontext preset exists",
+            "fastcontext preset removed",
+            "fastcontext" not in PRESETS,
+            20,
+            "FastContext search/runtime preset is not registered",
+        ),
+        Check(
+            "default preset exists",
             preset is not None,
             20,
-            "PRESETS['fastcontext'] is available for Rocky LLM runtime stage",
+            f"DEFAULT_PRESET={DEFAULT_PRESET!r} resolves to a registered runtime preset",
         ),
         Check(
-            "fastcontext model id",
-            bool(preset and preset.alias == "microsoft/FastContext-1.0-4B-SFT"),
+            "default model id",
+            bool(preset and preset.alias == "gemma-4-12b-qat-4bit"),
             20,
-            "FastContext model is the stage-one LLM runtime target",
+            "Gemma 4 12B is the zero-config LLM runtime target",
         ),
         Check(
-            "qwen tool parser enabled",
-            bool(preset and preset.tool_call_parser == "qwen"),
-            25,
-            "FastContext tool-call generation is wired to Qwen parser",
-        ),
-        Check(
-            "single LLM runtime without embedding model",
-            bool(preset and preset.embedding_model is None),
+            "no thinking default",
+            bool(preset and preset.no_thinking is True),
             20,
-            "Memory/search should share the FastContext LLM instead of a separate embedding model",
+            "Default runtime preset disables thinking for predictable lightweight serving",
         ),
         Check(
             "bounded token configuration",
-            bool(preset and preset.prefill_step_size == 4096 and preset.max_tokens == 8192),
-            15,
-            "Preset has deterministic bounded runtime defaults for stage validation",
+            bool(preset and preset.prefill_step_size == 4096 and preset.max_tokens == 32768),
+            20,
+            "Default preset has deterministic bounded runtime defaults for stage validation",
         ),
     ]
     score = sum(check.points for check in checks if check.passed)

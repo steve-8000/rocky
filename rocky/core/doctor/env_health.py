@@ -111,11 +111,6 @@ REQUIRED_PACKAGES: list[tuple[str, str]] = [
 OPTIONAL_PACKAGES: list[tuple[str, str, str]] = [
     ("mlx-vlm", "mlx-vlm (vision extras)", "pip install 'rocky[vision]'"),
     ("mlx-audio", "mlx-audio (audio extras)", "pip install 'rocky[audio]'"),
-    (
-        "mlx-embeddings",
-        "mlx-embeddings (embeddings extras)",
-        "pip install 'rocky[embeddings]'",
-    ),
 ]
 
 

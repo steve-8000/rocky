@@ -25,11 +25,6 @@ from .models import (
     CompletionRequest,
     CompletionResponse,
     ContentPart,
-    EmbeddingData,
-    # Embeddings
-    EmbeddingRequest,
-    EmbeddingResponse,
-    EmbeddingUsage,
     # Tool calling
     FunctionCall,
     # Content types
@@ -110,11 +105,6 @@ __all__ = [
     "AudioTranscriptionResponse",
     "AudioSpeechRequest",
     "AudioSeparationRequest",
-    # Embeddings
-    "EmbeddingRequest",
-    "EmbeddingData",
-    "EmbeddingUsage",
-    "EmbeddingResponse",
     # Utils
     "clean_output_text",
     "is_mllm_model",
