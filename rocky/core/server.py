@@ -866,8 +866,6 @@ def _sync_config() -> None:
     cfg.model_registry = _model_registry
 
 
-# Re-export for backward compatibility (test_streaming_pipeline_integration)
-from .routes.anthropic import _emit_content_pieces  # noqa: F401, E402
 
 # =============================================================================
 # MCP Initialization
@@ -915,25 +913,9 @@ async def init_mcp(config_path: str):
 # Route modules — imported after all server globals are defined to avoid
 # circular imports (route modules import verify_api_key etc. from this module)
 # =============================================================================
-from .routes.anthropic import router as _anthropic_router
-from .routes.chat import router as _chat_router
-from .routes.completions import router as _completions_router
-from .routes.health import probe_router as _probe_router
-from .routes.health import router as _health_router
-from .routes.mcp_routes import router as _mcp_router
 from .routes.mcp_server import router as _mcp_server_router
-from .routes.models import router as _models_router
 from .routes.rocky_native import router as _rocky_native_router
-from .routes.responses import router as _responses_router
 
-app.include_router(_probe_router)
-app.include_router(_health_router)
-app.include_router(_models_router)
-app.include_router(_chat_router)
-app.include_router(_completions_router)
-app.include_router(_anthropic_router)
-app.include_router(_responses_router)
-app.include_router(_mcp_router)
 if os.getenv("ROCKY_MCP_ENABLED", "true").lower() != "false":
     app.include_router(_mcp_server_router)
 app.include_router(_rocky_native_router)

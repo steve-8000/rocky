@@ -23,8 +23,7 @@ def _json_from_mcp(response) -> Any:
     body = response.json()
     if "error" in body:
         raise RuntimeError(body["error"])
-    text = body["result"]["content"][0]["text"]
-    return json.loads(text)
+    return json.loads(body["result"]["content"][0]["text"])
 
 
 def mcp_tool(client: TestClient, name: str, arguments: dict[str, Any]) -> Any:
@@ -41,16 +40,6 @@ def mcp_tool(client: TestClient, name: str, arguments: dict[str, Any]) -> Any:
     )
 
 
-def result_paths(payload: Any) -> list[str]:
-    results = payload.get("results", []) if isinstance(payload, dict) else []
-    paths: list[str] = []
-    for item in results:
-        path = item.get("file_path") or item.get("file")
-        if path:
-            paths.append(str(path))
-    return paths
-
-
 def fresh_import_probe(module: str) -> dict[str, Any]:
     code = f"""
 import importlib, json, sys
@@ -58,7 +47,7 @@ HEAVY={HEAVY!r}
 h=lambda: sorted({{m.split('.')[0] for m in sys.modules if m.split('.')[0] in HEAVY}})
 before=h()
 try:
-    mod=importlib.import_module({module!r})
+    importlib.import_module({module!r})
     ok=True
     err=None
 except Exception as exc:
@@ -74,93 +63,57 @@ def main() -> int:
     rng = random.Random(20260624)
 
     import_probe_mcp = fresh_import_probe("rocky.core.routes.mcp_server")
-    import_probe_server = fresh_import_probe("rocky.core.server")
+    import_probe_app = fresh_import_probe("rocky.mcp_app")
 
     from rocky.core.routes import mcp_server, rocky_native
 
-    mcp_app = FastAPI()
-    mcp_app.include_router(mcp_server.router)
-    mcp_client = TestClient(mcp_app)
+    app = FastAPI()
+    app.include_router(mcp_server.router)
+    app.include_router(rocky_native.router)
+    client = TestClient(app)
 
-    native_app = FastAPI()
-    native_app.include_router(rocky_native.router)
-    native_client = TestClient(native_app)
-
-    tools_response = mcp_client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+    tools_response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     tools_response.raise_for_status()
-    tools = tools_response.json()["result"]["tools"]
-    tool_names = sorted(tool["name"] for tool in tools)
+    tool_names = sorted(tool["name"] for tool in tools_response.json()["result"]["tools"])
 
-    # MCP-only app proves the tool server does not need OpenAI/LLM HTTP routes mounted.
-    missing_chat = mcp_client.post("/v1/chat/completions", json={})
-    missing_models = mcp_client.get("/v1/models")
-
-    projects = mcp_tool(mcp_client, "list_projects", {})
-    indexed_projects = [item.get("name") for item in projects.get("projects", [])]
-
-    queries = [
-        "FastContext",
-        "codebase plan",
-        "skill_search",
-        "runtime status",
-        "ProfileBudget",
-        "mcp_server",
-        "search_graph",
-        "to_search_json",
-        "DEFAULT_PRESET",
-        "RockyProfileEngine",
+    removed_routes = [
+        ("GET", "/v1/runtime/status"),
+        ("POST", "/v1/search"),
+        ("POST", "/v1/context/build"),
+        ("POST", "/v1/codebase/index"),
+        ("POST", "/v1/codebase/search_graph"),
+        ("POST", "/v1/codebase/search_code"),
+        ("POST", "/v1/codebase/call"),
+        ("GET", "/v1/rocky/codebase/status"),
     ]
-    path_filters = [None, "rocky/search", "rocky/core/routes", "tests", "scripts"]
+    removed_status = {f"{method} {path}": client.request(method, path, json={} if method == "POST" else None).status_code for method, path in removed_routes}
 
-    trials: list[dict[str, Any]] = []
-    for idx in range(30):
+    required_tools = {"index_repository", "detect_changes", "index_status", "search_graph", "search_code", "get_code_snippet", "trace_path"}
+    profile_status = {
+        "status": client.get("/v1/codebase/status").status_code,
+        "profiles": client.get("/v1/codebase/profiles").status_code,
+        "health": client.get("/v1/codebase/health").status_code,
+    }
+
+    queries = ["ProfileBudget", "mcp_server", "search_graph", "to_search_json", "RockyProfileEngine"]
+    mcp_trials: list[dict[str, Any]] = []
+    for idx in range(20):
         query = rng.choice(queries)
-        limit = rng.randint(1, 8)
-        native = native_client.post(
-            "/v1/codebase/search_graph",
-            json={"query": query, "path": str(ROOT), "cwd": str(ROOT), "scope": "workspace", "limit": limit},
-        ).json()
-        mcp = mcp_tool(mcp_client, "search_graph", {"project": PROJECT, "query": query, "limit": limit})
-        native_paths = [item["file_path"] for item in native.get("results", [])]
-        mcp_paths = result_paths(mcp)
-        trials.append(
+        limit = rng.randint(1, 5)
+        graph = mcp_tool(client, "search_graph", {"project": PROJECT, "query": query, "limit": limit})
+        code = mcp_tool(client, "search_code", {"project": PROJECT, "pattern": query, "limit": limit, "mode": "compact"})
+        mcp_trials.append(
             {
-                "kind": "search_graph_overlap",
                 "query": query,
                 "limit": limit,
-                "native_status": native.get("ok"),
-                "native_count": len(native_paths),
-                "mcp_count": len(mcp_paths),
-                "same_prefix": native_paths[: min(3, len(native_paths), len(mcp_paths))] == mcp_paths[: min(3, len(native_paths), len(mcp_paths))],
+                "graph_ok": isinstance(graph, dict) and "results" in graph,
+                "code_ok": isinstance(code, dict) and "results" in code,
             }
         )
 
-        pattern = rng.choice(queries)
-        native_code = native_client.post(
-            "/v1/codebase/search_code",
-            json={"pattern": pattern, "path": str(ROOT), "cwd": str(ROOT), "scope": "workspace", "limit": limit},
-        ).json()
-        mcp_code_args: dict[str, Any] = {"project": PROJECT, "pattern": pattern, "limit": limit, "mode": "compact"}
-        path_filter = rng.choice(path_filters)
-        if path_filter:
-            mcp_code_args["path_filter"] = path_filter
-        mcp_code = mcp_tool(mcp_client, "search_code", mcp_code_args)
-        trials.append(
-            {
-                "kind": "search_code_overlap",
-                "pattern": pattern,
-                "limit": limit,
-                "native_status": native_code.get("ok"),
-                "native_count": len(native_code.get("results", [])),
-                "mcp_total_results": mcp_code.get("total_results"),
-                "mcp_result_count": len(mcp_code.get("results", [])),
-            }
-        )
-
-    # Unique native profile flow: there is no MCP codebase_plan tool in the actual MCP catalog.
     profile_trials: list[dict[str, Any]] = []
-    for query in rng.sample(queries, 5):
-        plan = native_client.post(
+    for query in rng.sample(queries, 3):
+        plan = client.post(
             "/v1/codebase/plan",
             json={
                 "profile": "find_definition",
@@ -169,42 +122,26 @@ def main() -> int:
                 "budget": {"max_primary_points": 3, "max_primary_files": 3, "max_primary_lines": 90, "max_total_response_chars": 10_000},
             },
         ).json()
-        entry = {"query": query, "ok": plan.get("ok"), "has_plan_id": "plan_id" in plan, "primary": len(plan.get("primary", []))}
-        if plan.get("primary"):
-            point_id = plan["primary"][0]["point_id"]
-            read = native_client.post("/v1/codebase/read", json={"plan_id": plan["plan_id"], "point_ids": [point_id]}).json()
-            validate = native_client.post("/v1/codebase/validate_points", json={"plan_id": plan["plan_id"], "point_ids": [point_id]}).json()
-            entry["read_ok"] = read.get("ok")
-            entry["validate_fresh"] = bool(validate.get("points") and validate["points"][0].get("fresh"))
-        profile_trials.append(entry)
-
-    graph_ok = sum(1 for item in trials if item["kind"] == "search_graph_overlap" and item["native_status"] is True and item["mcp_count"] >= 0)
-    code_ok = sum(1 for item in trials if item["kind"] == "search_code_overlap" and item["native_status"] is True and item["mcp_result_count"] >= 0)
-    profile_ok = sum(1 for item in profile_trials if item.get("ok") is True and item.get("has_plan_id") is True)
+        profile_trials.append({"query": query, "ok": plan.get("ok"), "has_plan_id": "plan_id" in plan, "primary": len(plan.get("primary", []))})
 
     report = {
-        "real_backend": True,
-        "project": PROJECT,
-        "indexed_projects_contains_project": PROJECT in indexed_projects,
         "mcp_tool_count": len(tool_names),
-        "mcp_tool_sample": tool_names[:20],
-        "mcp_only_app": {"tools_list_status": tools_response.status_code, "chat_status": missing_chat.status_code, "models_status": missing_models.status_code},
-        "import_weight": {"mcp_server": import_probe_mcp, "full_server": import_probe_server},
-        "random_trials": {"search_graph_passed": graph_ok, "search_code_passed": code_ok, "total_each": 30, "samples": trials[:6]},
-        "profile_trials": {"passed": profile_ok, "total": len(profile_trials), "samples": profile_trials},
-        "mcp_catalog_has_profile_plan": any(name in tool_names for name in ["codebase_plan", "codebase_read", "codebase_expand", "codebase_validate"]),
+        "required_tools_present": sorted(required_tools & set(tool_names)),
+        "missing_required_tools": sorted(required_tools - set(tool_names)),
+        "removed_route_status": removed_status,
+        "profile_status": profile_status,
+        "import_weight": {"mcp_server": import_probe_mcp, "mcp_app": import_probe_app},
+        "mcp_trials": {"passed": sum(item["graph_ok"] and item["code_ok"] for item in mcp_trials), "total": len(mcp_trials), "samples": mcp_trials[:5]},
+        "profile_trials": profile_trials,
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
     success = (
-        report["indexed_projects_contains_project"]
-        and tools_response.status_code == 200
-        and missing_chat.status_code == 404
-        and missing_models.status_code == 404
-        and graph_ok == 30
-        and code_ok == 30
-        and profile_ok >= 1
-        and not report["mcp_catalog_has_profile_plan"]
+        not report["missing_required_tools"]
+        and all(status == 404 for status in removed_status.values())
+        and all(status == 200 for status in profile_status.values())
+        and report["mcp_trials"]["passed"] == report["mcp_trials"]["total"]
+        and all(item["ok"] and item["has_plan_id"] for item in profile_trials)
     )
     return 0 if success else 1
 

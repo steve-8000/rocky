@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Rocky Skills+Codebase MCP",
         description="Spec-compliant streamable-HTTP MCP server for external agents.",
-        version="0.1.0",
+        version="0.1.1",
     )
     app.include_router(mcp_router)
 

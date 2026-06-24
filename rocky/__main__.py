@@ -9,20 +9,20 @@ from rocky.serve import PRESETS, run
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rocky",
-        description="OpenAI-compatible server for M4 Max 64GB",
+        description="Skills and codebase MCP backend for agent tooling",
     )
     sub = p.add_subparsers(dest="command")
 
-    srv = sub.add_parser("serve", help="Launch the LLM API server")
+    srv = sub.add_parser("serve", help="Launch the MCP skills+codebase server")
     srv.add_argument(
         "preset",
         nargs="?",
         default=None,
         choices=list(PRESETS),
-        help=f"Model preset (default: 35b). Available: {', '.join(PRESETS)}",
+        help="Legacy accepted preset name; MCP-only serving ignores model loading.",
     )
     srv.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1 or ROCKY_HOST)")
-    srv.add_argument("--port", type=int, default=None, help="Port (default: 8000 or ROCKY_PORT)")
+    srv.add_argument("--port", type=int, default=None, help="Port (default: 7777 or ROCKY_PORT)")
     srv.add_argument("--api-key", default=None, dest="api_key", help="Bearer token (or ROCKY_API_KEY)")
     srv.add_argument(
         "--skills-dir", default=None, dest="skills_dir",
@@ -30,15 +30,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     srv.add_argument(
         "--mcp", dest="mcp", action="store_true", default=None,
-        help="Force-enable the /mcp MCP server endpoint",
+        help="Accepted for compatibility; MCP is enabled by default",
     )
     srv.add_argument(
         "--no-mcp", dest="mcp", action="store_false",
-        help="Disable the /mcp MCP server endpoint",
+        help="Reject startup because Rocky 0.1.1 is MCP-only",
     )
-    srv.add_argument("extra", nargs=argparse.REMAINDER, help="Extra flags forwarded to rapid-mlx serve")
+    srv.add_argument("extra", nargs=argparse.REMAINDER, help="Ignored legacy serve flags")
 
-    sub.add_parser("presets", help="List available model presets")
+    sub.add_parser("presets", help="List legacy model presets accepted by the CLI")
 
     return p
 

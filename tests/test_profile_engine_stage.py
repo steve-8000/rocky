@@ -17,8 +17,8 @@ def test_profile_plan_returns_bounded_read_points_with_hashes(tmp_path: Path) ->
         "\n".join(
             [
                 "export class RockyClient {",
-                "  async buildContext(query: string) {",
-                "    return this.request('POST', '/v1/context/build', { query });",
+                "  async buildPlan(query: string) {",
+                "    return this.request('POST', '/v1/codebase/plan', { query });",
                 "  }",
                 "}",
             ]
@@ -34,7 +34,7 @@ def test_profile_plan_returns_bounded_read_points_with_hashes(tmp_path: Path) ->
     plan = engine.plan(
         {
             "profile": "find_definition",
-            "query": "RockyClient buildContext context/build",
+            "query": "RockyClient buildPlan codebase plan",
             "scope": {"kind": "workspace", "cwd": str(repo), "roots": [str(repo)]},
             "budget": {
                 "max_primary_points": 2,
@@ -54,7 +54,7 @@ def test_profile_plan_returns_bounded_read_points_with_hashes(tmp_path: Path) ->
     assert "candidates" not in plan
     assert plan["primary"][0]["file"] == "packages/coding-agent/src/rocky/backend.ts"
     assert plan["primary"][0]["file_revision"].startswith("sha256:")
-    assert "buildContext" in plan["primary"][0]["snippet"]
+    assert "buildPlan" in plan["primary"][0]["snippet"]
     assert "\n" not in plan["primary"][0]["snippet"]
     assert "\\n" in plan["primary"][0]["snippet"]
     assert plan["primary"][0]["point_id"]
@@ -201,7 +201,7 @@ def test_profile_plan_fuses_ast_grep_structural_matches(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     source = repo / "src" / "routes.ts"
     source.parent.mkdir(parents=True)
-    source.write_text('router.post("/v1/rocky/codebase/plan", handler);\n', encoding="utf-8")
+    source.write_text('router.post("/v1/codebase/plan", handler);\n', encoding="utf-8")
     engine = RockyProfileEngine(
         RockyCodebaseClient(RockyCodebaseConfig(enabled=True, auto_index=False)),
         plan_root=tmp_path / ".rocky-plans",
@@ -487,7 +487,7 @@ def test_profile_routes_plan_read_validate_and_delete(monkeypatch, tmp_path: Pat
     repo = tmp_path / "repo"
     source = repo / "src" / "router.py"
     source.parent.mkdir(parents=True)
-    source.write_text("router.post('/v1/rocky/codebase/plan')\n", encoding="utf-8")
+    source.write_text("router.post('/v1/codebase/plan')\n", encoding="utf-8")
     engine = RockyProfileEngine(
         RockyCodebaseClient(RockyCodebaseConfig(enabled=True, auto_index=False)),
         plan_root=tmp_path / ".rocky-plans",

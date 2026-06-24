@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from rocky.core.routes import rocky_native
-from rocky.core.routes.rocky_native import CodebaseCallRequest
 from rocky.search.rocky_codebase import RockyCodebaseClient, RockyCodebaseConfig
 
 
@@ -60,42 +57,9 @@ def test_call_accepts_every_passthrough_tool(tmp_path: Path, tool: str) -> None:
 def test_call_rejects_unsupported_tool(tmp_path: Path) -> None:
     client = FakeCallClient()
 
-    # search_graph/search_code/list_projects have their own dedicated routes and
-    # must not be reachable through the generic passthrough.
+    # search_graph/search_code/list_projects have dedicated MCP tools and must
+    # not be reachable through the project-scoped passthrough helper.
     with pytest.raises(ValueError):
         client.call("search_graph", tmp_path, {})
 
 
-def test_codebase_call_route_proxies_to_rocky_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    client = FakeCallClient()
-    monkeypatch.setattr(rocky_native, "_rocky_codebase", client)
-
-    request = CodebaseCallRequest(
-        tool="get_code_snippet",
-        arguments={"qualified_name": "Foo"},
-        path=str(tmp_path),
-        cwd=str(tmp_path),
-        scope="workspace",
-    )
-
-    result = asyncio.run(rocky_native.codebase_call(request))
-
-    assert result["ok"] is True
-    assert result["result"]["tool"] == "get_code_snippet"
-    assert result["search_scope"]["effective_roots"] == [str(tmp_path.resolve())]
-    tool, payload = client.calls[0]
-    assert tool == "get_code_snippet"
-    assert payload["project"] == client.project_for_path(tmp_path)
-
-
-def test_codebase_call_route_reports_unsupported_tool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    client = FakeCallClient()
-    monkeypatch.setattr(rocky_native, "_rocky_codebase", client)
-
-    request = CodebaseCallRequest(tool="search_graph", path=str(tmp_path), cwd=str(tmp_path))
-
-    result = asyncio.run(rocky_native.codebase_call(request))
-
-    assert result["ok"] is False
-    assert "unsupported" in result["error"]
-    assert client.calls == []
