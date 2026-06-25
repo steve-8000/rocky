@@ -1,17 +1,17 @@
 # Rocky
 
-Rocky is a local memory backend for coding agents. It combines:
+Rocky is a local skills-registry and codebase backend for coding agents. It combines:
 
 - a spec-compliant streamable-HTTP MCP server at `POST /mcp`;
 - a managed skills registry stored as Markdown files;
 - a forked `rocky-codebase` C engine based on [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp);
 - a bounded native profile-plan API for precise code reads.
 
-The fork is intentional. `codebase-memory-mcp` is excellent at fast structural code intelligence. Rocky changes the product shape from a standalone analyzer into an Amaze-ready local memory service: one endpoint for repository structure, operational runbooks, project conventions, debugging recipes, and reusable agent skills.
+The fork is intentional. `codebase-memory-mcp` is excellent at fast structural code intelligence. Rocky changes the product shape from a standalone analyzer into an Amaze-ready service for **skill storage + codebase tools**: one endpoint for repository structure, operational runbooks, project conventions, debugging recipes, and reusable agent skills.
 
 ## Why Rocky exists
 
-Coding agents waste context when they rediscover a repository by grep/read loops. Rocky gives them a durable local graph and skill store instead:
+Coding agents waste context when they rediscover a repository by grep/read loops or re-learn operational procedures from old transcripts. Rocky gives them a durable local code graph and skill registry instead:
 
 - **Code graph first** — codebase queries return symbols, callers, routes, packages, and snippets instead of raw file floods.
 - **Skills as storage** — reusable procedures live as versioned Markdown skills under `ROCKY_SKILLS_DIR`, not pasted into every session.
@@ -19,7 +19,7 @@ Coding agents waste context when they rediscover a repository by grep/read loops
 - **Amaze integration** — checked-in `.mcp.json`, `rocky-skills` server name, bearer auth, launchd/container paths, and `mcp__rocky_skills_*` tools are first-class.
 - **Local-first operation** — repository understanding stays on the machine; no cloud dependency for indexing or skill lookup.
 
-Upstream codebase-memory-mcp reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving core and adds skill memory plus operational APIs around it.
+Upstream codebase-memory-mcp reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving codebase core and adds managed skill storage plus operational APIs around it.
 
 ## Architecture
 
