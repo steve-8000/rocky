@@ -1,14 +1,91 @@
 # Rocky
 
-Rocky is a lightweight local backend for agent-facing **skills** and **codebase** tools. It packages a Python MCP control plane with a high-performance C codebase engine forked from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp).
+Rocky is a local memory backend for coding agents. It combines:
 
-The primary surface is a spec-compliant streamable-HTTP MCP endpoint at `POST /mcp`. It serves reusable Markdown skills plus Rocky codebase tools backed by the `rocky-codebase` C engine. The native HTTP API is intentionally narrow and only keeps the bounded profile-plan workflow that is not currently exposed by the MCP tool catalog.
+- a spec-compliant streamable-HTTP MCP server at `POST /mcp`;
+- a managed skills registry stored as Markdown files;
+- a forked `rocky-codebase` C engine based on [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp);
+- a bounded native profile-plan API for precise code reads.
 
-Rocky's pitch is simple: give coding agents a memory-shaped code graph instead of forcing them to rediscover the repository by opening hundreds of files. The upstream engine reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving graph core, then changes the product shape: from a standalone codebase-memory MCP binary into a local agent memory service for Amaze.
+The fork is intentional. `codebase-memory-mcp` is excellent at fast structural code intelligence. Rocky changes the product shape from a standalone analyzer into an Amaze-ready local memory service: one endpoint for repository structure, operational runbooks, project conventions, debugging recipes, and reusable agent skills.
 
-The fork exists because code intelligence alone is not enough for daily coding-agent work. Amaze needs one durable local place for both **repository structure** and **operational knowledge**: skills, runbooks, project conventions, debugging recipes, and bounded code-reading plans. Rocky adds that storage and serving layer: streamable HTTP MCP, managed skill registry, profile-plan API, auth, launchd/container deployment paths, and local-first operation.
+## Why Rocky exists
 
-What Rocky adds on top of the fork is intentionally pragmatic: one local endpoint for skills and code intelligence, no cloud dependency for repository understanding, no forced full-context dumps, and a small enough operational surface to run from launchd, uvicorn, or a local container. It is intentionally boring to operate and aggressive about saving tokens.
+Coding agents waste context when they rediscover a repository by grep/read loops. Rocky gives them a durable local graph and skill store instead:
+
+- **Code graph first** — codebase queries return symbols, callers, routes, packages, and snippets instead of raw file floods.
+- **Skills as storage** — reusable procedures live as versioned Markdown skills under `ROCKY_SKILLS_DIR`, not pasted into every session.
+- **Bounded reads** — profile plans return selected read points plus expansion handles, keeping context focused.
+- **Amaze integration** — checked-in `.mcp.json`, `rocky-skills` server name, bearer auth, launchd/container paths, and `mcp__rocky_skills_*` tools are first-class.
+- **Local-first operation** — repository understanding stays on the machine; no cloud dependency for indexing or skill lookup.
+
+Upstream codebase-memory-mcp reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving core and adds skill memory plus operational APIs around it.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Amaze / MCP client] -->|JSON-RPC 2.0<br/>POST /mcp| B[Rocky MCP app<br/>rocky.mcp_app]
+    B --> C[SkillsService]
+    B --> D[RockyCodebaseClient]
+    B --> E[Native profile workflow]
+    C --> F[(ROCKY_SKILLS_DIR<br/>manifest.json + *.md)]
+    C -->|reindex on upsert/delete| D
+    D --> G[rocky-codebase C engine<br/>forked from codebase-memory-mcp]
+    G --> H[(SQLite knowledge graph)]
+    G --> I[Tree-sitter + Hybrid LSP<br/>symbols, calls, routes, IaC]
+    E --> J[(ROCKY_RUNTIME_ROOT<br/>codebase-plans)]
+```
+
+### Runtime surfaces
+
+| Surface | Path | Purpose |
+| --- | --- | --- |
+| MCP | `POST /mcp` | JSON-RPC initialize, tools/list, tools/call, ping. |
+| MCP GET | `GET /mcp` | Returns `405`; Rocky does not push server-initiated SSE. |
+| Health | `GET /healthz` | Lightweight MCP app readiness probe. |
+| Native profiles | `/v1/codebase/*` | Bounded plan/read/validate/expand workflow not yet exposed as MCP tools. |
+
+### Tool catalog
+
+Rocky MCP exposes local skill tools plus proxied codebase tools:
+
+- Skill tools: `skill_search`, `skill_get`, `skill_upsert`, `skill_delete`, `skill_list`.
+- Codebase tools: loaded from the `rocky-codebase` engine, including `index_repository`, `detect_changes`, `index_status`, `search_graph`, `search_code`, `get_code_snippet`, `trace_path`, `get_architecture`, and `query_graph`.
+
+Unknown tools are returned as MCP tool errors instead of crashing the server. `resources/list`, `resources/templates/list`, and `prompts/list` return empty lists because Rocky is tool-only.
+
+## Skill registry storage
+
+Skills are durable local files:
+
+```text
+ROCKY_SKILLS_DIR/
+  manifest.json
+  <skill-name>.md
+```
+
+Each skill file has YAML frontmatter and a Markdown body:
+
+```markdown
+---
+name: rocky-example
+summary: When to use this skill
+tags:
+  - rocky
+version: 1
+---
+Procedure, caveats, commands, verification notes.
+```
+
+Storage behavior:
+
+- `skill_upsert` sanitizes the kebab-case name, writes `<name>.md`, updates `manifest.json`, increments `version`, and triggers a small reindex of the skills directory.
+- `skill_search` asks the codebase graph first, then falls back to manifest substring/token matching if the C engine is unavailable.
+- `skill_get` loads the full Markdown body only when needed.
+- `skill_delete` removes the file and manifest entry.
+
+This is Rocky's main product difference from a plain code analyzer: agent procedures that used to live in one transcript become searchable local knowledge for future sessions.
 
 ## Quick start
 
@@ -20,26 +97,27 @@ ROCKY_API_KEY=rocky-secret \
 uvicorn rocky.mcp_app:app --host 127.0.0.1 --port 7777
 ```
 
-Default local MCP runtime:
+Equivalent CLI:
+
+```bash
+uv run rocky serve --host 127.0.0.1 --port 7777 --api-key rocky-secret
+```
+
+Default local runtime:
 
 ```text
 host: 127.0.0.1
 port: 7777
 mcp endpoint: /mcp
 auth: Authorization: Bearer rocky-secret
-codebase backend: /Users/steve/amaze_s3/rocky/bin/rocky-codebase
 skills dir: ~/.rocky/skills unless ROCKY_SKILLS_DIR is set
-logs: /Users/steve/amaze_s3/rocky/.rocky/logs
+runtime root: ~/.rocky unless ROCKY_RUNTIME_ROOT is set
+codebase backend: /Users/steve/amaze_s3/rocky/bin/rocky-codebase unless ROCKY_CODEBASE_BINARY is set
 ```
 
-## Installation
+## Amaze integration
 
-```bash
-cd /Users/steve/amaze_s3/rocky
-uv sync
-```
-
-For the local Amaze integration, keep this repository's checked-in `.mcp.json` in place. It registers Rocky as the `rocky-skills` HTTP MCP server:
+This repository includes `.mcp.json` so Amaze can discover Rocky from the workspace:
 
 ```json
 {
@@ -55,68 +133,42 @@ For the local Amaze integration, keep this repository's checked-in `.mcp.json` i
 }
 ```
 
-Amaze discovers `.mcp.json` from the active workspace and exposes Rocky tools with the `mcp__rocky_skills_*` prefix. If you run Rocky from the Apple container helper instead of localhost, run `bin/rocky-mcp-up.sh`; it starts the `rocky-mcp` container and rewrites the target Amaze `.mcp.json` URL to the container's current VM IP.
+Amaze namespaces remote tools with the `mcp__rocky_skills_*` prefix.
+
+If Rocky runs from the Apple container helper rather than localhost, run:
+
+```bash
+bin/rocky-mcp-up.sh
+```
+
+The helper starts or reuses the `rocky-mcp` container, waits for MCP initialize to succeed, then rewrites the target Amaze `.mcp.json` URL to the container's current VM IP.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ROCKY_HOST` | `127.0.0.1` | Host used by `rocky serve`. |
+| `ROCKY_PORT` | `7777` | Port used by `rocky serve`. |
+| `ROCKY_API_KEY` | unset | When set, clients must send `Authorization: Bearer <key>`. |
+| `ROCKY_SKILLS_DIR` | `~/.rocky/skills` | Skill registry directory. |
+| `ROCKY_RUNTIME_ROOT` | `~/.rocky` | Native profile plan storage root. |
+| `ROCKY_CODEBASE_ENABLED` | `true` | Enables codebase tools. |
+| `ROCKY_CODEBASE_AUTO_INDEX` | `true` | Allows automatic indexing before profile/search workflows. |
+| `ROCKY_CODEBASE_BINARY` | `/Users/steve/amaze_s3/rocky/bin/rocky-codebase` | Local C-engine binary path. |
+| `ROCKY_CODEBASE_ENDPOINT` | unset | Optional remote `/rpc` backend for the C engine. |
+| `ROCKY_CODEBASE_PROJECT_PATH` | `.` | Default repository for native profile workflows. |
+| `ROCKY_CODEBASE_TIMEOUT_SECONDS` | `30` | C-engine call timeout. |
+| `ROCKY_CODEBASE_STALE_AFTER_SECONDS` | `300` | Index freshness window. |
 
 ## Operator checks
 
-MCP readiness:
+Health:
 
 ```bash
 curl http://127.0.0.1:7777/healthz
 ```
 
-MCP tool catalog:
-
-```bash
-curl -s http://127.0.0.1:7777/mcp \
-  -H 'Authorization: Bearer rocky-secret' \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
-
-Codebase profile health:
-
-```bash
-curl http://127.0.0.1:7777/v1/codebase/health
-```
-
-## Why fork codebase-memory-mcp
-
-`codebase-memory-mcp` is excellent at building a structural code graph. Rocky forks it because Amaze needed a broader memory substrate:
-
-- **Different shape**: upstream is a direct MCP code-intelligence binary; Rocky wraps the C engine with a Python HTTP MCP app that can serve codebase tools and skill tools together.
-- **Skill registry**: Rocky stores reusable agent knowledge as Markdown skills under `ROCKY_SKILLS_DIR`, not as prompt text pasted into every session.
-- **Searchable memory**: skills are indexed through the same codebase graph/search backend, so `skill_search` becomes semantic lookup over local operational knowledge.
-- **Bounded context**: profile plans return specific read points and expansion handles, avoiding full-file dumping when an agent only needs a few lines.
-- **Amaze integration**: `.mcp.json`, auth, launchd, local container support, and `mcp__rocky_skills_*` tool names are first-class.
-
-This makes Rocky less of a standalone analyzer and more of a local memory server for coding agents.
-
-## Skill registry as storage
-
-Rocky's managed skills are durable files, not ephemeral chat memory:
-
-```text
-ROCKY_SKILLS_DIR/
-  manifest.json
-  <skill-name>.md
-```
-
-Each skill file carries YAML frontmatter (`name`, `summary`, `tags`, `version`) plus Markdown body. `skill_upsert` writes or updates the file, `skill_delete` removes it, and both operations trigger a small reindex of the skills directory. `skill_search` returns lightweight matches first; `skill_get` loads the full body only when the agent actually needs it.
-
-That storage model is the key product difference: agent procedures that used to live in one transcript can become reusable local knowledge, discoverable by future Amaze sessions through the same MCP endpoint as the code graph.
-
-## MCP server
-
-- **Endpoint**: `POST /mcp` (JSON-RPC 2.0, single object or batch). `GET /mcp` returns `405`.
-- **Auth**: `Authorization: Bearer $ROCKY_API_KEY` when a key is configured; open otherwise.
-- **Skill tools**: `skill_search`, `skill_get`, `skill_upsert`, `skill_delete`, `skill_list`. Search/list responses are lightweight (`name`, `summary`, `tags`, `version`, plus `score` for search); full Markdown bodies are returned only by `skill_get`.
-- **Codebase tools**: proxied from the C engine, including `index_repository`, `detect_changes`, `index_status`, `search_graph`, `search_code`, `get_code_snippet`, `trace_path`, `get_architecture`, `query_graph`, and related tools.
-- **Index control plane**: indexing is kept as MCP tools. Agents should call `index_repository`, `detect_changes`, and `index_status` through MCP rather than native HTTP aliases.
-- **Skills store**: Markdown skill files under `ROCKY_SKILLS_DIR` (default `~/.rocky/skills`). `skill_upsert` writes frontmatter plus body and reindexes the skills directory.
-
-Example initialize request:
+MCP initialize:
 
 ```bash
 curl -s http://127.0.0.1:7777/mcp \
@@ -126,88 +178,75 @@ curl -s http://127.0.0.1:7777/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"0"}}}'
 ```
 
-## Token efficiency
+MCP tools:
 
-Rocky reduces context spend by answering repository questions from a prebuilt structural graph:
+```bash
+curl -s http://127.0.0.1:7777/mcp \
+  -H 'Authorization: Bearer rocky-secret' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
 
-- `search_graph`, `trace_path`, `get_architecture`, and `query_graph` return ranked symbols, callers, routes, dependencies, and package clusters instead of raw file floods.
-- Profile plans return bounded read points plus expansion handles, so agents inspect only the lines needed for the task.
-- Skill search returns lightweight metadata first; full Markdown bodies are loaded only on `skill_get`.
-- The forked codebase engine inherits upstream codebase-memory-mcp's measured savings: five structural queries at ~3,400 tokens versus ~412,000 tokens through file-by-file exploration, about a 120× reduction for that scenario.
+Native profile health:
 
-The practical effect for Amaze: fewer repeated grep/read loops, lower prompt pressure, and more room for task-specific reasoning and verification.
+```bash
+curl http://127.0.0.1:7777/v1/codebase/health
+```
 
-## Native API
+## Native profile API
 
-The native HTTP surface is intentionally limited to Rocky's profile-plan workflow and profile diagnostics:
+The native HTTP surface is deliberately small. Raw indexing/search wrappers were removed in favor of MCP `tools/call`; native HTTP keeps only the bounded profile-plan workflow.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /v1/codebase/status` | Reports Rocky codebase backend configuration and availability. |
-| `GET /v1/codebase/profiles` | Lists available bounded context profiles. |
-| `GET /v1/codebase/health` | Reports profile-engine collector health. |
-| `POST /v1/codebase/plan` | Builds a bounded codebase read plan. |
-| `GET /v1/codebase/plan/{plan_id}` | Reads a stored plan. |
-| `DELETE /v1/codebase/plan/{plan_id}` | Deletes a stored plan. |
-| `POST /v1/codebase/read` | Reads selected plan points. |
-| `POST /v1/codebase/validate_points` | Validates selected point freshness. |
-| `POST /v1/codebase/expand` | Expands a deferred plan cluster. |
+| `GET /v1/codebase/status` | Codebase backend configuration and availability. |
+| `GET /v1/codebase/profiles` | Available bounded-context profiles. |
+| `GET /v1/codebase/health` | Profile-engine collector health. |
+| `POST /v1/codebase/plan` | Build a bounded codebase read plan. |
+| `GET /v1/codebase/plan/{plan_id}` | Read a stored plan. |
+| `DELETE /v1/codebase/plan/{plan_id}` | Delete a stored plan. |
+| `POST /v1/codebase/read` | Read selected plan points. |
+| `POST /v1/codebase/validate_points` | Validate selected point freshness. |
+| `POST /v1/codebase/expand` | Expand a deferred plan cluster. |
 
-Removed native aliases and wrappers:
+Removed surfaces include LLM/OpenAI-style routes, legacy `/v1/search` and `/v1/context/build`, raw `/v1/codebase/index|search_graph|search_code|call`, and duplicate `/v1/rocky/codebase/*` aliases.
 
-- LLM/OpenAI-style routes (`/v1/chat/completions`, `/v1/models`, `/v1/responses`, `/v1/completions`, audio/cache/request routes) are not part of the MCP-only surface.
-- Legacy search/context routes (`/v1/search`, `/v1/context/build`) are removed.
-- Raw C-engine HTTP wrappers (`/v1/codebase/index`, `/v1/codebase/search_graph`, `/v1/codebase/search_code`, `/v1/codebase/call`) are removed in favor of MCP `tools/call`.
-- `/v1/rocky/codebase/*` duplicate aliases are removed.
+## Deployment notes
 
-## Architecture
+### launchd
 
-```mermaid
-flowchart LR
-    A[Amaze / MCP client] -->|JSON-RPC 2.0<br/>POST /mcp| B[Rocky MCP app<br/>rocky.mcp_app]
-    B --> C[Skills registry<br/>ROCKY_SKILLS_DIR]
-    B --> D[Codebase engine proxy]
-    B --> E[Native profile workflow]
-    D --> F[rocky-codebase C engine<br/>forked from DeusData/codebase-memory-mcp]
-    F --> G[(SQLite knowledge graph)]
-    F --> H[Tree-sitter + Hybrid LSP<br/>symbols, calls, routes, IaC]
-    E --> I[(Runtime plan store<br/>.rocky/codebase-plans)]
-    C --> J[Markdown skills<br/>manifest + reindex]
-```
+`launchd/dev.rocky.llm.plist` runs:
 
 ```text
-Agent / MCP client
-    |
-    | JSON-RPC 2.0 over POST /mcp
-    v
-Rocky MCP app
-    |
-    +-- Skills registry
-    |     - Markdown skills
-    |     - manifest-backed CRUD
-    |     - skill_upsert/delete trigger skill-dir reindex
-    |
-    +-- Codebase engine proxy
-    |     - forked from DeusData/codebase-memory-mcp
-    |     - index_repository / detect_changes / index_status
-    |     - search_graph / search_code
-    |     - get_code_snippet / trace_path / architecture/query tools
-    |
-    +-- Native profile workflow
-          - bounded codebase_plan/read/validate/expand endpoints
-          - plan ids and fresh-point validation
+/Users/steve/amaze_s3/rocky/.venv/bin/rocky serve
 ```
 
-### Design boundaries
+with `ROCKY_PORT=7777`, `ROCKY_RUNTIME_ROOT=/Users/steve/amaze_s3/rocky/.rocky`, `ROCKY_CODEBASE_BINARY=/Users/steve/amaze_s3/rocky/bin/rocky-codebase`, `ROCKY_CODEBASE_PROJECT_PATH=/Users/steve/amaze_s3/amaze`, and `ROCKY_API_KEY=rocky-secret`.
 
-- MCP is the canonical agent/tool transport for skills, indexing, and raw codebase operations.
-- Native HTTP remains only for the profile-plan workflow that MCP does not yet expose.
-- Index functionality must remain available; only duplicate HTTP transport wrappers were removed.
-- `rocky.mcp_app` is the lightweight ML-free ASGI entrypoint. It avoids importing the full MLX serving stack.
+Logs go to:
+
+```text
+/Users/steve/amaze_s3/rocky/.rocky/logs/rocky-llm.out.log
+/Users/steve/amaze_s3/rocky/.rocky/logs/rocky-llm.err.log
+```
+
+### Container
+
+`deploy/mcp/Containerfile.full` builds an ML-free Python runtime plus the native `rocky-codebase` binary. It sets:
+
+```text
+ROCKY_SKILLS_DIR=/skills
+ROCKY_CODEBASE_BINARY=/usr/local/bin/rocky-codebase
+ROCKY_HOST=0.0.0.0
+ROCKY_PORT=7777
+```
+
+The image imports `rocky.mcp_app` during build and fails if heavy ML modules (`mlx`, `torch`, `transformers`, etc.) leak into the MCP path.
 
 ## Validation
 
-Run the focused test suite:
+Focused tests:
 
 ```bash
 python3 -m pytest \
@@ -219,7 +258,7 @@ python3 -m pytest \
   tests/test_skills_service.py
 ```
 
-Run the live surface check:
+Live surface check:
 
 ```bash
 python3 scripts/random_live_surface_check.py
@@ -230,7 +269,6 @@ Compile changed modules:
 ```bash
 python3 -m py_compile \
   rocky/mcp_app.py \
-  rocky/core/server.py \
   rocky/core/routes/rocky_native.py \
   rocky/core/routes/mcp_server.py \
   rocky/search/*.py \
@@ -238,30 +276,16 @@ python3 -m py_compile \
   scripts/random_live_surface_check.py
 ```
 
-## Runtime files
+## License and attribution
 
-With `ROCKY_RUNTIME_ROOT=/Users/steve/amaze_s3/rocky/.rocky`, Rocky stores profile plans under:
+Rocky is MIT licensed; see [`LICENSE`](LICENSE).
 
-```text
-/Users/steve/amaze_s3/rocky/.rocky/codebase-plans
-```
+The embedded `rocky-codebase` engine is forked from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), also MIT licensed. The upstream notice is preserved at [`vendor/codebase-memory-mcp/LICENSE`](vendor/codebase-memory-mcp/LICENSE), and vendored third-party provenance is preserved at [`vendor/codebase-memory-mcp/THIRD_PARTY.md`](vendor/codebase-memory-mcp/THIRD_PARTY.md).
 
-The checked-in launchd plists in `launchd/` send service logs to:
-
-```text
-/Users/steve/amaze_s3/rocky/.rocky/logs
-```
-
-## License and upstream attribution
-
-Rocky is released under the MIT License; see [`LICENSE`](LICENSE).
-
-The embedded `rocky-codebase` engine is forked from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), which is also MIT-licensed. Rocky preserves the upstream license at [`vendor/codebase-memory-mcp/LICENSE`](vendor/codebase-memory-mcp/LICENSE) and third-party provenance at [`vendor/codebase-memory-mcp/THIRD_PARTY.md`](vendor/codebase-memory-mcp/THIRD_PARTY.md).
-
-In plain terms: keep the MIT notices, keep the upstream attribution, and keep third-party notices with any redistributed engine build.
+Keep the MIT notices, upstream attribution, and third-party notices with any redistributed engine build.
 
 ## Development notes
 
 - Keep deployable source in `rocky/`, `scripts/`, `deploy/`, `launchd/`, and `tests/`.
 - Do not commit `.harness/`, virtualenvs, pycache, local logs, pid files, or runtime stores.
-- Prefer `uvicorn rocky.mcp_app:app` for the MCP-only runtime.
+- Prefer `uvicorn rocky.mcp_app:app` or `uv run rocky serve` for the MCP-only runtime.
