@@ -1,1 +1,45 @@
-/Users/steve/amaze_s3/rocky-codebase/build/c/rocky-codebase
+#!/usr/bin/env bash
+# Rocky codebase engine launcher.
+# Materializes the bundled compressed C-engine binary on first use, then execs it.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "$os-$arch" in
+  darwin-arm64) platform="darwin-arm64" ;;
+  *)
+    cat >&2 <<MSG
+rocky-codebase: no bundled binary for $os-$arch.
+This repository currently carries bin/rocky-codebase.darwin-arm64.xz.
+Build the C engine for this platform and set ROCKY_CODEBASE_BINARY to that path.
+MSG
+    exit 127
+    ;;
+esac
+
+archive="$ROOT/bin/rocky-codebase.$platform.xz"
+cache_dir="${ROCKY_CODEBASE_CACHE_DIR:-$ROOT/.rocky/bin}"
+binary="$cache_dir/rocky-codebase-$platform"
+
+if [[ ! -f "$archive" ]]; then
+  echo "rocky-codebase: missing bundled archive: $archive" >&2
+  exit 127
+fi
+
+if [[ ! -x "$binary" || "$archive" -nt "$binary" ]]; then
+  mkdir -p "$cache_dir"
+  tmp="$binary.tmp.$$"
+  python3 - "$archive" "$tmp" <<'PY'
+import lzma
+import shutil
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with lzma.open(src, 'rb') as fin, open(dst, 'wb') as fout:
+    shutil.copyfileobj(fin, fout)
+PY
+  chmod 0755 "$tmp"
+  mv "$tmp" "$binary"
+fi
+
+exec "$binary" "$@"

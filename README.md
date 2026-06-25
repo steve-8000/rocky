@@ -103,6 +103,8 @@ Equivalent CLI:
 uv run rocky serve --host 127.0.0.1 --port 7777 --api-key rocky-secret
 ```
 
+`bin/rocky-codebase` is a launcher, not a maintainer-local symlink. On macOS arm64 it materializes the bundled compressed C-engine archive (`bin/rocky-codebase.darwin-arm64.xz`) into `.rocky/bin/` on first use, then execs it. Set `ROCKY_CODEBASE_BINARY` only when you want to use a different engine build.
+
 Default local runtime:
 
 ```text
@@ -112,7 +114,7 @@ mcp endpoint: /mcp
 auth: Authorization: Bearer rocky-secret
 skills dir: ~/.rocky/skills unless ROCKY_SKILLS_DIR is set
 runtime root: ~/.rocky unless ROCKY_RUNTIME_ROOT is set
-codebase backend: /Users/steve/amaze_s3/rocky/bin/rocky-codebase unless ROCKY_CODEBASE_BINARY is set
+codebase backend: ./bin/rocky-codebase launcher unless ROCKY_CODEBASE_BINARY is set
 ```
 
 ## Amaze integration
@@ -154,7 +156,7 @@ The helper starts or reuses the `rocky-mcp` container, waits for MCP initialize 
 | `ROCKY_RUNTIME_ROOT` | `~/.rocky` | Native profile plan storage root. |
 | `ROCKY_CODEBASE_ENABLED` | `true` | Enables codebase tools. |
 | `ROCKY_CODEBASE_AUTO_INDEX` | `true` | Allows automatic indexing before profile/search workflows. |
-| `ROCKY_CODEBASE_BINARY` | `/Users/steve/amaze_s3/rocky/bin/rocky-codebase` | Local C-engine binary path. |
+| `ROCKY_CODEBASE_BINARY` | `<rocky repo>/bin/rocky-codebase` | Local C-engine launcher or binary path. |
 | `ROCKY_CODEBASE_ENDPOINT` | unset | Optional remote `/rpc` backend for the C engine. |
 | `ROCKY_CODEBASE_PROJECT_PATH` | `.` | Default repository for native profile workflows. |
 | `ROCKY_CODEBASE_TIMEOUT_SECONDS` | `30` | C-engine call timeout. |
@@ -222,7 +224,7 @@ Removed surfaces include LLM/OpenAI-style routes, legacy `/v1/search` and `/v1/c
 /Users/steve/amaze_s3/rocky/.venv/bin/rocky serve
 ```
 
-with `ROCKY_PORT=7777`, `ROCKY_RUNTIME_ROOT=/Users/steve/amaze_s3/rocky/.rocky`, `ROCKY_CODEBASE_BINARY=/Users/steve/amaze_s3/rocky/bin/rocky-codebase`, `ROCKY_CODEBASE_PROJECT_PATH=/Users/steve/amaze_s3/amaze`, and `ROCKY_API_KEY=rocky-secret`.
+with `ROCKY_PORT=7777`, `ROCKY_RUNTIME_ROOT=/Users/steve/amaze_s3/rocky/.rocky`, `ROCKY_CODEBASE_BINARY=/Users/steve/amaze_s3/rocky/bin/rocky-codebase`, `ROCKY_CODEBASE_PROJECT_PATH=/Users/steve/amaze_s3/amaze`, and `ROCKY_API_KEY=rocky-secret`. The `bin/rocky-codebase` launcher expands the bundled Darwin arm64 engine into `.rocky/bin/` if needed.
 
 Logs go to:
 

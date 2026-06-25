@@ -8,7 +8,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,12 +23,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _default_codebase_binary() -> str:
+    return str(Path(__file__).resolve().parents[2] / "bin" / "rocky-codebase")
+
+
 @dataclass(frozen=True)
 class RockyCodebaseConfig:
     enabled: bool = True
     auto_index: bool = True
     endpoint: str | None = None
-    binary: str = "/Users/steve/amaze_s3/rocky/bin/rocky-codebase"
+    binary: str = field(default_factory=_default_codebase_binary)
     project: str | None = None
     project_path: str | None = None
     timeout_seconds: float = 30.0
@@ -40,7 +44,7 @@ class RockyCodebaseConfig:
             enabled=_env_bool("ROCKY_CODEBASE_ENABLED", True),
             auto_index=_env_bool("ROCKY_CODEBASE_AUTO_INDEX", True),
             endpoint=os.getenv("ROCKY_CODEBASE_ENDPOINT") or None,
-            binary=os.getenv("ROCKY_CODEBASE_BINARY") or cls.binary,
+            binary=os.getenv("ROCKY_CODEBASE_BINARY") or _default_codebase_binary(),
             project=os.getenv("ROCKY_CODEBASE_PROJECT") or None,
             project_path=os.getenv("ROCKY_CODEBASE_PROJECT_PATH") or None,
             timeout_seconds=float(os.getenv("ROCKY_CODEBASE_TIMEOUT_SECONDS", "30")),

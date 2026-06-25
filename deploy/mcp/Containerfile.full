@@ -3,8 +3,9 @@
 # rocky-codebase C engine (so the 14 codebase/graph tools work too, not just the
 # 5 skill_* tools).
 #
-# Prereq: build the C-engine image first (same OCI store):
-#   (cd ../rocky-codebase && container build -t rocky-codebase:linux -f deploy/Dockerfile.linux .)
+# Prereq: build a Linux C-engine image from the codebase-memory-mcp source/fork
+# and tag it in the same OCI store:
+#   container build -t rocky-codebase:linux -f <codebase-memory-mcp>/deploy/Dockerfile.linux <codebase-memory-mcp>
 # Then, from the rocky repo root:
 #   container build -t rocky-mcp:full -f deploy/mcp/Containerfile.full .
 
