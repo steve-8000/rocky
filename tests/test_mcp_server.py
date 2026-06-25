@@ -123,6 +123,7 @@ def test_skill_upsert_get_search_delete_roundtrip(client):
     _, hits = _tool_payload(found)
     assert any(h["name"] == "deploy-canary" for h in hits)
     assert all("body" not in h for h in hits)  # search is summary-first
+    assert all("version" in h for h in hits)
 
     rm = _rpc(client, "tools/call", {"name": "skill_delete", "arguments": {"name": "deploy-canary"}})
     _, deleted = _tool_payload(rm)

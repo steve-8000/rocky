@@ -58,7 +58,7 @@ curl http://127.0.0.1:7777/v1/codebase/health
 
 - **Endpoint**: `POST /mcp` (JSON-RPC 2.0, single object or batch). `GET /mcp` returns `405`.
 - **Auth**: `Authorization: Bearer $ROCKY_API_KEY` when a key is configured; open otherwise.
-- **Skill tools**: `skill_search`, `skill_get`, `skill_upsert`, `skill_delete`, `skill_list`.
+- **Skill tools**: `skill_search`, `skill_get`, `skill_upsert`, `skill_delete`, `skill_list`. Search/list responses are lightweight (`name`, `summary`, `tags`, `version`, plus `score` for search); full Markdown bodies are returned only by `skill_get`.
 - **Codebase tools**: proxied from the C engine, including `index_repository`, `detect_changes`, `index_status`, `search_graph`, `search_code`, `get_code_snippet`, `trace_path`, `get_architecture`, `query_graph`, and related tools.
 - **Index control plane**: indexing is kept as MCP tools. Agents should call `index_repository`, `detect_changes`, and `index_status` through MCP rather than native HTTP aliases.
 - **Skills store**: Markdown skill files under `ROCKY_SKILLS_DIR` (default `~/.rocky/skills`). `skill_upsert` writes frontmatter plus body and reindexes the skills directory.

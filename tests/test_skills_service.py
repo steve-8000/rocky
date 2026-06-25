@@ -73,6 +73,7 @@ def test_upsert_get_list_delete_and_versioning(tmp_path: Path) -> None:
             "name": "alpha-skill",
             "summary": "Reusable alpha workflow",
             "tags": ["alpha", "workflow"],
+            "version": 2,
         }
     ]
 
@@ -99,6 +100,7 @@ def test_search_uses_codebase_candidates_and_manifest_summary(tmp_path: Path) ->
             "name": "alpha-skill",
             "summary": "Reusable alpha workflow",
             "tags": ["alpha"],
+            "version": 1,
             "score": 0.75,
         }
     ]
@@ -121,6 +123,7 @@ def test_search_falls_back_to_manifest_matching(tmp_path: Path, mode: str) -> No
             "name": "alpha-skill",
             "summary": "Reusable alpha workflow",
             "tags": ["alpha"],
+            "version": 1,
             "score": 14.0,
         }
     ]

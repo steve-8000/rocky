@@ -19,8 +19,8 @@ SKILL_TOOLS: list[dict] = [
     {
         "name": "skill_search",
         "description": (
-            "Search reusable skills by semantic meaning. Returns name, summary, tags, and score; "
-            "load the full body with skill_get when you want to use a matching skill."
+            "Search reusable skills by semantic meaning. Returns lightweight name, summary, tags, version, "
+            "and score results; load the full body with skill_get when you want to use a matching skill."
         ),
         "inputSchema": {
             "type": "object",
@@ -77,7 +77,7 @@ SKILL_TOOLS: list[dict] = [
     },
     {
         "name": "skill_list",
-        "description": "List reusable skills by optional name prefix or required tags. Returns name, summary, and tags only.",
+        "description": "List reusable skills by optional name prefix or required tags. Returns name, summary, tags, and version only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -134,6 +134,7 @@ class SkillsService:
                     "name": candidate_name,
                     "summary": str(entry.get("summary", "")),
                     "tags": self._normalize_tags(entry.get("tags")),
+                    "version": self._coerce_version(entry.get("version")),
                     "score": score,
                 }
             if results_by_name:
@@ -233,6 +234,7 @@ class SkillsService:
                     "name": name,
                     "summary": str(entry.get("summary", "")),
                     "tags": entry_tags,
+                    "version": self._coerce_version(entry.get("version")),
                 }
             )
         return results
@@ -418,6 +420,7 @@ class SkillsService:
                     "name": name,
                     "summary": summary,
                     "tags": tags,
+                    "version": self._coerce_version(entry.get("version")),
                     "score": score,
                 }
             )

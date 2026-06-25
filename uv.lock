@@ -1226,21 +1226,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mlx-embeddings"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "huggingface-hub" },
-    { name = "mlx" },
-    { name = "mlx-vlm" },
-    { name = "transformers", extra = ["sentencepiece"] },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4b/64/3d0e6a861ef2f59e28b6eeea144f7d2739a0b4f19caa2b45b3302b029725/mlx_embeddings-0.1.0.tar.gz", hash = "sha256:f80c1e1be26ff7bd22b15c1fba4cc03afd44c86e00a431b5fa75ffd7500affb1", size = 66007, upload-time = "2026-03-24T14:01:03.413Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/18/05a341c811c9ee04f227cdbc064a635b84202cb8f85471adfdeebe0da32d/mlx_embeddings-0.1.0-py2.py3-none-any.whl", hash = "sha256:3fe1feaa786d3b546ccd8909f6b4c22bd3bcce097616fce83173ededd30e6630", size = 74579, upload-time = "2026-03-24T14:01:02.235Z" },
-]
-
-[[package]]
 name = "mlx-lm"
 version = "0.31.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2896,35 +2881,17 @@ wheels = [
 
 [[package]]
 name = "rocky"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
-    { name = "huggingface-hub" },
     { name = "jsonschema" },
     { name = "mcp" },
-    { name = "mlx" },
-    { name = "mlx-embeddings" },
-    { name = "mlx-lm" },
-    { name = "mlx-vlm" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "openai-harmony" },
-    { name = "opencv-python" },
-    { name = "outlines", extra = ["mlxlm"] },
-    { name = "pillow" },
     { name = "psutil" },
+    { name = "pydantic" },
     { name = "pyyaml" },
     { name = "requests" },
-    { name = "sse-starlette" },
-    { name = "tabulate" },
-    { name = "tokenizers" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-    { name = "transformers" },
     { name = "uvicorn" },
-    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -2933,39 +2900,59 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
+llm = [
+    { name = "huggingface-hub" },
+    { name = "mlx" },
+    { name = "mlx-lm" },
+    { name = "mlx-vlm" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "openai-harmony" },
+    { name = "opencv-python" },
+    { name = "outlines", extra = ["mlxlm"] },
+    { name = "pillow" },
+    { name = "sse-starlette" },
+    { name = "tabulate" },
+    { name = "tokenizers" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "websockets" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.100.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27.0" },
-    { name = "huggingface-hub", specifier = ">=0.23.0" },
+    { name = "huggingface-hub", marker = "extra == 'llm'", specifier = ">=0.23.0" },
     { name = "jsonschema", specifier = ">=4.0.0" },
     { name = "mcp", specifier = ">=1.0.0" },
-    { name = "mlx", specifier = ">=0.29.0" },
-    { name = "mlx-embeddings", specifier = ">=0.1.0" },
-    { name = "mlx-lm", specifier = ">=0.31.0" },
-    { name = "mlx-vlm", specifier = ">=0.6.3" },
-    { name = "numpy", specifier = ">=1.24.0" },
-    { name = "openai-harmony", specifier = ">=0.0.8" },
-    { name = "opencv-python", specifier = ">=4.8.0" },
-    { name = "outlines", extras = ["mlxlm"], specifier = ">=1.0.0" },
-    { name = "pillow", specifier = ">=10.0.0" },
+    { name = "mlx", marker = "extra == 'llm'", specifier = ">=0.29.0" },
+    { name = "mlx-lm", marker = "extra == 'llm'", specifier = ">=0.31.0" },
+    { name = "mlx-vlm", marker = "extra == 'llm'", specifier = ">=0.6.3" },
+    { name = "numpy", marker = "extra == 'llm'", specifier = ">=1.24.0" },
+    { name = "openai-harmony", marker = "extra == 'llm'", specifier = ">=0.0.8" },
+    { name = "opencv-python", marker = "extra == 'llm'", specifier = ">=4.8.0" },
+    { name = "outlines", extras = ["mlxlm"], marker = "extra == 'llm'", specifier = ">=1.0.0" },
+    { name = "pillow", marker = "extra == 'llm'", specifier = ">=10.0.0" },
     { name = "psutil", specifier = ">=5.9.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.28.0" },
-    { name = "sse-starlette", specifier = ">=1.6.0" },
-    { name = "tabulate", specifier = ">=0.9.0" },
-    { name = "tokenizers", specifier = ">=0.19.0" },
-    { name = "torch", specifier = ">=2.3.0" },
-    { name = "torchvision", specifier = ">=0.18.0" },
-    { name = "tqdm", specifier = ">=4.66.0" },
-    { name = "transformers", specifier = ">=5.0.0" },
+    { name = "sse-starlette", marker = "extra == 'llm'", specifier = ">=1.6.0" },
+    { name = "tabulate", marker = "extra == 'llm'", specifier = ">=0.9.0" },
+    { name = "tokenizers", marker = "extra == 'llm'", specifier = ">=0.19.0" },
+    { name = "torch", marker = "extra == 'llm'", specifier = ">=2.3.0" },
+    { name = "torchvision", marker = "extra == 'llm'", specifier = ">=0.18.0" },
+    { name = "tqdm", marker = "extra == 'llm'", specifier = ">=4.66.0" },
+    { name = "transformers", marker = "extra == 'llm'", specifier = ">=5.0.0" },
     { name = "uvicorn", specifier = ">=0.23.0" },
-    { name = "websockets", specifier = ">=12.0" },
+    { name = "websockets", marker = "extra == 'llm'", specifier = ">=12.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["llm", "dev"]
 
 [[package]]
 name = "rpds-py"
@@ -3760,12 +3747,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/aa/7c/8240f612819718100a9346dc28dea6a11370c3ca9c8c6eabadd3dea4ef29/transformers-5.12.1.tar.gz", hash = "sha256:679ee731c8225347889ad4fb3b2c926a62e9da3b7d284e9d12c791da7272466b", size = 8924054, upload-time = "2026-06-15T17:27:50.604Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/df/56/bbd60dd8668055803bf8ba55a81f9b8a8b31497f620109a9671d26a2076d/transformers-5.12.1-py3-none-any.whl", hash = "sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a", size = 11150587, upload-time = "2026-06-15T17:27:46.679Z" },
-]
-
-[package.optional-dependencies]
-sentencepiece = [
-    { name = "protobuf" },
-    { name = "sentencepiece" },
 ]
 
 [[package]]
