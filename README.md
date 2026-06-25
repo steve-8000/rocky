@@ -4,9 +4,11 @@ Rocky is a lightweight local backend for agent-facing **skills** and **codebase*
 
 The primary surface is a spec-compliant streamable-HTTP MCP endpoint at `POST /mcp`. It serves reusable Markdown skills plus Rocky codebase tools backed by the `rocky-codebase` C engine. The native HTTP API is intentionally narrow and only keeps the bounded profile-plan workflow that is not currently exposed by the MCP tool catalog.
 
-Rocky's pitch is simple: give coding agents a memory-shaped code graph instead of forcing them to rediscover the repository by opening hundreds of files. The upstream engine reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving graph core, then adds an Amaze-ready MCP server, managed skills, bounded read plans, auth, launchd/container deployment paths, and local-first operation.
+Rocky's pitch is simple: give coding agents a memory-shaped code graph instead of forcing them to rediscover the repository by opening hundreds of files. The upstream engine reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving graph core, then changes the product shape: from a standalone codebase-memory MCP binary into a local agent memory service for Amaze.
 
-What Rocky adds on top of the fork is the part built for daily agent work: one local endpoint for skills and code intelligence, no cloud dependency for repository understanding, no forced full-context dumps, and a small enough operational surface to run from launchd, uvicorn, or a local container. It is intentionally boring to operate and aggressive about saving tokens.
+The fork exists because code intelligence alone is not enough for daily coding-agent work. Amaze needs one durable local place for both **repository structure** and **operational knowledge**: skills, runbooks, project conventions, debugging recipes, and bounded code-reading plans. Rocky adds that storage and serving layer: streamable HTTP MCP, managed skill registry, profile-plan API, auth, launchd/container deployment paths, and local-first operation.
+
+What Rocky adds on top of the fork is intentionally pragmatic: one local endpoint for skills and code intelligence, no cloud dependency for repository understanding, no forced full-context dumps, and a small enough operational surface to run from launchd, uvicorn, or a local container. It is intentionally boring to operate and aggressive about saving tokens.
 
 ## Quick start
 
@@ -78,6 +80,32 @@ Codebase profile health:
 ```bash
 curl http://127.0.0.1:7777/v1/codebase/health
 ```
+
+## Why fork codebase-memory-mcp
+
+`codebase-memory-mcp` is excellent at building a structural code graph. Rocky forks it because Amaze needed a broader memory substrate:
+
+- **Different shape**: upstream is a direct MCP code-intelligence binary; Rocky wraps the C engine with a Python HTTP MCP app that can serve codebase tools and skill tools together.
+- **Skill registry**: Rocky stores reusable agent knowledge as Markdown skills under `ROCKY_SKILLS_DIR`, not as prompt text pasted into every session.
+- **Searchable memory**: skills are indexed through the same codebase graph/search backend, so `skill_search` becomes semantic lookup over local operational knowledge.
+- **Bounded context**: profile plans return specific read points and expansion handles, avoiding full-file dumping when an agent only needs a few lines.
+- **Amaze integration**: `.mcp.json`, auth, launchd, local container support, and `mcp__rocky_skills_*` tool names are first-class.
+
+This makes Rocky less of a standalone analyzer and more of a local memory server for coding agents.
+
+## Skill registry as storage
+
+Rocky's managed skills are durable files, not ephemeral chat memory:
+
+```text
+ROCKY_SKILLS_DIR/
+  manifest.json
+  <skill-name>.md
+```
+
+Each skill file carries YAML frontmatter (`name`, `summary`, `tags`, `version`) plus Markdown body. `skill_upsert` writes or updates the file, `skill_delete` removes it, and both operations trigger a small reindex of the skills directory. `skill_search` returns lightweight matches first; `skill_get` loads the full body only when the agent actually needs it.
+
+That storage model is the key product difference: agent procedures that used to live in one transcript can become reusable local knowledge, discoverable by future Amaze sessions through the same MCP endpoint as the code graph.
 
 ## MCP server
 
