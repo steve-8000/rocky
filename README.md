@@ -10,6 +10,7 @@ The primary surface is a spec-compliant streamable-HTTP MCP endpoint at `POST /m
 cd /Users/steve/amaze_s3/rocky
 uv sync
 ROCKY_RUNTIME_ROOT=$PWD/.rocky \
+ROCKY_API_KEY=rocky-secret \
 uvicorn rocky.mcp_app:app --host 127.0.0.1 --port 7777
 ```
 
@@ -19,6 +20,7 @@ Default local MCP runtime:
 host: 127.0.0.1
 port: 7777
 mcp endpoint: /mcp
+auth: Authorization: Bearer rocky-secret
 codebase backend: /Users/steve/amaze_s3/rocky/bin/rocky-codebase
 skills dir: ~/.rocky/skills unless ROCKY_SKILLS_DIR is set
 logs: /Users/steve/amaze_s3/rocky/.rocky/logs
@@ -30,6 +32,24 @@ logs: /Users/steve/amaze_s3/rocky/.rocky/logs
 cd /Users/steve/amaze_s3/rocky
 uv sync
 ```
+
+For the local Amaze integration, keep this repository's checked-in `.mcp.json` in place. It registers Rocky as the `rocky-skills` HTTP MCP server:
+
+```json
+{
+  "mcpServers": {
+    "rocky-skills": {
+      "type": "http",
+      "url": "http://localhost:7777/mcp",
+      "headers": {
+        "Authorization": "Bearer rocky-secret"
+      }
+    }
+  }
+}
+```
+
+Amaze discovers `.mcp.json` from the active workspace and exposes Rocky tools with the `mcp__rocky_skills_*` prefix. If you run Rocky from the Apple container helper instead of localhost, run `bin/rocky-mcp-up.sh`; it starts the `rocky-mcp` container and rewrites the target Amaze `.mcp.json` URL to the container's current VM IP.
 
 ## Operator checks
 
@@ -43,6 +63,7 @@ MCP tool catalog:
 
 ```bash
 curl -s http://127.0.0.1:7777/mcp \
+  -H 'Authorization: Bearer rocky-secret' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
@@ -67,6 +88,7 @@ Example initialize request:
 
 ```bash
 curl -s http://127.0.0.1:7777/mcp \
+  -H 'Authorization: Bearer rocky-secret' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"0"}}}'

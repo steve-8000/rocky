@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/amaze-agent/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "rocky-skills": {
+      "type": "http",
+      "url": "http://localhost:7777/mcp",
+      "headers": {
+        "Authorization": "Bearer rocky-secret"
+      }
+    }
+  }
+}
