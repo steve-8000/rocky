@@ -1,8 +1,12 @@
 # Rocky
 
-Rocky is a lightweight local backend for agent-facing **skills** and **codebase** tools.
+Rocky is a lightweight local backend for agent-facing **skills** and **codebase** tools. It packages a Python MCP control plane with a high-performance C codebase engine forked from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp).
 
 The primary surface is a spec-compliant streamable-HTTP MCP endpoint at `POST /mcp`. It serves reusable Markdown skills plus Rocky codebase tools backed by the `rocky-codebase` C engine. The native HTTP API is intentionally narrow and only keeps the bounded profile-plan workflow that is not currently exposed by the MCP tool catalog.
+
+Rocky's pitch is simple: give coding agents a memory-shaped code graph instead of forcing them to rediscover the repository by opening hundreds of files. The upstream engine reports 10× fewer tokens in its paper evaluation and a concrete benchmark of ~3,400 tokens for five structural queries versus ~412,000 tokens for file-by-file search. Rocky keeps that token-saving graph core, then adds an Amaze-ready MCP server, managed skills, bounded read plans, auth, launchd/container deployment paths, and local-first operation.
+
+What Rocky adds on top of the fork is the part built for daily agent work: one local endpoint for skills and code intelligence, no cloud dependency for repository understanding, no forced full-context dumps, and a small enough operational surface to run from launchd, uvicorn, or a local container. It is intentionally boring to operate and aggressive about saving tokens.
 
 ## Quick start
 
@@ -94,6 +98,17 @@ curl -s http://127.0.0.1:7777/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"agent","version":"0"}}}'
 ```
 
+## Token efficiency
+
+Rocky reduces context spend by answering repository questions from a prebuilt structural graph:
+
+- `search_graph`, `trace_path`, `get_architecture`, and `query_graph` return ranked symbols, callers, routes, dependencies, and package clusters instead of raw file floods.
+- Profile plans return bounded read points plus expansion handles, so agents inspect only the lines needed for the task.
+- Skill search returns lightweight metadata first; full Markdown bodies are loaded only on `skill_get`.
+- The forked codebase engine inherits upstream codebase-memory-mcp's measured savings: five structural queries at ~3,400 tokens versus ~412,000 tokens through file-by-file exploration, about a 120× reduction for that scenario.
+
+The practical effect for Amaze: fewer repeated grep/read loops, lower prompt pressure, and more room for task-specific reasoning and verification.
+
 ## Native API
 
 The native HTTP surface is intentionally limited to Rocky's profile-plan workflow and profile diagnostics:
@@ -119,6 +134,19 @@ Removed native aliases and wrappers:
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    A[Amaze / MCP client] -->|JSON-RPC 2.0<br/>POST /mcp| B[Rocky MCP app<br/>rocky.mcp_app]
+    B --> C[Skills registry<br/>ROCKY_SKILLS_DIR]
+    B --> D[Codebase engine proxy]
+    B --> E[Native profile workflow]
+    D --> F[rocky-codebase C engine<br/>forked from DeusData/codebase-memory-mcp]
+    F --> G[(SQLite knowledge graph)]
+    F --> H[Tree-sitter + Hybrid LSP<br/>symbols, calls, routes, IaC]
+    E --> I[(Runtime plan store<br/>.rocky/codebase-plans)]
+    C --> J[Markdown skills<br/>manifest + reindex]
+```
+
 ```text
 Agent / MCP client
     |
@@ -132,6 +160,7 @@ Rocky MCP app
     |     - skill_upsert/delete trigger skill-dir reindex
     |
     +-- Codebase engine proxy
+    |     - forked from DeusData/codebase-memory-mcp
     |     - index_repository / detect_changes / index_status
     |     - search_graph / search_code
     |     - get_code_snippet / trace_path / architecture/query tools
@@ -194,6 +223,14 @@ The checked-in launchd plists in `launchd/` send service logs to:
 ```text
 /Users/steve/amaze_s3/rocky/.rocky/logs
 ```
+
+## License and upstream attribution
+
+Rocky is released under the MIT License; see [`LICENSE`](LICENSE).
+
+The embedded `rocky-codebase` engine is forked from [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), which is also MIT-licensed. Rocky preserves the upstream license at [`vendor/codebase-memory-mcp/LICENSE`](vendor/codebase-memory-mcp/LICENSE) and third-party provenance at [`vendor/codebase-memory-mcp/THIRD_PARTY.md`](vendor/codebase-memory-mcp/THIRD_PARTY.md).
+
+In plain terms: keep the MIT notices, keep the upstream attribution, and keep third-party notices with any redistributed engine build.
 
 ## Development notes
 

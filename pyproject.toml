@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "steve" }]
 keywords = ["mcp", "codebase", "skills", "agent-tools", "server"]
+license = { file = "LICENSE" }
 
 dependencies = [
   "fastapi>=0.100.0",
